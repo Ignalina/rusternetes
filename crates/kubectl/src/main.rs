@@ -1019,13 +1019,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load kubeconfig or use CLI flags
-    let (server, skip_tls, token, default_namespace) = if let Some(server_url) = cli.server {
+    let (server, skip_tls, token, default_namespace, tls_pem) = if let Some(server_url) = cli.server {
         // CLI flags override kubeconfig
         (
             server_url,
             cli.insecure_skip_tls_verify,
             cli.token,
             "default".to_string(),
+            (None, None, None),
         )
     } else {
         // Try to load from kubeconfig
@@ -1058,10 +1059,12 @@ async fn main() -> Result<()> {
             .get_namespace()
             .unwrap_or_else(|_| "default".to_string());
 
-        (server, skip_tls, token, namespace)
+        let tls_pem = config.get_tls_pem().unwrap_or((None, None, None));
+        (server, skip_tls, token, namespace, tls_pem)
     };
 
-    let client = ApiClient::new(&server, skip_tls, token)?;
+    let (ca_pem, cert_pem, key_pem) = tls_pem;
+    let client = ApiClient::with_tls(&server, skip_tls, token, ca_pem, cert_pem, key_pem)?;
 
     match cli.command {
         Commands::Get {

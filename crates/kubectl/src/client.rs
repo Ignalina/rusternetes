@@ -59,6 +59,36 @@ impl ApiClient {
         })
     }
 
+    /// Like [`Self::new`], trusting `ca_pem` and presenting a client
+    /// certificate (`cert_pem` + its `key_pem`) — an API server that
+    /// asks for client certificates (`--client-ca-file`).
+    pub fn with_tls(
+        base_url: &str,
+        insecure_skip_tls_verify: bool,
+        token: Option<String>,
+        ca_pem: Option<Vec<u8>>,
+        cert_pem: Option<Vec<u8>>,
+        key_pem: Option<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut b = Client::builder()
+            .use_rustls_tls()
+            .danger_accept_invalid_certs(insecure_skip_tls_verify);
+        if let Some(ca) = ca_pem {
+            b = b.add_root_certificate(reqwest::Certificate::from_pem(&ca).context("certificate-authority")?);
+        }
+        if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
+            let mut pem = cert;
+            pem.push(b'\n');
+            pem.extend_from_slice(&key);
+            b = b.identity(reqwest::Identity::from_pem(&pem).context("client certificate / key")?);
+        }
+        Ok(Self {
+            base_url: base_url.to_string(),
+            client: b.build().context("Failed to build HTTP client")?,
+            token,
+        })
+    }
+
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, GetError> {
         let url = format!("{}{}", self.base_url, path);
         let mut request = self.client.get(&url);

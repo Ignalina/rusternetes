@@ -513,6 +513,10 @@ impl ContainerRuntime {
     /// Teardown CNI networking for a pod
     /// Removes CNI configuration and deletes the network namespace
     async fn teardown_pod_network(&self, pod_name: &str) -> Result<()> {
+        // A host-network pod has no CNI attachment and no netns of its own.
+        if self.host_network_pods.lock().unwrap().contains(pod_name) {
+            return Ok(());
+        }
         info!("Tearing down CNI network for pod: {}", pod_name);
 
         let netns_name = format!("cni-{}", pod_name);
