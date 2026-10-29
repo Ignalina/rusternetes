@@ -5350,9 +5350,9 @@ dependencies = [
 
 [[package]]
 name = "tunnr-etcd"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63107f25a1fdec153c703f8f19625de32053d840e6ad88fef57d2ac711ac4e2d"
+checksum = "08e069a80d70ea7e58133c0f64191e1596633fafc2c45fed33ff65fd0d1aaf77"
 dependencies = [
  "redb",
 ]
