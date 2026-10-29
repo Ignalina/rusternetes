@@ -199,6 +199,17 @@ impl ContainerRuntime {
         kubernetes_service_host: String,
         pod_prefer_cluster_dns: bool,
     ) -> Result<Self> {
+        #[cfg(feature = "youki")]
+        let backend: Arc<dyn ContainerBackend> =
+            if std::env::var("KUBELET_CONTAINER_BACKEND").as_deref() == Ok("youki") {
+                info!("Using the youki container backend (no container daemon)");
+                Arc::new(crate::backend::youki::YoukiBackend::new(
+                    crate::backend::youki::YoukiConfig::from_env(),
+                )?)
+            } else {
+                Arc::new(DockerBackend::connect_with_local_defaults()?)
+            };
+        #[cfg(not(feature = "youki"))]
         let backend: Arc<dyn ContainerBackend> =
             Arc::new(DockerBackend::connect_with_local_defaults()?);
         Self::with_backend(

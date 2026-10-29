@@ -9,6 +9,8 @@ mod docker;
 #[cfg(test)]
 pub(crate) mod fake;
 mod types;
+#[cfg(feature = "youki")]
+pub mod youki;
 
 pub use docker::DockerBackend;
 pub use types::*;
