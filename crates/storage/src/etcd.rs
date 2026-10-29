@@ -16,17 +16,57 @@ pub struct EtcdStorage {
 }
 
 impl EtcdStorage {
+    fn connect_options() -> etcd_client::ConnectOptions {
+        etcd_client::ConnectOptions::new()
+            .with_keep_alive(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(3),
+            )
+            .with_keep_alive_while_idle(true)
+    }
+
     /// Create a new EtcdStorage instance
     pub async fn new(endpoints: Vec<String>) -> Result<Self> {
-        let options = Some(
-            etcd_client::ConnectOptions::new()
-                .with_keep_alive(
-                    std::time::Duration::from_secs(10),
-                    std::time::Duration::from_secs(3),
-                )
-                .with_keep_alive_while_idle(true),
+        Self::connect(endpoints, Self::connect_options()).await
+    }
+
+    /// Connect over TLS with a client certificate: every endpoint must be
+    /// `https://` (a plaintext endpoint is refused, not tried).
+    #[cfg(feature = "etcd-tls")]
+    pub async fn new_tls(endpoints: Vec<String>, tls: &crate::EtcdClientTls) -> Result<Self> {
+        if let Some(e) = endpoints.iter().find(|e| !e.starts_with("https://")) {
+            return Err(Error::Storage(format!(
+                "etcd over TLS: the endpoint {e} is not https://"
+            )));
+        }
+        // rustls is built with more than one crypto provider here: name the
+        // process default (the one the API server installs too).
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
         );
-        let client = Client::connect(endpoints, options)
+        let read = |p: &str| {
+            std::fs::read(p).map_err(|e| Error::Storage(format!("etcd TLS file {p}: {e}")))
+        };
+        let t = etcd_client::TlsOptions::new()
+            .ca_certificate(etcd_client::Certificate::from_pem(read(&tls.ca_file)?))
+            .identity(etcd_client::Identity::from_pem(
+                read(&tls.cert_file)?,
+                read(&tls.key_file)?,
+            ));
+        info!("Connecting to etcd over TLS (client certificate {})", tls.cert_file);
+        Self::connect(endpoints, Self::connect_options().with_tls(t)).await
+    }
+
+    /// Built without the `etcd-tls` feature: refused, never plaintext.
+    #[cfg(not(feature = "etcd-tls"))]
+    pub async fn new_tls(_endpoints: Vec<String>, _tls: &crate::EtcdClientTls) -> Result<Self> {
+        Err(Error::Storage(
+            "etcd over TLS needs the etcd-tls feature; refusing to connect in plaintext".into(),
+        ))
+    }
+
+    async fn connect(endpoints: Vec<String>, options: etcd_client::ConnectOptions) -> Result<Self> {
+        let client = Client::connect(endpoints, Some(options))
             .await
             .map_err(|e| Error::Storage(format!("Failed to connect to etcd: {}", e)))?;
 

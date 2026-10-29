@@ -73,3 +73,9 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+
+# tunnr-etcd's `tls` feature (mutual TLS on the served store) is on its main
+# (git.gunnar.rs/nordisk/tunnr-etcd e799ac7), not on crates.io yet: the
+# sibling checkout until a release carries it.
+[patch.crates-io]
+tunnr-etcd = { path = "../tunnr-etcd/crates/tunnr-etcd" }

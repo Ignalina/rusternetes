@@ -136,12 +136,27 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
     }
 }
 
+/// The PEM files of an etcd client over TLS: the CA the server's
+/// certificate must chain to, and this client's certificate and key.
+#[derive(Clone, Debug)]
+pub struct EtcdClientTls {
+    pub ca_file: String,
+    pub cert_file: String,
+    pub key_file: String,
+}
+
 /// Configuration for selecting a storage backend.
 pub enum StorageConfig {
     /// Use an external etcd cluster.
     Etcd {
         /// Etcd endpoint URLs (e.g. `["http://localhost:2379"]`).
         endpoints: Vec<String>,
+    },
+    /// Use an external etcd cluster over TLS with a client certificate
+    /// (requires the `etcd-tls` feature). Every endpoint must be `https://`.
+    EtcdTls {
+        endpoints: Vec<String>,
+        tls: EtcdClientTls,
     },
     /// Use an embedded SQLite database via rhino (requires `sqlite` feature).
     #[cfg(feature = "sqlite")]
@@ -188,6 +203,10 @@ impl StorageBackend {
         match config {
             StorageConfig::Etcd { endpoints } => {
                 let storage = etcd::EtcdStorage::new(endpoints).await?;
+                Ok(StorageBackend::Etcd(storage))
+            }
+            StorageConfig::EtcdTls { endpoints, tls } => {
+                let storage = etcd::EtcdStorage::new_tls(endpoints, &tls).await?;
                 Ok(StorageBackend::Etcd(storage))
             }
             #[cfg(feature = "sqlite")]

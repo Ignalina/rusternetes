@@ -40,6 +40,10 @@ redb = [
 # Daemonless youki container backend for the embedded kubelet (Linux, root,
 # cgroup v2), and the shim binary it runs per container.
 youki = ["rusternetes-kubelet/youki"]
+# The etcd link over mutual TLS: --etcd-cafile/--etcd-certfile/--etcd-keyfile
+# for a client, --serve-etcd-cert-file/--serve-etcd-key-file/
+# --serve-etcd-client-ca-file for the served store.
+etcd-tls = ["rusternetes-storage/etcd-tls", "tunnr-etcd?/tls", "dep:rustls"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }
@@ -56,3 +60,4 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 # With `redb`: serve the embedded store to other nodes as etcd v3 (--serve-etcd).
 tunnr-etcd = { version = "0.2", optional = true, features = ["server"] }
+rustls = { workspace = true, optional = true }

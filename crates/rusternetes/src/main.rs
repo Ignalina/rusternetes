@@ -129,9 +129,58 @@ struct Args {
 
     /// With `--storage-backend redb`: also serve the embedded store as etcd v3
     /// on this address, so kubelets on other nodes can use it
-    /// (`--storage-backend etcd --etcd-servers http://<this>`). Plaintext.
+    /// (`--storage-backend etcd --etcd-servers http://<this>`). Plaintext,
+    /// unless the three --serve-etcd-* TLS files are given.
     #[arg(long)]
     serve_etcd: Option<String>,
+
+    /// The served store's certificate (PEM). With --serve-etcd-key-file and
+    /// --serve-etcd-client-ca-file, --serve-etcd serves mutual TLS only: a
+    /// client must present a certificate from that CA; plaintext is refused.
+    #[arg(long)]
+    serve_etcd_cert_file: Option<String>,
+
+    /// The served store certificate's key (PEM).
+    #[arg(long)]
+    serve_etcd_key_file: Option<String>,
+
+    /// The CA a client certificate of the served store must chain to (PEM).
+    #[arg(long)]
+    serve_etcd_client_ca_file: Option<String>,
+
+    /// The CA the etcd servers' certificates must chain to (PEM). With
+    /// --etcd-certfile and --etcd-keyfile, the etcd backend connects over
+    /// TLS with that client certificate (https:// endpoints only).
+    #[arg(long)]
+    etcd_cafile: Option<String>,
+
+    /// This client's certificate for the etcd servers (PEM).
+    #[arg(long)]
+    etcd_certfile: Option<String>,
+
+    /// This client's key for the etcd servers (PEM).
+    #[arg(long)]
+    etcd_keyfile: Option<String>,
+}
+
+/// All three of a TLS file set, or none.
+fn all_or_none(
+    what: &str,
+    files: [(&str, &Option<String>); 3],
+) -> Result<Option<[String; 3]>> {
+    let given = files.iter().filter(|(_, v)| v.is_some()).count();
+    match given {
+        0 => Ok(None),
+        3 => Ok(Some(files.map(|(_, v)| v.clone().unwrap_or_default()))),
+        _ => {
+            let missing: Vec<&str> = files
+                .iter()
+                .filter(|(_, v)| v.is_none())
+                .map(|(n, _)| *n)
+                .collect();
+            anyhow::bail!("{what}: also give {}", missing.join(", "))
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -147,6 +196,30 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    #[cfg(feature = "etcd-tls")]
+    {
+        // More than one rustls crypto provider is built in; the etcd link's
+        // client and server use the process default, as the API server does.
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        );
+    }
+    let etcd_client_tls = all_or_none(
+        "etcd client TLS",
+        [
+            ("--etcd-cafile", &args.etcd_cafile),
+            ("--etcd-certfile", &args.etcd_certfile),
+            ("--etcd-keyfile", &args.etcd_keyfile),
+        ],
+    )?;
+    let serve_etcd_tls = all_or_none(
+        "--serve-etcd TLS",
+        [
+            ("--serve-etcd-cert-file", &args.serve_etcd_cert_file),
+            ("--serve-etcd-key-file", &args.serve_etcd_key_file),
+            ("--serve-etcd-client-ca-file", &args.serve_etcd_client_ca_file),
+        ],
+    )?;
 
     let level = match args.log_level.as_str() {
         "trace" => Level::TRACE,
@@ -183,8 +256,23 @@ async fn run() -> Result<()> {
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect();
-            info!("Storage: etcd at {:?}", endpoints);
-            StorageConfig::Etcd { endpoints }
+            match etcd_client_tls {
+                Some([ca_file, cert_file, key_file]) => {
+                    info!("Storage: etcd over TLS at {:?}", endpoints);
+                    StorageConfig::EtcdTls {
+                        endpoints,
+                        tls: rusternetes_storage::EtcdClientTls {
+                            ca_file,
+                            cert_file,
+                            key_file,
+                        },
+                    }
+                }
+                None => {
+                    info!("Storage: etcd at {:?}", endpoints);
+                    StorageConfig::Etcd { endpoints }
+                }
+            }
         }
         #[cfg(feature = "redis")]
         "redis" => {
@@ -220,10 +308,36 @@ async fn run() -> Result<()> {
                 anyhow::bail!("--serve-etcd needs --storage-backend redb");
             };
             let store = redb.store().clone();
+            let tls = match serve_etcd_tls {
+                Some([cert, key, ca]) => {
+                    let read = |p: &str| {
+                        std::fs::read(p).map_err(|e| anyhow::anyhow!("--serve-etcd TLS file {p}: {e}"))
+                    };
+                    Some(tunnr_etcd::server::ServeTls {
+                        cert_pem: read(&cert)?,
+                        key_pem: read(&key)?,
+                        client_ca_pem: read(&ca)?,
+                    })
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "etcd-tls"))]
+            if tls.is_some() {
+                anyhow::bail!("--serve-etcd TLS needs the etcd-tls feature; refusing to serve plaintext");
+            }
+            let scheme = if tls.is_some() { "https" } else { "http" };
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            info!("Serving the embedded store as etcd v3 on {}", addr);
+            if tls.is_some() {
+                info!(
+                    "Serving the embedded store as etcd v3 on {} over mutual TLS (client certificate required, plaintext refused)",
+                    addr
+                );
+            } else {
+                info!("Serving the embedded store as etcd v3 on {} (plaintext)", addr);
+            }
             let opts = tunnr_etcd::server::ServeOptions {
-                client_url: format!("http://{}", addr),
+                client_url: format!("{scheme}://{addr}"),
+                tls,
                 ..Default::default()
             };
             tokio::spawn(async move {
