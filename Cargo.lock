@@ -3875,15 +3875,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redb"
-version = "4.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "redis"
 version = "0.27.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4411,7 +4402,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "tunnr-etcd",
  "uuid",
 ]
 
@@ -4437,11 +4427,7 @@ dependencies = [
  "bitflags",
  "errno",
  "libc",
-<<<<<<< HEAD
- "linux-raw-sys",
-=======
  "linux-raw-sys 0.12.1",
->>>>>>> origin/feat/youki-backend
  "windows-sys 0.61.2",
 ]
 
@@ -5299,11 +5285,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.2",
  "once_cell",
-<<<<<<< HEAD
- "rustix",
-=======
  "rustix 1.1.4",
->>>>>>> origin/feat/youki-backend
  "windows-sys 0.61.2",
 ]
 
@@ -5830,15 +5812,6 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
-]
-
-[[package]]
-name = "tunnr-etcd"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08e069a80d70ea7e58133c0f64191e1596633fafc2c45fed33ff65fd0d1aaf77"
-dependencies = [
- "redb",
 ]
 
 [[package]]
