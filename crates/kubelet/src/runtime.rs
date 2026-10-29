@@ -14,7 +14,6 @@ use rusternetes_common::resources::{
 use rusternetes_storage::{build_key, Storage};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
@@ -357,22 +356,14 @@ impl ContainerRuntime {
     /// Pre-flight check: can this process create network namespaces?
     fn probe_netns() -> NetnsProbe {
         let test_netns = "rusternetes-cni-test";
-        match Command::new("ip")
-            .args(["netns", "add", test_netns])
-            .output()
-        {
-            Ok(output)
-                if output.status.success()
-                    || String::from_utf8_lossy(&output.stderr).contains("File exists") =>
-            {
-                // Clean up test namespace
-                let _ = Command::new("ip")
-                    .args(["netns", "del", test_netns])
-                    .output();
+        match crate::netns::add(test_netns) {
+            Ok(()) => {
+                let _ = crate::netns::del(test_netns);
                 NetnsProbe::Works
             }
-            Ok(output) => {
-                NetnsProbe::Fails(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = crate::netns::del(test_netns);
+                NetnsProbe::Works
             }
             Err(e) => NetnsProbe::Fails(e.to_string()),
         }
@@ -433,30 +424,18 @@ impl ContainerRuntime {
 
         // Create network namespace
         let netns_name = format!("cni-{}", pod_name);
-        let output = match Command::new("ip")
-            .args(["netns", "add", &netns_name])
-            .output()
-        {
-            Ok(out) => out,
+        match crate::netns::add(&netns_name) {
+            Ok(()) => info!("Created network namespace: {}", netns_name),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                info!(
+                    "Network namespace {} already exists, reusing it",
+                    netns_name
+                );
+            }
             Err(e) => {
                 warn!("Failed to create network namespace for pod {}: {}. Falling back to Podman networking.", pod_name, e);
                 return None;
             }
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore error if namespace already exists
-            if !stderr.contains("File exists") {
-                warn!("Failed to create network namespace for pod {}: {}. Falling back to Podman networking.", pod_name, stderr);
-                return None;
-            }
-            info!(
-                "Network namespace {} already exists, reusing it",
-                netns_name
-            );
-        } else {
-            info!("Created network namespace: {}", netns_name);
         }
 
         // Get the network namespace path
@@ -474,9 +453,7 @@ impl ContainerRuntime {
                 Err(e) => {
                     warn!("Failed to setup CNI network for pod {}: {}. Falling back to Podman networking.", pod_name, e);
                     // Clean up the network namespace on failure
-                    let _ = Command::new("ip")
-                        .args(["netns", "del", &netns_name])
-                        .output();
+                    let _ = crate::netns::del(&netns_name);
                     return None;
                 }
             }
@@ -504,19 +481,12 @@ impl ContainerRuntime {
         }
 
         // Delete network namespace
-        let output = Command::new("ip")
-            .args(["netns", "del", &netns_name])
-            .output()
-            .context("Failed to execute ip netns del command")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!(
+        match crate::netns::del(&netns_name) {
+            Err(e) => warn!(
                 "Failed to delete network namespace {}: {}",
-                netns_name, stderr
-            );
-        } else {
-            info!("Deleted network namespace: {}", netns_name);
+                netns_name, e
+            ),
+            Ok(()) => info!("Deleted network namespace: {}", netns_name),
         }
 
         Ok(())

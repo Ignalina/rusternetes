@@ -35,7 +35,11 @@ redb = [
     "rusternetes-controller-manager/redb",
     "rusternetes-kubelet/redb",
     "rusternetes-kube-proxy/redb",
+    "dep:tunnr-etcd",
 ]
+# Daemonless youki container backend for the embedded kubelet (Linux, root,
+# cgroup v2), and the shim binary it runs per container.
+youki = ["rusternetes-kubelet/youki"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }
@@ -50,3 +54,5 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+# With `redb`: serve the embedded store to other nodes as etcd v3 (--serve-etcd).
+tunnr-etcd = { version = "0.2", optional = true, features = ["server"] }
