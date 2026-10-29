@@ -42,6 +42,20 @@ pub struct CniRuntime {
     default_network: Option<String>,
 }
 
+/// The `CNI_CONTAINERID` for a pod sandbox the kubelet names by `id` (the
+/// pod name): 64 hex digits, the shape CRI runtimes pass. Plugins derive
+/// interface names from it — Cilium's temporary peer is `tmp` + its first
+/// five characters, so a pod name with a `:` or `.` there (`web` → `web:e`
+/// of `web:eth0`) became an invalid interface name ("unable to create veth
+/// pair: invalid argument"). Deterministic, so ADD, CHECK and DEL agree.
+pub fn cni_container_id(id: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(id.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 impl CniRuntime {
     /// Create a new CNI runtime
     pub fn new(plugin_paths: Vec<PathBuf>, config_dir: PathBuf) -> Result<Self, CniError> {
@@ -130,7 +144,7 @@ impl CniRuntime {
         let result = plugin_manager.execute_network(
             CniCommand::Add,
             &network,
-            container_id,
+            &cni_container_id(container_id),
             netns,
             ifname,
             args,
@@ -181,7 +195,7 @@ impl CniRuntime {
         plugin_manager.execute_network(
             CniCommand::Del,
             &network,
-            container_id,
+            &cni_container_id(container_id),
             netns,
             ifname,
             None,
@@ -228,7 +242,7 @@ impl CniRuntime {
         plugin_manager.execute_network(
             CniCommand::Check,
             &network,
-            container_id,
+            &cni_container_id(container_id),
             netns,
             ifname,
             None,
@@ -332,6 +346,15 @@ pub struct NetworkStats {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn cni_container_ids_are_64_hex_and_stable() {
+        let a = cni_container_id("web");
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a, cni_container_id("web"));
+        assert_ne!(a, cni_container_id("web2"));
+    }
 
     #[test]
     fn test_cni_runtime_creation() {

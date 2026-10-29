@@ -744,7 +744,18 @@ impl ContainerRuntime {
                 .insert(pod_name.to_string());
         }
         let netns_path = if self.use_cni && !host_network {
-            self.setup_pod_network(pod).await
+            match self.setup_pod_network(pod).await {
+                Some(p) => Some(p),
+                // No network yet (the CNI plugin or its config is not there,
+                // e.g. a CNI agent still starting): the pod waits and is tried
+                // again, as the upstream kubelet's NetworkNotReady does, instead
+                // of starting its containers without a network and failing.
+                None => anyhow::bail!(
+                    "CreateContainerError: the pod network is not ready (CNI ADD failed for {}/{})",
+                    namespace,
+                    pod_name
+                ),
+            }
         } else {
             None
         };
@@ -8414,7 +8425,7 @@ fn cni_args(pod: &Pod, container_id: &str) -> String {
         "IgnoreUnknown=1;K8S_POD_NAMESPACE={};K8S_POD_NAME={};K8S_POD_INFRA_CONTAINER_ID={};K8S_POD_UID={}",
         pod.metadata.namespace.as_deref().unwrap_or("default"),
         pod.metadata.name,
-        container_id,
+        crate::cni::runtime::cni_container_id(container_id),
         pod.metadata.uid,
     )
 }
@@ -12318,7 +12329,7 @@ mod host_network_and_cni_args_tests {
         }));
         assert_eq!(
             cni_args(&p, "web"),
-            "IgnoreUnknown=1;K8S_POD_NAMESPACE=shop;K8S_POD_NAME=web;K8S_POD_INFRA_CONTAINER_ID=web;K8S_POD_UID=u-1"
+            format!("IgnoreUnknown=1;K8S_POD_NAMESPACE=shop;K8S_POD_NAME=web;K8S_POD_INFRA_CONTAINER_ID={};K8S_POD_UID=u-1", crate::cni::runtime::cni_container_id("web"))
         );
     }
 }

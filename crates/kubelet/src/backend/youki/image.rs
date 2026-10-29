@@ -502,6 +502,10 @@ pub fn apply_layer(blob: &Path, rootfs: &Path) -> Result<()> {
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive.set_preserve_mtime(true);
+    // File capabilities ride as `security.capability` xattrs (CoreDNS binds
+    // :53 as a non-root user through `cap_net_bind_service=+ep` on its
+    // binary); without them such a binary gets EACCES at bind.
+    archive.set_unpack_xattrs(true);
     archive.set_overwrite(true);
     for entry in archive.entries()? {
         let mut entry = entry?;
