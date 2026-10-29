@@ -393,6 +393,15 @@ fn to_bollard_config(c: ContainerConfig) -> bc::Config<String> {
             cap_add: h.cap_add,
             cap_drop: h.cap_drop,
             privileged: h.privileged,
+            devices: h.devices.map(|ds| {
+                ds.into_iter()
+                    .map(|d| bm::DeviceMapping {
+                        path_on_host: Some(d.path_on_host),
+                        path_in_container: Some(d.path_in_container),
+                        cgroup_permissions: Some(d.cgroup_permissions),
+                    })
+                    .collect()
+            }),
             ..Default::default()
         }),
         ..Default::default()

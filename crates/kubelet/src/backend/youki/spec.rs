@@ -311,7 +311,23 @@ pub fn build(input: &SpecInput) -> Result<Value> {
     if let Some(sysctls) = &hc.sysctls {
         linux["sysctl"] = json!(sysctls);
     }
-    let mut resources = json!({"devices": []});
+    let mut allow = Vec::new();
+    if let Some(devices) = hc.devices.as_ref().filter(|d| !d.is_empty()) {
+        let mut nodes = Vec::new();
+        for d in devices {
+            let (kind, major, minor) = device_numbers(Path::new(&d.path_on_host))?;
+            nodes.push(json!({
+                "path": d.path_in_container, "type": kind, "major": major, "minor": minor,
+                "fileMode": 0o660, "uid": 0, "gid": 0
+            }));
+            allow.push(json!({
+                "allow": true, "type": kind, "major": major, "minor": minor,
+                "access": d.cgroup_permissions
+            }));
+        }
+        linux["devices"] = json!(nodes);
+    }
+    let mut resources = json!({"devices": allow});
     if let Some(m) = hc.memory.filter(|m| *m > 0) {
         resources["memory"] = json!({"limit": m});
     }
@@ -333,6 +349,26 @@ pub fn build(input: &SpecInput) -> Result<Value> {
     // Round-trip through the typed spec so libcontainer will accept it.
     let typed: oci_spec::runtime::Spec = serde_json::from_value(spec)?;
     Ok(serde_json::to_value(typed)?)
+}
+
+/// `("b"|"c", major, minor)` of a device node (following a bind-mounted node
+/// like any other path).
+pub fn device_numbers(path: &Path) -> Result<(&'static str, u64, u64)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("device {}: {}", path.display(), e))?;
+    let kind = if meta.file_type().is_block_device() {
+        "b"
+    } else if meta.file_type().is_char_device() {
+        "c"
+    } else {
+        bail!("{} is not a device node", path.display());
+    };
+    let dev = meta.rdev();
+    // The glibc/musl encoding of a dev_t (sys/sysmacros.h).
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    Ok((kind, major, minor))
 }
 
 /// resolv.conf contents from the container's DNS settings, or `None` to
@@ -513,6 +549,32 @@ mod tests {
         };
         let err = build(&input(&c, &image)).unwrap_err().to_string();
         assert!(err.contains("unsupported on youki"), "{err}");
+    }
+
+    #[test]
+    fn volume_devices_become_nodes_and_cgroup_rules() {
+        let image = ImageConfig::default();
+        let c = ContainerConfig {
+            cmd: s(&["true"]),
+            host_config: Some(HostConfig {
+                devices: Some(vec![crate::backend::DeviceMapping {
+                    path_on_host: "/dev/null".into(),
+                    path_in_container: "/dev/xvda".into(),
+                    cgroup_permissions: "rwm".into(),
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spec = build(&input(&c, &image)).unwrap();
+        let dev = &spec["linux"]["devices"][0];
+        assert_eq!(dev["path"], "/dev/xvda");
+        assert_eq!((dev["type"].as_str(), dev["major"].as_i64(), dev["minor"].as_i64()), (Some("c"), Some(1), Some(3)));
+        let rule = &spec["linux"]["resources"]["devices"][0];
+        assert_eq!(rule["allow"], true);
+        assert_eq!(rule["access"], "rwm");
+        assert_eq!(rule["major"], 1);
+        assert!(device_numbers(Path::new("/")).is_err());
     }
 
     #[test]

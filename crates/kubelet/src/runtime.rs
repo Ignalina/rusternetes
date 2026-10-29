@@ -116,6 +116,33 @@ pub struct ContainerRuntime {
     csi: Arc<crate::csi::CsiManager>,
 }
 
+/// A container's `volumeDevices` as device mappings: each names a pod volume
+/// whose path is a device node (a raw block PersistentVolume, published by its
+/// CSI driver as a node bound onto `<volume dir>/block`).
+fn volume_devices(
+    container: &Container,
+    volume_paths: &HashMap<String, String>,
+) -> Result<Option<Vec<crate::backend::DeviceMapping>>> {
+    let Some(devices) = container.volume_devices.as_ref().filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    let mut out = Vec::new();
+    for d in devices {
+        let host = volume_paths.get(&d.name).with_context(|| {
+            format!(
+                "volumeDevices: container {} names volume {}, which the pod does not have",
+                container.name, d.name
+            )
+        })?;
+        out.push(crate::backend::DeviceMapping {
+            path_on_host: host.clone(),
+            path_in_container: d.device_path.clone(),
+            cgroup_permissions: "rwm".to_string(),
+        });
+    }
+    Ok(Some(out))
+}
+
 /// Join a list of strings into a shell-safe command string.
 /// Wraps arguments containing spaces or special characters in single quotes.
 fn shell_join(args: &[String]) -> String {
@@ -4649,6 +4676,7 @@ impl ContainerRuntime {
                     Some(port_bindings)
                 },
                 binds: if binds.is_empty() { None } else { Some(binds) },
+                devices: volume_devices(container, volume_paths)?,
                 tmpfs: if tmpfs_mounts.is_empty() {
                     None
                 } else {

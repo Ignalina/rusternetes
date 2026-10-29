@@ -87,6 +87,17 @@ pub struct Mount {
     pub read_only: Option<bool>,
 }
 
+/// A host device node exposed inside the container (a pod's `volumeDevices`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeviceMapping {
+    /// A block or character device node on the host (for a raw block CSI
+    /// volume, the published target the driver bound the device onto).
+    pub path_on_host: String,
+    pub path_in_container: String,
+    /// Device cgroup access, `"rwm"` for a writable volume.
+    pub cgroup_permissions: String,
+}
+
 /// Host-side settings of a container to create.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HostConfig {
@@ -118,6 +129,8 @@ pub struct HostConfig {
     pub cap_add: Option<Vec<String>>,
     pub cap_drop: Option<Vec<String>>,
     pub privileged: Option<bool>,
+    /// Device nodes to create in the container and allow in its device cgroup.
+    pub devices: Option<Vec<DeviceMapping>>,
 }
 
 /// Everything needed to create a container.
