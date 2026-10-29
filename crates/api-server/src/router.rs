@@ -213,7 +213,7 @@ async fn custom_resource_fallback(
     let (group, version, plural, namespace, name, subresource) = match parts.as_slice() {
         // Namespaced: /apis/{group}/{version}/namespaces/{namespace}/{plural}
         [group, version, "namespaces", namespace, plural]
-            if method == Method::GET || method == Method::POST =>
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
         {
             (*group, *version, *plural, Some(*namespace), None, None)
         }
@@ -236,7 +236,9 @@ async fn custom_resource_fallback(
             Some(*subresource),
         ),
         // Cluster-scoped: /apis/{group}/{version}/{plural}
-        [group, version, plural] if method == Method::GET || method == Method::POST => {
+        [group, version, plural]
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
+        {
             (*group, *version, *plural, None, None, None)
         }
         // Cluster-scoped resource: /apis/{group}/{version}/{plural}/{name}
