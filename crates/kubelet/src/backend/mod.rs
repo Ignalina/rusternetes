@@ -22,6 +22,12 @@ use async_trait::async_trait;
 /// message, since the kubelet matches on a few of them (e.g. name conflicts).
 #[async_trait]
 pub trait ContainerBackend: Send + Sync {
+    /// Whether containers can join network namespaces the kubelet creates
+    /// (`network_mode: "ns:<path>"`). CNI networking is only used when true.
+    fn joins_kubelet_netns(&self) -> bool {
+        false
+    }
+
     /// A human-readable identity of the runtime, e.g. `"Podman Engine"`.
     async fn version_identity(&self) -> Result<String>;
 

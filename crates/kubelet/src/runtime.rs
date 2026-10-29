@@ -81,6 +81,13 @@ struct ProbeState {
     consecutive_successes: i32,
 }
 
+/// Outcome of trying to create a network namespace.
+#[derive(Debug)]
+enum NetnsProbe {
+    Works,
+    Fails(String),
+}
+
 /// ContainerRuntime manages containers using Docker/Podman with CNI networking
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
@@ -224,7 +231,7 @@ impl ContainerRuntime {
         info!("Kubernetes service host: {}", kubernetes_service_host);
 
         // Initialize CNI if plugins are available
-        let (cni, use_cni) = match Self::initialize_cni() {
+        let (cni, use_cni) = match Self::initialize_cni(backend.joins_kubelet_netns()) {
             Ok(cni_runtime) => {
                 info!("CNI networking enabled");
                 (Some(cni_runtime), true)
@@ -317,46 +324,80 @@ impl ContainerRuntime {
     }
 
     /// Initialize CNI runtime
-    fn initialize_cni() -> Result<CniRuntime> {
+    fn initialize_cni(backend_joins_kubelet_netns: bool) -> Result<CniRuntime> {
         let cni_plugin_paths = vec![PathBuf::from("/opt/cni/bin")];
         let cni_config_dir = PathBuf::from("/etc/cni/net.d");
 
-        // Check if CNI plugins exist
-        if !cni_plugin_paths.iter().any(|p| p.exists()) {
-            return Err(anyhow::anyhow!("CNI plugin directory not found"));
-        }
-
-        // Pre-flight check: verify we can create and access network namespaces
-        // This will fail in Podman Machine where netns created in container aren't
-        // accessible to other containers
-        let test_netns = "rusternetes-cni-test";
-        let create_result = Command::new("ip")
-            .args(["netns", "add", test_netns])
-            .output();
-
-        if let Ok(output) = create_result {
-            if output.status.success()
-                || String::from_utf8_lossy(&output.stderr).contains("File exists")
-            {
-                // Clean up test namespace
-                let _ = Command::new("ip")
-                    .args(["netns", "del", test_netns])
-                    .output();
-
-                // Network namespaces work, but we're likely in a container where
-                // they won't be accessible to sibling containers (Podman Machine case)
-                warn!("CNI plugins found but network namespaces may not work across containers.");
-                warn!("This is normal in Podman Machine - will fall back to Podman networking.");
-                return Err(anyhow::anyhow!(
-                    "Network namespace isolation prevents CNI usage"
-                ));
-            }
-        }
+        let plugins_found = cni_plugin_paths.iter().any(|p| p.exists());
+        // Only probe when plugins exist, so hosts without CNI never run `ip`.
+        let netns = if plugins_found {
+            Self::probe_netns()
+        } else {
+            NetnsProbe::Fails(String::new())
+        };
+        Self::cni_usable(plugins_found, netns, backend_joins_kubelet_netns)?;
 
         let cni = CniRuntime::new(cni_plugin_paths, cni_config_dir)?
             .with_default_network("rusternetes".to_string());
 
         Ok(cni)
+    }
+
+    /// Pre-flight check: can this process create network namespaces?
+    fn probe_netns() -> NetnsProbe {
+        let test_netns = "rusternetes-cni-test";
+        match Command::new("ip")
+            .args(["netns", "add", test_netns])
+            .output()
+        {
+            Ok(output)
+                if output.status.success()
+                    || String::from_utf8_lossy(&output.stderr).contains("File exists") =>
+            {
+                // Clean up test namespace
+                let _ = Command::new("ip")
+                    .args(["netns", "del", test_netns])
+                    .output();
+                NetnsProbe::Works
+            }
+            Ok(output) => {
+                NetnsProbe::Fails(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            }
+            Err(e) => NetnsProbe::Fails(e.to_string()),
+        }
+    }
+
+    /// Decide whether pods get CNI networking.
+    ///
+    /// CNI needs both: the kubelet must be able to create network namespaces
+    /// (pods are wired into `/var/run/netns/cni-<pod>`), and the backend must
+    /// be able to put containers into them. Without the first, every pod's
+    /// netns setup fails and its containers point at a pause container that
+    /// CNI mode never starts.
+    fn cni_usable(
+        plugins_found: bool,
+        netns: NetnsProbe,
+        backend_joins_kubelet_netns: bool,
+    ) -> Result<()> {
+        if !plugins_found {
+            return Err(anyhow::anyhow!("CNI plugin directory not found"));
+        }
+        match netns {
+            NetnsProbe::Fails(reason) => Err(anyhow::anyhow!(
+                "cannot create network namespaces for CNI: {}",
+                reason
+            )),
+            NetnsProbe::Works if !backend_joins_kubelet_netns => {
+                // Network namespaces work, but we're likely in a container where
+                // they won't be accessible to sibling containers (Podman Machine case)
+                warn!("CNI plugins found but network namespaces may not work across containers.");
+                warn!("This is normal in Podman Machine - will fall back to Podman networking.");
+                Err(anyhow::anyhow!(
+                    "Network namespace isolation prevents CNI usage"
+                ))
+            }
+            NetnsProbe::Works => Ok(()),
+        }
     }
 
     /// The container backend this runtime drives.
@@ -11623,6 +11664,24 @@ mod backend_tests {
         .await
         .unwrap();
         (runtime, volumes)
+    }
+
+    /// Regression: the pre-flight used to enable CNI exactly when
+    /// `ip netns add` failed, which left pods pointing at a pause container
+    /// that CNI mode never starts.
+    #[test]
+    fn cni_needs_working_netns_and_a_backend_that_joins_it() {
+        use super::NetnsProbe;
+        let usable =
+            |plugins, netns, joins| ContainerRuntime::cni_usable(plugins, netns, joins).is_ok();
+        let fails = || NetnsProbe::Fails("Operation not permitted".to_string());
+
+        assert!(!usable(true, fails(), false));
+        assert!(!usable(true, fails(), true));
+        // Docker/Podman cannot join kubelet-made namespaces: unchanged, no CNI.
+        assert!(!usable(true, NetnsProbe::Works, false));
+        assert!(usable(true, NetnsProbe::Works, true));
+        assert!(!usable(false, NetnsProbe::Works, true));
     }
 
     #[tokio::test]
