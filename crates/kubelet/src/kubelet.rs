@@ -42,6 +42,8 @@ pub enum PodWorkerState {
 
 pub struct Kubelet {
     node_name: String,
+    /// `--pod-cidr`: the Node's `spec.podCIDR`.
+    pod_cidr: Option<String>,
     storage: Arc<StorageBackend>,
     runtime: Arc<ContainerRuntime>,
     sync_interval: Duration,
@@ -117,7 +119,14 @@ impl Kubelet {
             pod_sync_locks: Mutex::new(HashSet::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
+            pod_cidr: None,
         })
+    }
+
+    /// Register the node with this pod CIDR (`spec.podCIDR` + `spec.podCIDRs`).
+    pub fn with_pod_cidr(mut self, pod_cidr: Option<String>) -> Self {
+        self.pod_cidr = pod_cidr.filter(|c| !c.is_empty());
+        self
     }
 
     pub async fn run(self: &Arc<Self>) -> Result<()> {
@@ -402,8 +411,8 @@ impl Kubelet {
 
         // Set node spec to mark it as schedulable
         node.spec = Some(NodeSpec {
-            pod_cidr: None,
-            pod_cidrs: None,
+            pod_cidr: self.pod_cidr.clone(),
+            pod_cidrs: self.pod_cidr.clone().map(|c| vec![c]),
             provider_id: None,
             unschedulable: Some(false),
             taints: None,

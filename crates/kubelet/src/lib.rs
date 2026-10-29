@@ -27,6 +27,10 @@ pub struct KubeletConfig {
     pub metrics_port: u16,
     pub kubernetes_service_host: String,
     pub pod_prefer_cluster_dns: bool,
+    /// The node's pod CIDR (`--pod-cidr`), registered as the Node's
+    /// `spec.podCIDR`/`spec.podCIDRs` — what a CNI with Kubernetes host-scope
+    /// IPAM (Cilium `ipam: kubernetes`, flannel, …) allocates pod IPs from.
+    pub pod_cidr: Option<String>,
 }
 
 impl Default for KubeletConfig {
@@ -41,6 +45,7 @@ impl Default for KubeletConfig {
             metrics_port: 10250,
             kubernetes_service_host: "127.0.0.1".to_string(),
             pod_prefer_cluster_dns: false,
+            pod_cidr: None,
         }
     }
 }
@@ -111,7 +116,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
             config.kubernetes_service_host,
             config.pod_prefer_cluster_dns,
         )
-        .await?,
+        .await?
+        .with_pod_cidr(config.pod_cidr),
     );
     let logs_backend = k.backend();
     tokio::spawn(async move {

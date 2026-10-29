@@ -393,6 +393,7 @@ async fn custom_resource_fallback(
                         plural.to_string(),
                         namespace.map(|s| s.to_string()),
                     )),
+                    axum::extract::Query(query_params.clone()),
                 )
                 .await
                 {
@@ -460,6 +461,72 @@ async fn custom_resource_fallback(
                 Ok(json) => json.into_response(),
                 Err(e) => {
                     warn!("Error updating custom resource: {}", e);
+                    e.into_response()
+                }
+            }
+        }
+        // DELETE on the collection = deletecollection: every object the
+        // list (with its labelSelector / fieldSelector) returns, deleted one
+        // by one through the single-object path (finalizers, admission).
+        (Method::DELETE, None, None) => {
+            let query_params: std::collections::HashMap<String, String> = uri
+                .query()
+                .map(|q| {
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let listed = handlers::custom_resource::list_custom_resources(
+                State(state.clone()),
+                Extension(auth_ctx.clone()),
+                axum::extract::Path((
+                    group.to_string(),
+                    version.to_string(),
+                    plural.to_string(),
+                    namespace.map(|s| s.to_string()),
+                )),
+                axum::extract::Query(query_params.clone()),
+            )
+            .await;
+            match listed {
+                Ok(Json(mut list)) => {
+                    let mut failed = None;
+                    for cr in &list.items {
+                        let item_ns = cr.metadata.namespace.clone().or(namespace.map(|s| s.to_string()));
+                        if let Err(e) = handlers::custom_resource::delete_custom_resource(
+                            State(state.clone()),
+                            Extension(auth_ctx.clone()),
+                            axum::extract::Path((
+                                group.to_string(),
+                                version.to_string(),
+                                plural.to_string(),
+                                item_ns,
+                                cr.metadata.name.clone(),
+                            )),
+                            axum::extract::Query(query_params.clone()),
+                        )
+                        .await
+                        {
+                            if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        Some(e) => {
+                            warn!("Error deleting custom resources: {}", e);
+                            e.into_response()
+                        }
+                        None => {
+                            list.items.clear();
+                            Json(list).into_response()
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Error listing custom resources for deletecollection: {}", e);
                     e.into_response()
                 }
             }

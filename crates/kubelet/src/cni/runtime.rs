@@ -72,6 +72,19 @@ impl CniRuntime {
         ifname: &str,
         network_name: Option<&str>,
     ) -> Result<CniResult, CniError> {
+        self.setup_network_with_args(container_id, netns, ifname, network_name, None)
+    }
+
+    /// Setup network for a container (ADD operation) with `CNI_ARGS`
+    /// (`K8S_POD_NAMESPACE=…;K8S_POD_NAME=…`, as the CRI runtimes pass them).
+    pub fn setup_network_with_args(
+        &self,
+        container_id: &str,
+        netns: &str,
+        ifname: &str,
+        network_name: Option<&str>,
+        args: Option<&str>,
+    ) -> Result<CniResult, CniError> {
         info!(
             "Setting up network for container {} in netns {}",
             container_id, netns
@@ -103,15 +116,24 @@ impl CniRuntime {
         // Get network configuration
         let network = self.get_network_config(network_name)?;
 
-        // Execute ADD command
-        let plugin_manager = self.plugin_manager.lock().unwrap();
+        // Execute ADD command. A plugin the network names but the last scan
+        // did not see (installed after start, e.g. by a CNI agent's pod) is
+        // looked for again before giving up.
+        let mut plugin_manager = self.plugin_manager.lock().unwrap();
+        if network
+            .plugins
+            .iter()
+            .any(|p| !plugin_manager.has_plugin(&p.plugin_type))
+        {
+            plugin_manager.discover_plugins()?;
+        }
         let result = plugin_manager.execute_network(
             CniCommand::Add,
             &network,
             container_id,
             netns,
             ifname,
-            None,
+            args,
         )?;
 
         // Store attachment

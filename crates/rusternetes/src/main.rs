@@ -161,6 +161,11 @@ struct Args {
     /// This client's key for the etcd servers (PEM).
     #[arg(long)]
     etcd_keyfile: Option<String>,
+
+    /// The embedded kubelet registers its Node with this pod CIDR
+    /// (`spec.podCIDR`), for CNIs that allocate from the node's range.
+    #[arg(long)]
+    pod_cidr: Option<String>,
 }
 
 /// All three of a TLS file set, or none.
@@ -421,6 +426,7 @@ async fn run() -> Result<()> {
             .or_else(|| std::env::var("KUBERNETES_SERVICE_HOST_OVERRIDE").ok())
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         pod_prefer_cluster_dns: args.pod_prefer_cluster_dns,
+        pod_cidr: args.pod_cidr.clone(),
     };
     let kubelet_handle = if on("kubelet") {
         Some(tokio::spawn(async move {
