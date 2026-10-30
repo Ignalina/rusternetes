@@ -75,6 +75,12 @@ impl EtcdStorage {
         Ok(Self { client })
     }
 
+    /// The etcd client (cheap to clone), for leader election on the same
+    /// connection settings (TLS included).
+    pub fn client(&self) -> Client {
+        self.client.clone()
+    }
+
     /// Helper to serialize a value to JSON
     fn serialize<T: Serialize>(value: &T) -> Result<String> {
         serde_json::to_string(value).map_err(Error::Serialization)

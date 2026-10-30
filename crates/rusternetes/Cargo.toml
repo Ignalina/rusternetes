@@ -44,6 +44,9 @@ youki = ["rusternetes-kubelet/youki"]
 # for a client, --serve-etcd-cert-file/--serve-etcd-key-file/
 # --serve-etcd-client-ca-file for the served store.
 etcd-tls = ["rusternetes-storage/etcd-tls", "tunnr-etcd?/tls", "dep:rustls"]
+# The served store as a Raft replica (tunnr-etcd feature raft): an HA control
+# plane of three, --store-raft-id/--store-raft-peers, plus --leader-elect.
+store-raft = ["redb", "tunnr-etcd?/raft"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }

@@ -75,6 +75,18 @@ impl LeaderElector {
         })
     }
 
+    /// A LeaderElector on an existing client (one that already speaks TLS
+    /// to the store, as the all-in-one's etcd backend does).
+    pub fn with_client(client: Client, config: LeaderElectionConfig) -> Self {
+        Self {
+            client: Arc::new(Mutex::new(client)),
+            config,
+            state: Arc::new(RwLock::new(LeaderState::Unknown)),
+            lease_id: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(RwLock::new(false)),
+        }
+    }
+
     /// Get the current leader state
     pub async fn get_state(&self) -> LeaderState {
         self.state.read().await.clone()
@@ -231,9 +243,21 @@ impl LeaderElector {
 
         // Check if we have an existing lease
         if let Some(lease_id) = *lease_id_guard {
-            // Try to keep it alive
-            match client.lease_keep_alive(lease_id).await {
-                Ok(_) => {
+            // Keep it alive: `lease_keep_alive` only opens the stream; one
+            // keepalive has to be sent and answered (TTL 0: the lease is gone).
+            let renewed = match client.lease_keep_alive(lease_id).await {
+                Ok((mut keeper, mut stream)) => match keeper.keep_alive().await {
+                    Ok(()) => match stream.message().await {
+                        Ok(Some(r)) if r.ttl() > 0 => Ok(()),
+                        Ok(_) => Err("the lease expired".to_string()),
+                        Err(e) => Err(e.to_string()),
+                    },
+                    Err(e) => Err(e.to_string()),
+                },
+                Err(e) => Err(e.to_string()),
+            };
+            match renewed {
+                Ok(()) => {
                     debug!(lease_id = lease_id, "Renewed lease");
                     return Ok(lease_id);
                 }
