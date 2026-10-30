@@ -502,6 +502,10 @@ pub fn apply_layer(blob: &Path, rootfs: &Path) -> Result<()> {
     archive.set_preserve_permissions(true);
     archive.set_preserve_ownerships(true);
     archive.set_preserve_mtime(true);
+    // File capabilities ride as `security.capability` xattrs (CoreDNS binds
+    // :53 as a non-root user through `cap_net_bind_service=+ep` on its
+    // binary); without them such a binary gets EACCES at bind.
+    archive.set_unpack_xattrs(true);
     archive.set_overwrite(true);
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -634,6 +638,39 @@ mod tests {
         }
         b.finish().unwrap();
         f
+    }
+
+    #[test]
+    fn layers_keep_extended_attributes() {
+        // Probe: the test file system must take user xattrs at all.
+        let root = tempfile::tempdir().unwrap();
+        let probe = root.path().join("probe");
+        fs::write(&probe, "").unwrap();
+        if xattr::set(&probe, "user.probe", b"1").is_err() {
+            eprintln!("skipped: no user xattrs on {:?}", root.path());
+            return;
+        }
+        // A file with an xattr as a PAX record, as image builders write a
+        // file capability (`SCHILY.xattr.security.capability`).
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let mut b = tar::Builder::new(f.reopen().unwrap());
+        b.append_pax_extensions([("SCHILY.xattr.user.rusternetes", &b"cap"[..])])
+            .unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_mtime(0);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(1);
+        h.set_mode(0o755);
+        b.append_data(&mut h, "coredns", &b"x"[..]).unwrap();
+        b.finish().unwrap();
+
+        apply_layer(f.path(), root.path()).unwrap();
+        assert_eq!(
+            xattr::get(root.path().join("coredns"), "user.rusternetes").unwrap(),
+            Some(b"cap".to_vec())
+        );
     }
 
     #[test]

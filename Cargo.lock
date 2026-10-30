@@ -4363,6 +4363,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "xattr",
 ]
 
 [[package]]
