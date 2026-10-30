@@ -94,6 +94,23 @@ pub async fn execute_full(
         url.push_str(&params.join("&"));
     }
 
+    if follow {
+        // Stream the body as it arrives until the server ends it.
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let resp = client
+            .get_stream(&url)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut body = resp.bytes_stream();
+        let mut out = tokio::io::stdout();
+        while let Some(chunk) = body.next().await {
+            out.write_all(&chunk?).await?;
+            out.flush().await?;
+        }
+        return Ok(());
+    }
+
     // Fetch logs (the API returns plain text)
     let logs = client.get_text(&url).await?;
 

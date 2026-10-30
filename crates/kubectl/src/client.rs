@@ -18,6 +18,9 @@ pub struct ApiClient {
     base_url: String,
     client: Client,
     token: Option<String>,
+    /// rustls for WebSocket streams (exec, attach, port-forward): the same
+    /// trust and client certificate as `client`.
+    ws_tls: std::sync::Arc<rustls::ClientConfig>,
 }
 
 #[derive(Debug)]
@@ -38,25 +41,13 @@ impl std::fmt::Display for GetError {
 impl std::error::Error for GetError {}
 
 impl ApiClient {
+    #[allow(dead_code)] // tests and library-style callers
     pub fn new(
         base_url: &str,
         insecure_skip_tls_verify: bool,
         token: Option<String>,
     ) -> Result<Self> {
-        let client = if insecure_skip_tls_verify {
-            Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()
-                .context("Failed to build HTTP client")?
-        } else {
-            Client::new()
-        };
-
-        Ok(Self {
-            base_url: base_url.to_string(),
-            client,
-            token,
-        })
+        Self::with_tls(base_url, insecure_skip_tls_verify, token, None, None, None)
     }
 
     /// Like [`Self::new`], trusting `ca_pem` and presenting a client
@@ -70,11 +61,19 @@ impl ApiClient {
         cert_pem: Option<Vec<u8>>,
         key_pem: Option<Vec<u8>>,
     ) -> Result<Self> {
+        let ws_tls = std::sync::Arc::new(crate::websocket::rustls_config(
+            insecure_skip_tls_verify,
+            ca_pem.as_deref(),
+            cert_pem.as_deref(),
+            key_pem.as_deref(),
+        )?);
         let mut b = Client::builder()
             .use_rustls_tls()
             .danger_accept_invalid_certs(insecure_skip_tls_verify);
         if let Some(ca) = ca_pem {
-            b = b.add_root_certificate(reqwest::Certificate::from_pem(&ca).context("certificate-authority")?);
+            b = b.add_root_certificate(
+                reqwest::Certificate::from_pem(&ca).context("certificate-authority")?,
+            );
         }
         if let (Some(cert), Some(key)) = (cert_pem, key_pem) {
             let mut pem = cert;
@@ -86,6 +85,7 @@ impl ApiClient {
             base_url: base_url.to_string(),
             client: b.build().context("Failed to build HTTP client")?,
             token,
+            ws_tls,
         })
     }
 
@@ -342,15 +342,29 @@ impl ApiClient {
             anyhow::bail!("Invalid base URL: {}", self.base_url);
         };
 
-        let mut url = format!("{}{}", ws_base, path);
+        Ok(format!("{}{}", ws_base, path))
+    }
 
-        // Add token as query parameter if present (WebSocket doesn't support headers)
-        if let Some(ref token) = self.token {
-            let separator = if url.contains('?') { "&" } else { "?" };
-            url.push_str(&format!("{}token={}", separator, token));
-        }
+    /// Open a WebSocket to `path` offering `protocols`, over the same TLS
+    /// identity and bearer token as the REST calls.
+    pub async fn ws_connect(
+        &self,
+        path: &str,
+        protocols: &[&str],
+    ) -> Result<crate::websocket::WsStream> {
+        let url = self.get_ws_url(path)?;
+        crate::websocket::connect(
+            &url,
+            protocols,
+            self.token.as_deref(),
+            Some(self.ws_tls.clone()),
+        )
+        .await
+    }
 
-        Ok(url)
+    /// The rustls configuration WebSocket streams use.
+    pub fn ws_tls(&self) -> std::sync::Arc<rustls::ClientConfig> {
+        self.ws_tls.clone()
     }
 
     pub fn get_base_url(&self) -> &str {

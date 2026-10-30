@@ -208,7 +208,9 @@ impl KubeConfig {
         let user = self.get_user(context)?;
         let pick = |data: &Option<String>, file: &Option<String>| -> Result<Option<Vec<u8>>> {
             if let Some(d) = data {
-                return Ok(Some(base64::engine::general_purpose::STANDARD.decode(d.trim())?));
+                return Ok(Some(
+                    base64::engine::general_purpose::STANDARD.decode(d.trim())?,
+                ));
             }
             if let Some(f) = file {
                 return Ok(Some(std::fs::read(f)?));
@@ -216,7 +218,10 @@ impl KubeConfig {
             Ok(None)
         };
         Ok((
-            pick(&cluster.certificate_authority_data, &cluster.certificate_authority)?,
+            pick(
+                &cluster.certificate_authority_data,
+                &cluster.certificate_authority,
+            )?,
             pick(&user.client_certificate_data, &user.client_certificate)?,
             pick(&user.client_key_data, &user.client_key)?,
         ))

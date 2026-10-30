@@ -40,11 +40,11 @@ pub async fn execute(
         url_path.push_str(&query_params.join("&"));
     }
 
-    // Convert HTTP(S) URL to WebSocket URL
-    let ws_url = client.get_ws_url(&url_path)?;
-
-    // Execute with WebSocket streaming (same mechanism as exec)
-    websocket::exec_stream(ws_url, stdin, tty).await
+    let ws = client
+        .ws_connect(&url_path, websocket::EXEC_PROTOCOLS)
+        .await?;
+    let code = websocket::run_stream(ws, stdin).await?;
+    std::process::exit(code)
 }
 
 #[cfg(test)]

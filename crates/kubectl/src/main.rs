@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod kubeconfig;
+mod printers;
 mod types;
 mod websocket;
 
@@ -1019,7 +1020,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Load kubeconfig or use CLI flags
-    let (server, skip_tls, token, default_namespace, tls_pem) = if let Some(server_url) = cli.server {
+    let (server, skip_tls, token, default_namespace, tls_pem) = if let Some(server_url) = cli.server
+    {
         // CLI flags override kubeconfig
         (
             server_url,

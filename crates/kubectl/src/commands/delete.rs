@@ -181,7 +181,6 @@ pub async fn execute_from_file(client: &ApiClient, file: &str) -> Result<()> {
     };
 
     // Support for multi-document YAML files
-    let mut deleted_count = 0;
     for document in serde_yaml::Deserializer::from_str(&contents) {
         let value = serde_yaml::Value::deserialize(document)?;
 
@@ -190,10 +189,8 @@ pub async fn execute_from_file(client: &ApiClient, file: &str) -> Result<()> {
         }
 
         delete_resource(client, &value).await?;
-        deleted_count += 1;
     }
 
-    println!("Deleted {} resource(s) from file", deleted_count);
     Ok(())
 }
 
@@ -219,7 +216,14 @@ async fn delete_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
         .await
         .context(format!("Failed to delete {} {}", kind, name))?;
 
-    println!("{}/{} deleted", kind.to_lowercase(), name);
+    let api_version = value
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    println!(
+        "{}",
+        crate::printers::deleted_line(&crate::printers::qualified_kind(kind, api_version), name)
+    );
     Ok(())
 }
 
