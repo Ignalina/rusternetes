@@ -743,9 +743,19 @@ async fn start_store_replica(args: &Args, id: u64, tls: Option<[String; 3]>) -> 
         if serve_tls.is_some() { "mutual TLS" } else { "plaintext" },
         peers.values().map(|p| p.raft_addr.clone()).collect::<Vec<_>>()
     );
+    if args.serve_etcd_node_authz {
+        if serve_tls.is_none() {
+            anyhow::bail!("--serve-etcd-node-authz needs the --serve-etcd TLS files: a node is known by its client certificate");
+        }
+        #[cfg(not(feature = "etcd-authz"))]
+        anyhow::bail!("--serve-etcd-node-authz needs the etcd-authz feature");
+        #[cfg(feature = "etcd-authz")]
+        info!("Store replica: per-node limits on, checked against committed state on every replica");
+    }
     let opts = tunnr_etcd::server::ServeOptions {
         client_url: format!("{scheme}://{addr}"),
         tls: serve_tls,
+        node_authz: args.serve_etcd_node_authz.then(tunnr_etcd::server::NodeAuthz::default),
         ..Default::default()
     };
     let served = node.clone();
