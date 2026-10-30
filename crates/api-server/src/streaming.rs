@@ -265,6 +265,151 @@ pub async fn handle_ws_exec(
     debug!("WS exec completed for {}", container_id);
 }
 
+/// Whether this API server reaches a Docker/Podman socket itself (the
+/// compose clusters). When it does not (a node with the youki backend), exec,
+/// attach and followed logs go to the kubelet of the pod's node.
+pub async fn local_runtime_reachable() -> bool {
+    match bollard::Docker::connect_with_local_defaults() {
+        Ok(d) => matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), d.ping()).await,
+            Ok(Ok(_))
+        ),
+        Err(_) => false,
+    }
+}
+
+/// `host:10250` of the kubelet on the pod's node (its InternalIP).
+pub async fn node_kubelet_addr(
+    state: &crate::state::ApiServerState,
+    pod: &Pod,
+) -> anyhow::Result<String> {
+    use rusternetes_storage::Storage;
+    let storage = &state.storage;
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("pod is not on a node"))?;
+    let node: rusternetes_common::resources::Node = storage
+        .get(&rusternetes_storage::build_key("nodes", None, &node_name))
+        .await?;
+    let ip = node
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .and_then(|a| a.iter().find(|a| a.address_type == "InternalIP"))
+        .map(|a| a.address.clone())
+        .ok_or_else(|| anyhow::anyhow!("node {} has no InternalIP", node_name))?;
+    Ok(if ip.contains(':') {
+        format!("[{}]:10250", ip)
+    } else {
+        format!("{}:10250", ip)
+    })
+}
+
+/// The kubelet's streaming URL for `verb` (`exec` or `attach`) on a
+/// container, with the exec options as its query.
+pub fn kubelet_stream_url(
+    addr: &str,
+    verb: &str,
+    namespace: &str,
+    pod: &str,
+    container: &str,
+    command: &[String],
+    stdin: bool,
+    tty: bool,
+) -> String {
+    let mut q = url::form_urlencoded::Serializer::new(String::new());
+    for c in command {
+        q.append_pair("command", c);
+    }
+    q.append_pair("stdin", if stdin { "true" } else { "false" });
+    q.append_pair("stdout", "true");
+    q.append_pair("stderr", "true");
+    q.append_pair("tty", if tty { "true" } else { "false" });
+    format!(
+        "ws://{}/{}/{}/{}/{}?{}",
+        addr,
+        verb,
+        namespace,
+        pod,
+        container,
+        q.finish()
+    )
+}
+
+/// Bridge the client's WebSocket to the kubelet's at `url`, frame for frame
+/// (both speak the channel protocol). For a v1 (`channel.k8s.io`) client a
+/// Success status frame is dropped, since v1 has no status channel.
+pub async fn proxy_to_kubelet(socket: WebSocket, url: String, is_v1: bool) {
+    use tokio_tungstenite::tungstenite::{self as t, client::IntoClientRequest};
+    let (mut client_tx, mut client_rx) = socket.split();
+    let connected = async {
+        let mut req = url.as_str().into_client_request()?;
+        req.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            t::http::HeaderValue::from_static("v5.channel.k8s.io, v4.channel.k8s.io"),
+        );
+        let (ws, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio_tungstenite::connect_async(req),
+        )
+        .await??;
+        Ok::<_, anyhow::Error>(ws)
+    }
+    .await;
+    let node = match connected {
+        Ok(ws) => ws,
+        Err(e) => {
+            error!("stream proxy: kubelet {} unreachable: {}", url, e);
+            let status = serde_json::json!({
+                "metadata": {}, "status": "Failure",
+                "message": format!("error dialing backend: {}", e)
+            });
+            let mut f = vec![3u8];
+            f.extend_from_slice(status.to_string().as_bytes());
+            let _ = client_tx.send(Message::Binary(f)).await;
+            let _ = client_tx.close().await;
+            return;
+        }
+    };
+    let (mut node_tx, mut node_rx) = node.split();
+    let up = tokio::spawn(async move {
+        while let Some(Ok(m)) = client_rx.next().await {
+            let m = match m {
+                Message::Binary(d) => t::Message::Binary(d),
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            if node_tx.send(m).await.is_err() {
+                break;
+            }
+        }
+        let _ = node_tx.close().await;
+    });
+    while let Some(Ok(m)) = node_rx.next().await {
+        match m {
+            t::Message::Binary(d) => {
+                if is_v1 && d.first() == Some(&3) && d.windows(9).any(|w| w == b"\"Success\"") {
+                    continue;
+                }
+                if client_tx.send(Message::Binary(d)).await.is_err() {
+                    break;
+                }
+            }
+            t::Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    up.abort();
+    let _ = client_tx
+        .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+            code: 1000,
+            reason: "".into(),
+        })))
+        .await;
+}
+
 /// Handle WebSocket attach
 pub async fn handle_ws_attach(
     mut socket: WebSocket,
@@ -660,5 +805,86 @@ mod portforward_tests {
             }
         }
         assert_eq!(data, b"hi");
+    }
+}
+
+#[cfg(test)]
+mod kubelet_proxy_tests {
+    use super::*;
+    use axum::extract::ws::WebSocketUpgrade;
+    use axum::routing::get;
+    use tokio_tungstenite::tungstenite::Message as T;
+
+    #[test]
+    fn kubelet_url_carries_the_exec_options() {
+        let url = kubelet_stream_url(
+            "10.77.0.2:10250",
+            "exec",
+            "default",
+            "web",
+            "httpd",
+            &["sh".into(), "-c".into(), "echo a b; exit 3".into()],
+            true,
+            false,
+        );
+        assert_eq!(
+            url,
+            "ws://10.77.0.2:10250/exec/default/web/httpd?command=sh&command=-c&command=echo+a+b%3B+exit+3&stdin=true&stdout=true&stderr=true&tty=false"
+        );
+    }
+
+    /// The client's frames reach the kubelet and the kubelet's reach the
+    /// client, status frame included; v1 clients do not get Success.
+    #[tokio::test]
+    async fn proxies_frames_both_ways() {
+        for v1 in [false, true] {
+            // A kubelet stand-in: echo stdin on stdout, then status + close.
+            let node = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let node_addr = node.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (tcp, _) = node.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                while let Some(Ok(T::Binary(d))) = ws.next().await {
+                    if d == [255, 0] {
+                        break;
+                    }
+                    let mut out = d.clone();
+                    out[0] = 1;
+                    ws.send(T::Binary(out)).await.unwrap();
+                }
+                ws.send(T::Binary(b"\x03{\"status\":\"Success\"}".to_vec()))
+                    .await
+                    .unwrap();
+                let _ = ws.close(None).await;
+            });
+            let url = format!("ws://{}/exec/default/web/c?command=cat", node_addr);
+            let app = axum::Router::new().route(
+                "/",
+                get(move |ws: WebSocketUpgrade| {
+                    let url = url.clone();
+                    async move { ws.on_upgrade(move |s| proxy_to_kubelet(s, url, v1)) }
+                }),
+            );
+            let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let front_addr = front.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(front, app).await.unwrap() });
+
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/", front_addr))
+                .await
+                .unwrap();
+            ws.send(T::Binary(b"\0hi".to_vec())).await.unwrap();
+            ws.send(T::Binary(vec![255, 0])).await.unwrap();
+            let mut frames = Vec::new();
+            while let Some(Ok(m)) = ws.next().await {
+                if let T::Binary(d) = m {
+                    frames.push(d);
+                }
+            }
+            let mut want = vec![b"\x01hi".to_vec()];
+            if !v1 {
+                want.push(b"\x03{\"status\":\"Success\"}".to_vec());
+            }
+            assert_eq!(frames, want, "v1={}", v1);
+        }
     }
 }

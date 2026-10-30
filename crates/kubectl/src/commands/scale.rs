@@ -10,6 +10,7 @@ pub async fn execute(
     namespace: &str,
     replicas: i32,
 ) -> Result<()> {
+    let qualified = scaled_kind(resource_type);
     let path = match resource_type {
         "deployment" | "deployments" | "deploy" => {
             format!(
@@ -45,19 +46,41 @@ pub async fn execute(
     });
 
     // Use strategic merge patch for the scale subresource
-    let result: Value = client
+    let _: Value = client
         .patch(&path, &scale_body, "application/merge-patch+json")
         .await
         .context("Failed to scale resource")?;
 
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    println!(
+        "{}",
+        crate::printers::action_line(qualified, name, "scaled")
+    );
 
     Ok(())
+}
+
+/// kubectl's name for the scaled kind: `deployment.apps`, `statefulset.apps`.
+fn scaled_kind(resource_type: &str) -> &'static str {
+    match resource_type {
+        "replicaset" | "replicasets" | "rs" => "replicaset.apps",
+        "statefulset" | "statefulsets" | "sts" => "statefulset.apps",
+        "replicationcontroller" | "rc" => "replicationcontroller",
+        _ => "deployment.apps",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn scale_message_like_upstream() {
+        assert_eq!(
+            crate::printers::action_line(super::scaled_kind("deploy"), "web", "scaled"),
+            "deployment.apps/web scaled"
+        );
+        assert_eq!(super::scaled_kind("sts"), "statefulset.apps");
+    }
 
     #[test]
     fn test_scale_path_deployment() {

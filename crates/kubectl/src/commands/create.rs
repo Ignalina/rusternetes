@@ -1425,6 +1425,22 @@ pub async fn execute(client: &ApiClient, file: &str) -> Result<()> {
     Ok(())
 }
 
+/// `deployment.apps/web created`, as upstream kubectl says it.
+fn created_line(value: &serde_yaml::Value, name: &str) -> String {
+    let field = |k: &str| {
+        value
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    crate::printers::action_line(
+        &crate::printers::qualified_kind(&field("kind"), &field("apiVersion")),
+        name,
+        "created",
+    )
+}
+
 async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Result<()> {
     // Get the kind field
     let kind = value
@@ -1441,7 +1457,7 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
             let _result: Pod = client
                 .post(&format!("/api/v1/namespaces/{}/pods", namespace), &pod)
                 .await?;
-            println!("Pod '{}' created", pod.metadata.name);
+            println!("{}", created_line(value, &pod.metadata.name));
         }
         "Service" => {
             let service: Service = serde_yaml::from_str(&yaml_str)?;
@@ -1452,7 +1468,7 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
                     &service,
                 )
                 .await?;
-            println!("Service '{}' created", service.metadata.name);
+            println!("{}", created_line(value, &service.metadata.name));
         }
         "Deployment" => {
             let deployment: Deployment = serde_yaml::from_str(&yaml_str)?;
@@ -1467,24 +1483,24 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
                     &deployment,
                 )
                 .await?;
-            println!("Deployment '{}' created", deployment.metadata.name);
+            println!("{}", created_line(value, &deployment.metadata.name));
         }
         "Node" => {
             let node: Node = serde_yaml::from_str(&yaml_str)?;
             let _result: Node = client.post("/api/v1/nodes", &node).await?;
-            println!("Node '{}' created", node.metadata.name);
+            println!("{}", created_line(value, &node.metadata.name));
         }
         "Namespace" => {
             let namespace: Namespace = serde_yaml::from_str(&yaml_str)?;
             let _result: Namespace = client.post("/api/v1/namespaces", &namespace).await?;
-            println!("Namespace '{}' created", namespace.metadata.name);
+            println!("{}", created_line(value, &namespace.metadata.name));
         }
         "StorageClass" => {
             let sc: StorageClass = serde_yaml::from_str(&yaml_str)?;
             let _result: StorageClass = client
                 .post("/apis/storage.k8s.io/v1/storageclasses", &sc)
                 .await?;
-            println!("StorageClass '{}' created", sc.metadata.name);
+            println!("{}", created_line(value, &sc.metadata.name));
         }
         "VolumeSnapshot" => {
             let vs: VolumeSnapshot = serde_yaml::from_str(&yaml_str)?;
@@ -1498,7 +1514,7 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
                     &vs,
                 )
                 .await?;
-            println!("VolumeSnapshot '{}' created", vs.metadata.name);
+            println!("{}", created_line(value, &vs.metadata.name));
         }
         "VolumeSnapshotClass" => {
             let vsc: VolumeSnapshotClass = serde_yaml::from_str(&yaml_str)?;
@@ -1508,7 +1524,7 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
                     &vsc,
                 )
                 .await?;
-            println!("VolumeSnapshotClass '{}' created", vsc.metadata.name);
+            println!("{}", created_line(value, &vsc.metadata.name));
         }
         "Endpoints" => {
             let ep: Endpoints = serde_yaml::from_str(&yaml_str)?;
@@ -1516,7 +1532,7 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
             let _result: Endpoints = client
                 .post(&format!("/api/v1/namespaces/{}/endpoints", namespace), &ep)
                 .await?;
-            println!("Endpoints '{}' created", ep.metadata.name);
+            println!("{}", created_line(value, &ep.metadata.name));
         }
         "ResourceQuota" => {
             let rq: ResourceQuota = serde_yaml::from_str(&yaml_str)?;
@@ -1527,7 +1543,7 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
                     &rq,
                 )
                 .await?;
-            println!("ResourceQuota '{}' created", rq.metadata.name);
+            println!("{}", created_line(value, &rq.metadata.name));
         }
         "LimitRange" => {
             let lr: LimitRange = serde_yaml::from_str(&yaml_str)?;
@@ -1538,14 +1554,14 @@ async fn create_resource(client: &ApiClient, value: &serde_yaml::Value) -> Resul
                     &lr,
                 )
                 .await?;
-            println!("LimitRange '{}' created", lr.metadata.name);
+            println!("{}", created_line(value, &lr.metadata.name));
         }
         "PriorityClass" => {
             let pc: PriorityClass = serde_yaml::from_str(&yaml_str)?;
             let _result: PriorityClass = client
                 .post("/apis/scheduling.k8s.io/v1/priorityclasses", &pc)
                 .await?;
-            println!("PriorityClass '{}' created", pc.metadata.name);
+            println!("{}", created_line(value, &pc.metadata.name));
         }
         _ => anyhow::bail!("Unsupported resource kind: {}", kind),
     }

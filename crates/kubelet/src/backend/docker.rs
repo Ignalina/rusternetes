@@ -231,11 +231,12 @@ impl ContainerBackend for DockerBackend {
 
     async fn start_exec(&self, exec_id: &str) -> Result<StartExecResults> {
         Ok(match self.docker.start_exec(exec_id, None).await? {
-            bollard::exec::StartExecResults::Attached { output, .. } => {
+            bollard::exec::StartExecResults::Attached { output, input } => {
                 StartExecResults::Attached {
                     output: output
                         .map(|r| r.map(log_output).map_err(Into::into))
                         .boxed(),
+                    input: Some(input),
                 }
             }
             bollard::exec::StartExecResults::Detached => StartExecResults::Detached,
@@ -255,6 +256,7 @@ impl ContainerBackend for DockerBackend {
             stdout: options.stdout,
             stderr: options.stderr,
             tail: options.tail,
+            follow: options.follow,
             ..Default::default()
         };
         self.docker

@@ -43,6 +43,8 @@ pub struct LogsOptions {
     pub stderr: bool,
     /// Number of lines from the end, or `"all"`.
     pub tail: String,
+    /// Keep streaming new output until the container stops.
+    pub follow: bool,
 }
 
 /// Options for [`ContainerBackend::stats`](super::ContainerBackend::stats).
@@ -282,6 +284,9 @@ impl fmt::Display for LogOutput {
 pub enum StartExecResults {
     Attached {
         output: BackendStream<'static, LogOutput>,
+        /// The exec's stdin, when it was created with `attach_stdin`;
+        /// shutting it down is end of input.
+        input: Option<std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>>,
     },
     Detached,
 }

@@ -241,6 +241,7 @@ struct ApplyResult {
 enum ApplyAction {
     Created,
     Configured,
+    Unchanged,
 }
 
 impl ApplyResult {
@@ -275,6 +276,7 @@ fn format_output(result: &ApplyResult, options: &ApplyOptions) {
             let action = match result.action {
                 ApplyAction::Created => "created",
                 ApplyAction::Configured => "configured",
+                ApplyAction::Unchanged => "unchanged",
             };
             println!("{} {}", result.resource_label(), action);
         }
@@ -284,6 +286,29 @@ fn format_output(result: &ApplyResult, options: &ApplyOptions) {
 // ---------------------------------------------------------------------------
 // Resource existence check
 // ---------------------------------------------------------------------------
+
+/// The object at `path` when its last-applied configuration equals the one
+/// in `applied` (upstream kubectl then says `unchanged` and sends nothing).
+async fn unchanged_since_last_apply(
+    client: &ApiClient,
+    path: &str,
+    applied: &Value,
+) -> Result<Option<Value>> {
+    let ann = |v: &Value| {
+        v.pointer("/metadata/annotations")
+            .and_then(|a| a.get(LAST_APPLIED_ANNOTATION))
+            .and_then(Value::as_str)
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    };
+    match client.get::<Value>(path).await {
+        Ok(live) => Ok(match (ann(&live), ann(applied)) {
+            (Some(a), Some(b)) if a == b => Some(live),
+            _ => None,
+        }),
+        Err(GetError::NotFound) => Ok(None),
+        Err(GetError::Other(e)) => Err(e),
+    }
+}
 
 async fn resource_exists<T: DeserializeOwned>(client: &ApiClient, path: &str) -> Result<bool> {
     match client.get::<T>(path).await {
@@ -787,8 +812,15 @@ async fn apply_namespaced<T: HasMetadata>(
     let collection_path = format!("{}/namespaces/{}/{}", api_base, ns, resource_plural);
 
     let exists = resource_exists::<T>(client, &item_path).await?;
+    let unchanged = if exists {
+        unchanged_since_last_apply(client, &item_path, &serde_json::to_value(&resource)?).await?
+    } else {
+        None
+    };
 
-    let (action, response) = if exists {
+    let (action, response) = if let Some(live) = unchanged {
+        (ApplyAction::Unchanged, live)
+    } else if exists {
         let result: Value = client
             .put(&format!("{}{}", item_path, query), &resource)
             .await?;
@@ -835,8 +867,15 @@ async fn apply_cluster<T: HasMetadata>(
     let item_path = format!("{}/{}", collection_path, name);
 
     let exists = resource_exists::<T>(client, &item_path).await?;
+    let unchanged = if exists {
+        unchanged_since_last_apply(client, &item_path, &serde_json::to_value(&resource)?).await?
+    } else {
+        None
+    };
 
-    let (action, response) = if exists {
+    let (action, response) = if let Some(live) = unchanged {
+        (ApplyAction::Unchanged, live)
+    } else if exists {
         let result: Value = client
             .put(&format!("{}{}", item_path, query), &resource)
             .await?;

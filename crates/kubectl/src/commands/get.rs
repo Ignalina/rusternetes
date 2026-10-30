@@ -1,4 +1,5 @@
 use crate::client::{ApiClient, GetError};
+use crate::printers;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
@@ -441,6 +442,21 @@ pub async fn execute_with_query(
         .transpose()?
         .unwrap_or(OutputFormat::Table);
 
+    if let Some(kind) = printers::Kind::parse(resource_type) {
+        return print_kind(
+            client,
+            kind,
+            name,
+            namespace,
+            &format,
+            no_headers,
+            query,
+            show_labels,
+            sort_by,
+        )
+        .await;
+    }
+
     // Helper macro to reduce code duplication
     macro_rules! get_resources {
         ($path:expr, $type:ty, $print_fn:expr) => {{
@@ -574,6 +590,104 @@ pub async fn execute_with_query(
         }
     }
 
+    Ok(())
+}
+
+/// `get` for the kinds [`printers`] knows: upstream's columns and wording,
+/// `-o wide|yaml|json|name|jsonpath`, `-A` (NAMESPACE column).
+#[allow(clippy::too_many_arguments)]
+async fn print_kind(
+    client: &ApiClient,
+    kind: printers::Kind,
+    name: Option<&str>,
+    namespace: Option<&str>,
+    format: &OutputFormat,
+    no_headers: bool,
+    query: &str,
+    show_labels: bool,
+    sort_by: Option<&str>,
+) -> Result<()> {
+    let base = kind.list_path(namespace);
+    let items: Vec<serde_json::Value> = match name {
+        Some(n) => {
+            let path = format!("{}/{}", base, n);
+            match client.get::<serde_json::Value>(&path).await {
+                Ok(v) => vec![v],
+                Err(GetError::NotFound) => {
+                    let plural = base.rsplit('/').next().unwrap_or("");
+                    let group = if kind == printers::Kind::Deployment {
+                        ".apps"
+                    } else {
+                        ""
+                    };
+                    anyhow::bail!(
+                        "Error from server (NotFound): {}{} \"{}\" not found",
+                        plural,
+                        group,
+                        n
+                    );
+                }
+                Err(e) => return Err(map_get_error(e)),
+            }
+        }
+        None => {
+            let list: serde_json::Value = client
+                .get(&format!("{}{}", base, query))
+                .await
+                .map_err(map_get_error)?;
+            let mut items = list["items"].as_array().cloned().unwrap_or_default();
+            if let Some(expr) = sort_by {
+                sort_by_jsonpath(&mut items, expr);
+            }
+            items
+        }
+    };
+    let api_version = kind.api_version();
+    let with_type = |mut o: serde_json::Value| {
+        if let Some(m) = o.as_object_mut() {
+            m.entry("kind").or_insert_with(|| kind.kind_name().into());
+            m.entry("apiVersion").or_insert_with(|| api_version.into());
+        }
+        o
+    };
+    match format {
+        OutputFormat::Table | OutputFormat::Wide => {
+            if items.is_empty() {
+                eprintln!("{}", printers::no_resources(kind, namespace));
+                return Ok(());
+            }
+            let opts = printers::PrintOptions {
+                wide: *format == OutputFormat::Wide,
+                show_labels,
+                with_namespace: namespace.is_none() && kind.namespaced(),
+            };
+            print!(
+                "{}",
+                printers::render(
+                    &printers::table(kind, &items, &opts, Utc::now()),
+                    no_headers
+                )
+            );
+        }
+        OutputFormat::Name => {
+            for o in items {
+                println!("{}", printers::object_ref(&with_type(o)));
+            }
+        }
+        OutputFormat::Json | OutputFormat::Yaml | OutputFormat::JsonPath(_) => {
+            let obj = if name.is_some() {
+                with_type(items.into_iter().next().unwrap_or_default())
+            } else {
+                printers::list_object(kind, &items)
+            };
+            match format {
+                OutputFormat::Json => println!("{}", printers::to_json(&obj)),
+                OutputFormat::Yaml => print!("{}", serde_yaml::to_string(&obj)?),
+                OutputFormat::JsonPath(expr) => print!("{}", evaluate_jsonpath(&obj, expr)?),
+                _ => unreachable!(),
+            }
+        }
+    }
     Ok(())
 }
 

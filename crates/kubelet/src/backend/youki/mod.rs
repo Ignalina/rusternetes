@@ -142,6 +142,85 @@ impl YoukiBackend {
     }
 }
 
+impl YoukiBackend {
+    /// `logs --follow`: the tail as [`ContainerBackend::logs`] gives it,
+    /// then whatever the container appends to its log, until it stops.
+    fn follow_logs(&self, name: &str, options: LogsOptions) -> BackendStream<'static, LogOutput> {
+        let inner = self.inner.clone();
+        let name = name.to_string();
+        let start = futures::stream::once(async move {
+            let m = inner.meta(&name)?;
+            let path = inner.dir(&m.name).join("output.log");
+            let text = tokio::fs::read(&path).await.unwrap_or_default();
+            let offset = text.len() as u64;
+            let shown = tail_lines(&String::from_utf8_lossy(&text), &options.tail);
+            Ok::<_, anyhow::Error>((inner, m, path, offset, shown))
+        });
+        start
+            .flat_map(|r| match r {
+                Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
+                Ok((inner, m, path, offset, shown)) => {
+                    let first = futures::stream::iter((!shown.is_empty()).then(|| {
+                        Ok(LogOutput::StdOut {
+                            message: shown.into_bytes(),
+                        })
+                    }));
+                    let more = futures::stream::unfold(
+                        (inner, m, path, offset, false),
+                        |(inner, m, path, mut offset, done)| async move {
+                            if done {
+                                return None;
+                            }
+                            loop {
+                                use tokio::io::{AsyncReadExt, AsyncSeekExt};
+                                let running = inner.is_running(&m);
+                                let mut buf = Vec::new();
+                                if let Ok(mut f) = tokio::fs::File::open(&path).await {
+                                    if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+                                        let _ = f.read_to_end(&mut buf).await;
+                                    }
+                                }
+                                if !buf.is_empty() {
+                                    offset += buf.len() as u64;
+                                    let next = (inner, m, path, offset, false);
+                                    return Some((Ok(LogOutput::StdOut { message: buf }), next));
+                                }
+                                if !running {
+                                    return None;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                        },
+                    );
+                    first.chain(more).boxed()
+                }
+            })
+            .boxed()
+    }
+}
+
+/// Chunks read from `r` as they arrive, each made a [`LogOutput`] by `wrap`.
+fn read_chunks<R>(r: Option<R>, wrap: fn(Vec<u8>) -> LogOutput) -> BackendStream<'static, LogOutput>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let Some(r) = r else {
+        return futures::stream::empty().boxed();
+    };
+    futures::stream::unfold(r, move |mut r| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 16384];
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(wrap(buf)), r))
+            }
+        }
+    })
+    .boxed()
+}
+
 fn not_found(name: &str) -> anyhow::Error {
     anyhow!("No such container: {}", name)
 }
@@ -853,12 +932,13 @@ impl ContainerBackend for YoukiBackend {
             if !i.is_running(&m) {
                 bail!("container {} is not running", m.id);
             }
-            if options.tty == Some(true) || options.attach_stdin == Some(true) {
-                tracing::debug!("youki exec: tty and stdin are not attached");
+            if options.tty == Some(true) {
+                tracing::debug!("youki exec: no TTY; stdin and output are pipes");
             }
             let exec_id = uuid::Uuid::new_v4().simple().to_string();
             let args = shim::ExecArgs {
                 cmd: options.cmd.unwrap_or_default(),
+                stdin: options.attach_stdin == Some(true),
             };
             image::write_json(
                 &i.dir(&m.name)
@@ -880,39 +960,39 @@ impl ContainerBackend for YoukiBackend {
         if !file("json").exists() {
             bail!("No such exec instance: {}", exec_id);
         }
+        let stdin = read_json::<shim::ExecArgs>(&file("json")).map_or(false, |a| a.stdin);
         let cfg = &self.inner.cfg;
+        // The shim's stdout and stderr ("-") are the exec's: streamed as
+        // they come; its stdin is the exec's when attached.
         let mut child = tokio::process::Command::new(&cfg.shim)
             .arg("exec")
             .arg(&cfg.state_root)
             .arg(name)
             .arg(file("json"))
-            .arg(file("out"))
-            .arg(file("err"))
+            .arg("-")
+            .arg("-")
             .arg(file("exit"))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdin(if stdin {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("starting {}", cfg.shim.display()))?;
-        let (out, err) = (file("out"), file("err"));
-        let output = futures::stream::once(async move {
+        let input = child
+            .stdin
+            .take()
+            .map(|w| Box::pin(w) as std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>);
+        let out = read_chunks(child.stdout.take(), |message| LogOutput::StdOut { message });
+        let err = read_chunks(child.stderr.take(), |message| LogOutput::StdErr { message });
+        // Reap the shim; it writes the exit file before its pipes close.
+        tokio::spawn(async move {
             let _ = child.wait().await;
-            let mut chunks = Vec::new();
-            if let Ok(m) = tokio::fs::read(&out).await {
-                if !m.is_empty() {
-                    chunks.push(Ok(LogOutput::StdOut { message: m }));
-                }
-            }
-            if let Ok(m) = tokio::fs::read(&err).await {
-                if !m.is_empty() {
-                    chunks.push(Ok(LogOutput::StdErr { message: m }));
-                }
-            }
-            futures::stream::iter(chunks)
-        })
-        .flatten()
-        .boxed();
-        Ok(StartExecResults::Attached { output })
+        });
+        let output = futures::stream::select(out, err).boxed();
+        Ok(StartExecResults::Attached { output, input })
     }
 
     async fn inspect_exec(&self, exec_id: &str) -> Result<ExecInspect> {
@@ -931,6 +1011,9 @@ impl ContainerBackend for YoukiBackend {
     }
 
     fn logs<'a>(&'a self, name: &'a str, options: LogsOptions) -> BackendStream<'a, LogOutput> {
+        if options.follow {
+            return self.follow_logs(name, options);
+        }
         let inner = self.inner.clone();
         let name = name.to_string();
         futures::stream::once(async move {

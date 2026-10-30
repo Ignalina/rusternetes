@@ -6656,6 +6656,7 @@ impl ContainerRuntime {
             stdout: true,
             stderr: true,
             tail: lines.to_string(),
+            follow: false,
         };
         let mut stream = self.backend.logs(container_name, options);
         let mut output = String::new();

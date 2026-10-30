@@ -42,11 +42,17 @@ pub async fn execute(
         url_path.push_str(&query_params.join("&"));
     }
 
-    // Convert HTTP(S) URL to WebSocket URL
-    let ws_url = client.get_ws_url(&url_path)?;
-
-    // Execute with WebSocket streaming
-    websocket::exec_stream(ws_url, stdin, tty).await
+    let ws = client
+        .ws_connect(&url_path, websocket::EXEC_PROTOCOLS)
+        .await?;
+    let code = websocket::run_stream(ws, stdin).await?;
+    if code != 0 {
+        // Upstream kubectl's wording and exit status.
+        eprintln!("command terminated with exit code {}", code);
+    }
+    // Exit here: a stdin reader still blocked on the terminal would keep
+    // the runtime from shutting down.
+    std::process::exit(code)
 }
 
 #[cfg(test)]
