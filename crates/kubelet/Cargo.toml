@@ -50,6 +50,11 @@ prost.workspace = true
 prost-types.workspace = true
 http = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
+# The node server (:10250) over mutual TLS: a serving certificate from the
+# cluster CA, control-plane client certificates only (serving_tls.rs).
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls.workspace = true
+x509-parser = "0.18"
 tower = { workspace = true, features = ["util"] }
 tar = "0.4"
 sysinfo = "0.32"
@@ -63,6 +68,7 @@ uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-tungstenite = "0.24"
 

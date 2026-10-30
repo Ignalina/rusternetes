@@ -328,7 +328,8 @@ pub fn kubelet_stream_url(
     q.append_pair("stderr", "true");
     q.append_pair("tty", if tty { "true" } else { "false" });
     format!(
-        "ws://{}/{}/{}/{}/{}?{}",
+        "{}://{}/{}/{}/{}/{}?{}",
+        crate::kubelet_client::ws_scheme(),
         addr,
         verb,
         namespace,
@@ -350,10 +351,15 @@ pub async fn proxy_to_kubelet(socket: WebSocket, url: String, is_v1: bool) {
             "Sec-WebSocket-Protocol",
             t::http::HeaderValue::from_static("v5.channel.k8s.io, v4.channel.k8s.io"),
         );
-        let (ws, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            tokio_tungstenite::connect_async(req),
-        )
+        let addr = req
+            .uri()
+            .authority()
+            .map(|a| a.to_string())
+            .ok_or_else(|| anyhow::anyhow!("no host in {}", url))?;
+        let (ws, _) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let io = crate::kubelet_client::connect(&addr).await?;
+            Ok::<_, anyhow::Error>(tokio_tungstenite::client_async(req, io).await?)
+        })
         .await??;
         Ok::<_, anyhow::Error>(ws)
     }

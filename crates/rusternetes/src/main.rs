@@ -176,6 +176,35 @@ struct Args {
     /// (`spec.podCIDR`), for CNIs that allocate from the node's range.
     #[arg(long)]
     pod_cidr: Option<String>,
+
+    /// The kubelet's node server (:10250: exec, attach, logs, metrics) over
+    /// mutual TLS: its serving certificate (PEM). With
+    /// --kubelet-tls-key-file and --kubelet-client-ca-file it takes only
+    /// control-plane client certificates from that CA (never a node's,
+    /// never none); plaintext is refused.
+    #[arg(long)]
+    kubelet_tls_cert_file: Option<String>,
+
+    /// The kubelet serving certificate's key (PEM).
+    #[arg(long)]
+    kubelet_tls_key_file: Option<String>,
+
+    /// The CA a client of the kubelet's node server must chain to (PEM).
+    #[arg(long)]
+    kubelet_client_ca_file: Option<String>,
+
+    /// The API server reaches the kubelets over mutual TLS: their serving
+    /// certificates checked against this CA (PEM)...
+    #[arg(long)]
+    kubelet_certificate_authority: Option<String>,
+
+    /// ...presenting this client certificate (PEM)...
+    #[arg(long)]
+    kubelet_client_certificate: Option<String>,
+
+    /// ...and its key (PEM).
+    #[arg(long)]
+    kubelet_client_key: Option<String>,
 }
 
 /// All three of a TLS file set, or none.
@@ -227,6 +256,32 @@ async fn run() -> Result<()> {
             ("--etcd-keyfile", &args.etcd_keyfile),
         ],
     )?;
+    let kubelet_serving_tls = all_or_none(
+        "kubelet node server TLS",
+        [
+            ("--kubelet-tls-cert-file", &args.kubelet_tls_cert_file),
+            ("--kubelet-tls-key-file", &args.kubelet_tls_key_file),
+            ("--kubelet-client-ca-file", &args.kubelet_client_ca_file),
+        ],
+    )?
+    .map(|[cert_file, key_file, client_ca_file]| rusternetes_kubelet::serving_tls::ServingTls {
+        cert_file,
+        key_file,
+        client_ca_file,
+    });
+    let kubelet_client_tls = all_or_none(
+        "API server to kubelet TLS",
+        [
+            ("--kubelet-certificate-authority", &args.kubelet_certificate_authority),
+            ("--kubelet-client-certificate", &args.kubelet_client_certificate),
+            ("--kubelet-client-key", &args.kubelet_client_key),
+        ],
+    )?
+    .map(|[ca_file, cert_file, key_file]| rusternetes_api_server::kubelet_client::KubeletClientTls {
+        ca_file,
+        cert_file,
+        key_file,
+    });
     let serve_etcd_tls = all_or_none(
         "--serve-etcd TLS",
         [
@@ -391,6 +446,7 @@ async fn run() -> Result<()> {
         skip_auth: args.skip_auth,
         console_dir: args.console_dir.map(std::path::PathBuf::from),
         client_ca_file: args.client_ca_file,
+        kubelet_client_tls,
         ..Default::default()
     };
     let api_handle = if on("api-server") {
@@ -449,6 +505,7 @@ async fn run() -> Result<()> {
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         pod_prefer_cluster_dns: args.pod_prefer_cluster_dns,
         pod_cidr: args.pod_cidr.clone(),
+        serving_tls: kubelet_serving_tls,
     };
     let kubelet_handle = if on("kubelet") {
         Some(tokio::spawn(async move {

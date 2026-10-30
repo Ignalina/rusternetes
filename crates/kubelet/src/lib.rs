@@ -8,6 +8,7 @@ pub mod eviction;
 pub mod kubelet;
 pub mod netns;
 pub mod runtime;
+pub mod serving_tls;
 pub mod streaming;
 
 pub use kubelet::PodWorkerState;
@@ -32,6 +33,11 @@ pub struct KubeletConfig {
     /// `spec.podCIDR`/`spec.podCIDRs` — what a CNI with Kubernetes host-scope
     /// IPAM (Cilium `ipam: kubernetes`, flannel, …) allocates pod IPs from.
     pub pod_cidr: Option<String>,
+    /// Serve the node server (exec, attach, logs, metrics on
+    /// `metrics_port`) over mutual TLS: this certificate and key, and only
+    /// control-plane client certificates from `client_ca_file` (never a
+    /// node's, never none). `None`: plain HTTP.
+    pub serving_tls: Option<serving_tls::ServingTls>,
 }
 
 impl Default for KubeletConfig {
@@ -47,6 +53,7 @@ impl Default for KubeletConfig {
             kubernetes_service_host: "127.0.0.1".to_string(),
             pod_prefer_cluster_dns: false,
             pod_cidr: None,
+            serving_tls: None,
         }
     }
 }
@@ -121,6 +128,7 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
         .with_pod_cidr(config.pod_cidr),
     );
     let logs_backend = k.backend();
+    let serving_tls = config.serving_tls.clone();
     tokio::spawn(async move {
         use axum::{routing::get, Json};
         let app = streaming::routes(logs_backend)
@@ -129,8 +137,27 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
                 "/configz",
                 get(|| async move { Json(kubelet_config_clone.as_ref().clone()) }),
             );
-        let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
-        axum::serve(listener, app).await.unwrap();
+        match serving_tls {
+            Some(t) => {
+                let cfg = match t.server_config() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("kubelet node server TLS: {e:#}; not serving {metrics_addr}");
+                        return;
+                    }
+                };
+                info!("kubelet node server on {} over mutual TLS (control-plane client certificates only)", metrics_addr);
+                let addr: std::net::SocketAddr = metrics_addr.parse().unwrap();
+                axum_server::bind_rustls(addr, axum_server::tls_rustls::RustlsConfig::from_config(cfg))
+                    .serve(app.into_make_service())
+                    .await
+                    .unwrap();
+            }
+            None => {
+                let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
+                axum::serve(listener, app).await.unwrap();
+            }
+        }
     });
 
     k.run().await?;

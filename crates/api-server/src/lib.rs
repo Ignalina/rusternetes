@@ -8,6 +8,7 @@ pub mod flow_control;
 pub mod gnostic;
 pub mod handlers;
 pub mod ip_allocator;
+pub mod kubelet_client;
 pub mod middleware;
 pub mod openapi;
 pub mod patch;
@@ -55,6 +56,11 @@ pub struct ApiServerConfig {
     /// When set, the API server requires clients to present a certificate signed
     /// by this CA. The CN field becomes the username and O fields become groups.
     pub client_ca_file: Option<String>,
+    /// Reach the kubelets' node servers (exec, attach, logs) over mutual
+    /// TLS: their certificates checked against this CA, this client
+    /// certificate and key presented (`--kubelet-certificate-authority`,
+    /// `--kubelet-client-certificate`, `--kubelet-client-key`). `None`: plain HTTP.
+    pub kubelet_client_tls: Option<kubelet_client::KubeletClientTls>,
 }
 
 impl Default for ApiServerConfig {
@@ -71,6 +77,7 @@ impl Default for ApiServerConfig {
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
+            kubelet_client_tls: None,
         }
     }
 }
@@ -81,6 +88,10 @@ impl Default for ApiServerConfig {
 /// Starts the HTTPS/HTTP server and blocks until shutdown.
 pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyhow::Result<()> {
     info!("Starting Rusternetes API Server");
+    if let Some(t) = &config.kubelet_client_tls {
+        kubelet_client::configure(t)?;
+        info!("Kubelet node servers: mutual TLS (CA {}, client certificate {})", t.ca_file, t.cert_file);
+    }
 
     let token_manager = Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()));
 

@@ -197,13 +197,18 @@ pub async fn get_logs(
             .await
             .map_err(|e| Error::Internal(format!("logs: {}", e)))?;
         let mut url = format!(
-            "http://{}/containerLogs/{}/{}/{}?follow=true",
-            addr, namespace, name, container_name
+            "{}://{}/containerLogs/{}/{}/{}?follow=true",
+            crate::kubelet_client::http_scheme(),
+            addr,
+            namespace,
+            name,
+            container_name
         );
         if let Some(t) = query.tail_lines {
             url.push_str(&format!("&tailLines={}", t));
         }
-        let resp = reqwest::Client::new()
+        let resp = crate::kubelet_client::http_client(None)
+            .map_err(|e| Error::Internal(format!("logs: {}", e)))?
             .get(&url)
             .send()
             .await
@@ -286,7 +291,8 @@ async fn get_node_container_logs(
         .map(|a| a.address.clone())
         .ok_or_else(|| anyhow::anyhow!("node {} has no InternalIP", node_name))?;
     let mut url = format!(
-        "http://{}:10250/containerLogs/{}/{}/{}",
+        "{}://{}:10250/containerLogs/{}/{}/{}",
+        crate::kubelet_client::http_scheme(),
         ip,
         pod.metadata.namespace.as_deref().unwrap_or("default"),
         pod.metadata.name,
@@ -295,9 +301,7 @@ async fn get_node_container_logs(
     if let Some(t) = query.tail_lines {
         url.push_str(&format!("?tailLines={}", t));
     }
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?
+    let resp = crate::kubelet_client::http_client(Some(std::time::Duration::from_secs(10)))?
         .get(&url)
         .send()
         .await?;
