@@ -1016,7 +1016,37 @@ enum ConfigCommands {
 */
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    // Errors print as upstream kubectl prints them: no "Error: " wrapper
+    // around a server's own "Error from server (...)" line, exit status 1.
+    if let Err(e) = run().await {
+        eprintln!("{}", error_line(&e));
+        std::process::exit(1);
+    }
+}
+
+/// The line kubectl prints for `e`.
+fn error_line(e: &anyhow::Error) -> String {
+    let text = format!("{:#}", e);
+    if text.starts_with("Error from server") {
+        return text;
+    }
+    // A Status body from the server: "Error from server (Reason): message".
+    if let Some(i) = text.find("{\"kind\":\"Status\"") {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text[i..]) {
+            if let Some(msg) = v["message"].as_str() {
+                return format!(
+                    "Error from server ({}): {}",
+                    v["reason"].as_str().unwrap_or("Unknown"),
+                    msg
+                );
+            }
+        }
+    }
+    format!("error: {}", text)
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Load kubeconfig or use CLI flags
@@ -1700,4 +1730,25 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod error_line_tests {
+    #[test]
+    fn server_status_like_upstream() {
+        let e = anyhow::anyhow!(
+            "the server answered 404 Not Found: {}",
+            r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"pods \"x\" not found","reason":"NotFound","code":404}"#
+        );
+        assert_eq!(
+            super::error_line(&e),
+            "Error from server (NotFound): pods \"x\" not found"
+        );
+        let e = anyhow::anyhow!("Error from server (NotFound): pods \"x\" not found");
+        assert_eq!(
+            super::error_line(&e),
+            "Error from server (NotFound): pods \"x\" not found"
+        );
+        assert_eq!(super::error_line(&anyhow::anyhow!("boom")), "error: boom");
+    }
 }
