@@ -4276,11 +4276,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.24.0",
  "tonic",
  "tonic-build",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

@@ -73,7 +73,7 @@ async fn exec(b: &YoukiBackend, name: &str, cmd: &[&str]) -> (String, i64) {
         .await
         .unwrap();
     let mut out = String::new();
-    if let StartExecResults::Attached { mut output } = b.start_exec(&id).await.unwrap() {
+    if let StartExecResults::Attached { mut output, .. } = b.start_exec(&id).await.unwrap() {
         while let Some(chunk) = output.next().await {
             out.push_str(&chunk.unwrap().to_string());
         }
@@ -158,6 +158,7 @@ async fn youki_runs_a_pod_like_pair_of_containers() {
             stdout: true,
             stderr: true,
             tail: "all".into(),
+            follow: false,
         },
     );
     while let Some(l) = s.next().await {

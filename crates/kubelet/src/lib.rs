@@ -8,6 +8,7 @@ pub mod eviction;
 pub mod kubelet;
 pub mod netns;
 pub mod runtime;
+pub mod streaming;
 
 pub use kubelet::PodWorkerState;
 
@@ -121,12 +122,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
     );
     let logs_backend = k.backend();
     tokio::spawn(async move {
-        use axum::{routing::get, Json, Router};
-        let app = Router::new()
-            .route(
-                "/containerLogs/:namespace/:pod/:container",
-                get(move |path, query| container_logs(logs_backend.clone(), path, query)),
-            )
+        use axum::{routing::get, Json};
+        let app = streaming::routes(logs_backend)
             .route("/metrics", get(|| async move { metrics_clone.gather() }))
             .route(
                 "/configz",
@@ -141,28 +138,3 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
     Ok(())
 }
 
-/// `GET /containerLogs/{namespace}/{pod}/{container}[?tailLines=N]` — a
-/// container's output from this node's backend, so the API server can serve
-/// `pods/log` for pods on any node.
-async fn container_logs(
-    backend: Arc<dyn backend::ContainerBackend>,
-    axum::extract::Path((_namespace, pod, container)): axum::extract::Path<(String, String, String)>,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> std::result::Result<String, (axum::http::StatusCode, String)> {
-    use futures::StreamExt;
-    let name = format!("{}_{}", pod, container);
-    let opts = backend::LogsOptions {
-        stdout: true,
-        stderr: true,
-        tail: q.get("tailLines").cloned().unwrap_or_else(|| "all".to_string()),
-    };
-    let mut out = String::new();
-    let mut stream = backend.logs(&name, opts);
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(c) => out.push_str(&c.to_string()),
-            Err(e) => return Err((axum::http::StatusCode::NOT_FOUND, e.to_string())),
-        }
-    }
-    Ok(out)
-}

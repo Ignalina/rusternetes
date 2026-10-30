@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! rusternetes-youki-shim create <state-root> <id> <bundle> <log> <exit-file>
-//! rusternetes-youki-shim exec   <state-root> <id> <args.json> <out> <err> <exit-file>
+//! rusternetes-youki-shim exec   <state-root> <id> <args.json> <out|-> <err|-> <exit-file>
 //! ```
 //!
 //! `create` prints `ok <pid>` (or `err <message>`) on stdout once the
@@ -129,16 +129,36 @@ fn create(state: PathBuf, id: &str, bundle: PathBuf, log: &Path, exit: &Path) ->
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecArgs {
     pub cmd: Vec<String>,
+    /// The process reads the shim's own stdin (a pipe from the kubelet)
+    /// instead of /dev/null.
+    #[serde(default)]
+    pub stdin: bool,
+}
+
+/// `-` is the shim's own stdout or stderr (a pipe the kubelet streams),
+/// anything else a file appended to.
+fn out_fd(path: &Path, own: std::os::fd::BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    if path == Path::new("-") {
+        own.try_clone_to_owned()
+    } else {
+        Ok(append(path)?.into())
+    }
 }
 
 fn exec(state: PathBuf, id: &str, args: &Path, out: &Path, err: &Path, exit: &Path) -> i32 {
     let result = (|| -> anyhow::Result<i64> {
+        use std::os::fd::AsFd;
         let args: ExecArgs = serde_json::from_slice(&std::fs::read(args)?)?;
+        let stdin: OwnedFd = if args.stdin {
+            std::io::stdin().as_fd().try_clone_to_owned()?
+        } else {
+            devnull()?
+        };
         let pid = ContainerBuilder::new(id.to_string(), SyscallType::default())
             .with_root_path(state)?
-            .with_stdin(devnull()?)
-            .with_stdout(append(out)?)
-            .with_stderr(append(err)?)
+            .with_stdin(stdin)
+            .with_stdout(out_fd(out, std::io::stdout().as_fd())?)
+            .with_stderr(out_fd(err, std::io::stderr().as_fd())?)
             .as_tenant()
             .with_container_args(args.cmd)
             .with_detach(true)
@@ -152,7 +172,9 @@ fn exec(state: PathBuf, id: &str, args: &Path, out: &Path, err: &Path, exit: &Pa
         }
         Err(e) => {
             let msg = format!("{:#}", e);
-            if let Ok(mut f) = append(err) {
+            if err == Path::new("-") {
+                eprintln!("{}", msg);
+            } else if let Ok(mut f) = append(err) {
                 let _ = writeln!(f, "{}", msg);
             }
             // Docker: 127 for a missing command, 126 for one that cannot run.

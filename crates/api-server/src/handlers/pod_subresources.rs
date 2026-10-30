@@ -190,6 +190,40 @@ pub async fn get_logs(
         )));
     }
 
+    // Followed logs of a pod whose runtime this API server cannot reach
+    // stream from its node's kubelet until the container stops.
+    if query.follow && ws.is_none() && !streaming::local_runtime_reachable().await {
+        let addr = streaming::node_kubelet_addr(&state, &pod)
+            .await
+            .map_err(|e| Error::Internal(format!("logs: {}", e)))?;
+        let mut url = format!(
+            "http://{}/containerLogs/{}/{}/{}?follow=true",
+            addr, namespace, name, container_name
+        );
+        if let Some(t) = query.tail_lines {
+            url.push_str(&format!("&tailLines={}", t));
+        }
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("logs from {}: {}", addr, e)))?;
+        if !resp.status().is_success() {
+            return Err(Error::NotFound(format!(
+                "container {} in pod {}/{}: {}",
+                container_name,
+                namespace,
+                name,
+                resp.text().await.unwrap_or_default()
+            )));
+        }
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(Body::from_stream(resp.bytes_stream()))
+            .unwrap());
+    }
+
     // Get logs from the container runtime
     let logs = match get_container_logs(&pod, &container_name, &query).await {
         Ok(logs) => logs,
@@ -253,7 +287,10 @@ async fn get_node_container_logs(
         .ok_or_else(|| anyhow::anyhow!("node {} has no InternalIP", node_name))?;
     let mut url = format!(
         "http://{}:10250/containerLogs/{}/{}/{}",
-        ip, pod.metadata.namespace.as_deref().unwrap_or("default"), pod.metadata.name, container_name
+        ip,
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name,
+        container_name
     );
     if let Some(t) = query.tail_lines {
         url.push_str(&format!("?tailLines={}", t));
@@ -635,6 +672,26 @@ pub async fn exec(
         // use channel 3 for status; v4/v5 do. We need to tell the handler.
         let is_v1_protocol = sec_ws_protocol == "channel.k8s.io"
             || (!sec_ws_protocol.contains("v4.channel") && !sec_ws_protocol.contains("v5.channel"));
+        if !streaming::local_runtime_reachable().await {
+            // No container runtime here: the kubelet of the pod's node runs it.
+            let addr = streaming::node_kubelet_addr(&state, &pod)
+                .await
+                .map_err(|e| Error::Internal(format!("exec: {}", e)))?;
+            let url = streaming::kubelet_stream_url(
+                &addr,
+                "exec",
+                &namespace,
+                &name,
+                &container_name,
+                &query.command,
+                query.stdin,
+                query.tty,
+            );
+            return Ok(ws
+                .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
+                .on_upgrade(move |socket| streaming::proxy_to_kubelet(socket, url, is_v1_protocol))
+                .into_response());
+        }
         return Ok(ws
             .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
             .on_upgrade(move |socket| {
@@ -916,6 +973,32 @@ pub async fn attach(
             "Upgrading attach to WebSocket for pod {}/{}",
             namespace, name
         );
+        if !streaming::local_runtime_reachable().await {
+            let addr = streaming::node_kubelet_addr(&state, &pod)
+                .await
+                .map_err(|e| Error::Internal(format!("attach: {}", e)))?;
+            let url = streaming::kubelet_stream_url(
+                &addr,
+                "attach",
+                &namespace,
+                &name,
+                &container_name,
+                &[],
+                query.stdin,
+                query.tty,
+            );
+            let v1 = req
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok())
+                .map_or(true, |p| {
+                    !p.contains("v4.channel") && !p.contains("v5.channel")
+                });
+            return Ok(ws
+                .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
+                .on_upgrade(move |socket| streaming::proxy_to_kubelet(socket, url, v1))
+                .into_response());
+        }
         Ok(ws
             .on_upgrade(move |socket| {
                 streaming::handle_attach_websocket(

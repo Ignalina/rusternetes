@@ -41,7 +41,8 @@ futures.workspace = true
 async-trait.workspace = true
 bollard.workspace = true
 chrono.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+url = "2"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tonic.workspace = true
@@ -63,6 +64,7 @@ uuid = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = "3"
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = "0.24"
 
 [build-dependencies]
 tonic-build = "0.12"

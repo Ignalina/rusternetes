@@ -26,6 +26,8 @@ pub(crate) struct FakeState {
     /// Every mutating call, e.g. `"stop web_app"`.
     pub calls: Vec<String>,
     next_id: u64,
+    /// The last exec's command (`cat` echoes stdin, `false` exits 1).
+    last_exec: Vec<String>,
 }
 
 /// Containers live in a map; nothing runs.
@@ -241,22 +243,57 @@ impl ContainerBackend for FakeBackend {
 
     async fn create_exec(&self, name: &str, options: CreateExecOptions) -> Result<String> {
         let mut st = self.state.lock().unwrap();
-        st.calls.push(format!(
-            "exec {} {}",
-            name,
-            options.cmd.unwrap_or_default().join(" ")
-        ));
+        let cmd = options.cmd.unwrap_or_default();
+        st.calls.push(format!("exec {} {}", name, cmd.join(" ")));
+        st.last_exec = cmd;
         Ok("exec1".to_string())
     }
 
     async fn start_exec(&self, _exec_id: &str) -> Result<StartExecResults> {
-        Ok(StartExecResults::Detached)
+        let cmd = self.state.lock().unwrap().last_exec.clone();
+        match cmd.first().map(String::as_str) {
+            Some("cat") => {
+                let (w, r) = tokio::io::duplex(4096);
+                let output = futures::stream::unfold(r, |mut r| async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = vec![0u8; 4096];
+                    match r.read(&mut buf).await {
+                        Ok(0) | Err(_) => None,
+                        Ok(n) => {
+                            buf.truncate(n);
+                            Some((Ok(LogOutput::StdOut { message: buf }), r))
+                        }
+                    }
+                })
+                .boxed();
+                Ok(StartExecResults::Attached {
+                    output,
+                    input: Some(Box::pin(w)),
+                })
+            }
+            Some("false") => Ok(StartExecResults::Attached {
+                output: futures::stream::iter([Ok(LogOutput::StdErr {
+                    message: b"failed\n".to_vec(),
+                })])
+                .boxed(),
+                input: None,
+            }),
+            _ => Ok(StartExecResults::Detached),
+        }
     }
 
     async fn inspect_exec(&self, _exec_id: &str) -> Result<ExecInspect> {
+        let failed = self
+            .state
+            .lock()
+            .unwrap()
+            .last_exec
+            .first()
+            .map(String::as_str)
+            == Some("false");
         Ok(ExecInspect {
             running: Some(false),
-            exit_code: Some(0),
+            exit_code: Some(if failed { 1 } else { 0 }),
         })
     }
 
