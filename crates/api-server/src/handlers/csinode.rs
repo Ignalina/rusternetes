@@ -28,7 +28,8 @@ pub async fn create_csinode(
 
     // Check authorization (cluster-scoped)
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "csinodes")
-        .with_api_group("storage.k8s.io");
+        .with_api_group("storage.k8s.io")
+        .with_name(&node.metadata.name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}

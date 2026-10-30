@@ -1,5 +1,6 @@
 mod admission;
 mod admission_webhook;
+mod authn;
 mod bootstrap;
 mod conversion;
 mod dynamic_routes;
@@ -8,7 +9,9 @@ mod flow_control;
 mod gnostic;
 mod handlers;
 mod ip_allocator;
+mod kubelet_client;
 mod middleware;
+mod node_authz;
 mod openapi;
 mod patch;
 mod prometheus_client;

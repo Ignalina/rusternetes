@@ -348,3 +348,45 @@ mod kubernetes_service_tests {
         assert_eq!(a.allocate().as_deref(), Some(KUBERNETES_SERVICE_IP));
     }
 }
+
+/// The root CA publisher (upstream's kube-controller-manager
+/// root-ca-cert-publisher): ConfigMap `kube-root-ca.crt` with `ca.crt` = the
+/// cluster CA in every namespace, which every pod's ServiceAccount volume
+/// projects. Creates it where it is missing and corrects a wrong one.
+pub async fn publish_root_ca(storage: &Arc<StorageBackend>, ca_pem: &str) -> Result<()> {
+    let namespaces: Vec<serde_json::Value> = storage.list("/registry/namespaces/").await?;
+    for ns in namespaces {
+        let Some(name) = ns.pointer("/metadata/name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if ns.pointer("/metadata/deletionTimestamp").is_some() {
+            continue;
+        }
+        let key = rusternetes_storage::build_key("configmaps", Some(name), "kube-root-ca.crt");
+        match storage.get::<serde_json::Value>(&key).await {
+            Ok(mut cm) => {
+                if cm.pointer("/data/ca.crt").and_then(|c| c.as_str()) != Some(ca_pem) {
+                    cm["data"] = serde_json::json!({ "ca.crt": ca_pem });
+                    storage.update(&key, &cm).await?;
+                    info!("kube-root-ca.crt in namespace {name}: set to the cluster CA");
+                }
+            }
+            Err(_) => {
+                let cm = serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "kube-root-ca.crt", "namespace": name,
+                        "uid": uuid::Uuid::new_v4().to_string(),
+                        "creationTimestamp": rusternetes_common::time::k8s_time::format(&chrono::Utc::now()),
+                    },
+                    "data": { "ca.crt": ca_pem },
+                });
+                match storage.create(&key, &cm).await {
+                    Ok(_) => info!("kube-root-ca.crt in namespace {name}: created"),
+                    Err(e) => debug!("kube-root-ca.crt in namespace {name}: {e}"),
+                }
+            }
+        }
+    }
+    Ok(())
+}

@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::Parser;
 use rusternetes_storage::{StorageBackend, StorageConfig};
 use std::sync::Arc;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 
 #[derive(Parser, Debug)]
 #[command(name = "rusternetes")]
@@ -113,6 +113,16 @@ struct Args {
     /// Client CA certificate file for mTLS client certificate authentication
     #[arg(long)]
     client_ca_file: Option<String>,
+
+    /// The cluster's service-account signing key (PEM, RSA or ECDSA P-256):
+    /// the API server, the kubelet and the controller manager sign
+    /// ServiceAccount tokens with it. Every control plane gets the same key.
+    #[arg(long)]
+    service_account_signing_key_file: Option<String>,
+
+    /// The matching public key (PEM): ServiceAccount tokens are checked with it.
+    #[arg(long)]
+    service_account_key_file: Option<String>,
 
     /// By default, a pod's resolv.conf lists the node's own DNS server first
     /// so pods can resolve sibling container names under Docker Compose.
@@ -480,6 +490,23 @@ async fn run() -> Result<()> {
         }
         #[cfg(not(feature = "redb"))]
         anyhow::bail!("--serve-etcd {} needs the redb feature", addr);
+    }
+
+    // The cluster's ServiceAccount key: tokens are signed and checked with it
+    // in this process (API server, kubelet, controller manager). A node
+    // without it (a worker) signs none: its pods get their ServiceAccount's
+    // token Secret, signed on a control plane.
+    match (&args.service_account_signing_key_file, &args.service_account_key_file) {
+        (Some(private), Some(public)) => {
+            let tm = rusternetes_common::auth::TokenManager::from_key_files(private, public)?;
+            rusternetes_common::auth::install_cluster_token_manager(Arc::new(tm));
+            info!("ServiceAccount key: {}", public);
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("--service-account-signing-key-file and --service-account-key-file go together"),
+    }
+    if !args.skip_auth && on("api-server") && args.service_account_signing_key_file.is_none() {
+        warn!("--skip-auth=false without --service-account-signing-key-file: ServiceAccount tokens hold for this process only");
     }
 
     // --- API Server ---

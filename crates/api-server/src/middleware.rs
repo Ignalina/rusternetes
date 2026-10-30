@@ -46,65 +46,99 @@ pub async fn skip_auth_middleware(mut request: Request, next: Next) -> Result<Re
     Ok(next.run(request).await)
 }
 
-/// Returns the token of an `Authorization: Bearer <token>` header. The scheme name is
-/// case-insensitive; the Python Kubernetes client sends it in lowercase.
-fn bearer_token(header: &str) -> Option<&str> {
-    let (scheme, token) = header.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("Bearer") {
-        Some(token.trim())
-    } else {
-        None
-    }
+#[cfg(test)]
+use crate::authn::bearer_token;
+
+fn unauthorized(msg: &str) -> Response {
+    let body = serde_json::json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {},
+        "status": "Failure", "message": msg, "reason": "Unauthorized", "code": 401
+    });
+    (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response()
 }
 
-/// Authentication middleware that extracts and validates JWT tokens
+fn forbidden(msg: &str) -> Response {
+    let body = serde_json::json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {},
+        "status": "Failure", "message": msg, "reason": "Forbidden", "code": 403
+    });
+    (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
+}
+
+/// Authentication (crate::authn): the connection's client certificate, else
+/// a bearer token; neither, or a bad token, is 401. There is no anonymous user.
 pub async fn auth_middleware(
     Extension(token_manager): Extension<Arc<TokenManager>>,
     Extension(bootstrap_token_manager): Extension<Arc<BootstrapTokenManager>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    // Extract Bearer token from Authorization header
-    let auth_header = request
+    let peer = request
+        .extensions()
+        .get::<crate::authn::PeerIdentity>()
+        .and_then(|p| p.0.clone());
+    let header = request
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    let user = if let Some(token) = bearer_token(auth_header) {
-        // Try to validate as a service account token first
-        if let Ok(claims) = token_manager.validate_token(token) {
-            let user_info = UserInfo::from_service_account_claims(&claims);
-            debug!(
-                "Authenticated user (service account): {}",
-                user_info.username
-            );
-            user_info
+        .map(str::to_string);
+    let user = match crate::authn::authenticate(
+        peer.as_deref(),
+        header.as_deref(),
+        &token_manager,
+        &bootstrap_token_manager,
+    ) {
+        Ok(u) => u,
+        Err(msg) => {
+            debug!("{} {}: {}", request.method(), request.uri().path(), msg);
+            return Err(unauthorized(msg));
         }
-        // Try to validate as a bootstrap token
-        else if let Ok(bootstrap_token) = bootstrap_token_manager.validate_token(token) {
-            let user_info = UserInfo::from_bootstrap_token(&bootstrap_token);
-            debug!(
-                "Authenticated user (bootstrap token): {}",
-                user_info.username
-            );
-            user_info
-        }
-        // Invalid token
-        else {
-            warn!("Invalid token");
-            return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
-        }
-    } else {
-        // Anonymous user
-        debug!("Anonymous request");
-        UserInfo::anonymous()
     };
-
-    // Insert UserInfo into request extensions
+    debug!("Authenticated {} {:?}", user.username, user.groups);
     request.extensions_mut().insert(AuthContext { user });
-
     Ok(next.run(request).await)
+}
+
+/// Authorization of every resource request from its URL (crate::authn::request_attributes),
+/// before any handler: the handlers' own checks come on top. A node's create
+/// is checked with the object's name from the body (its own Node, Lease, CSINode).
+pub async fn authz_middleware(
+    Extension(authorizer): Extension<Arc<dyn rusternetes_common::authz::Authorizer>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    let Some(ctx) = request.extensions().get::<AuthContext>().cloned() else {
+        return Err(unauthorized("Unauthorized"));
+    };
+    let Some(mut attrs) = crate::authn::request_attributes(request.method(), request.uri(), ctx.user.clone()) else {
+        // Not a resource URL: any authenticated user (discovery, OpenAPI).
+        return Ok(next.run(request).await);
+    };
+    let mut request = request;
+    if attrs.verb == "create" && attrs.name.is_none() && crate::node_authz::node_of(&ctx.user).is_some() {
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, 8 << 20)
+            .await
+            .map_err(|_| forbidden("request body too large"))?;
+        if let Some(name) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.pointer("/metadata/name").and_then(|n| n.as_str()).map(str::to_string))
+        {
+            attrs = attrs.with_name(name);
+        }
+        request = Request::from_parts(parts, Body::from(bytes));
+    }
+    match authorizer.authorize(&attrs).await {
+        Ok(rusternetes_common::authz::Decision::Allow) => Ok(next.run(request).await),
+        Ok(rusternetes_common::authz::Decision::Deny(reason)) => {
+            info!("Forbidden: {} {} {:?}/{:?}: {}", ctx.user.username, attrs.verb, attrs.resource, attrs.name, reason);
+            Err(forbidden(&format!(
+                "{} \"{}\" is forbidden: User \"{}\" cannot {} resource \"{}\": {}",
+                attrs.resource, attrs.name.as_deref().unwrap_or(""), ctx.user.username, attrs.verb, attrs.resource, reason
+            )))
+        }
+        Err(e) => Err(forbidden(&format!("authorization failed: {e}"))),
+    }
 }
 
 /// Query parameters that hold a boolean.

@@ -124,6 +124,24 @@ impl TlsConfig {
         self,
         client_ca_cert_path: &str,
     ) -> Result<Arc<rustls::ServerConfig>> {
+        self.into_client_auth_server_config(client_ca_cert_path, true)
+    }
+
+    /// Like [`Self::into_mtls_server_config`], but a client may also come
+    /// without a certificate (it then authenticates with a bearer token); a
+    /// certificate it does present must verify against the client CA.
+    pub fn into_optional_mtls_server_config(
+        self,
+        client_ca_cert_path: &str,
+    ) -> Result<Arc<rustls::ServerConfig>> {
+        self.into_client_auth_server_config(client_ca_cert_path, false)
+    }
+
+    fn into_client_auth_server_config(
+        self,
+        client_ca_cert_path: &str,
+        required: bool,
+    ) -> Result<Arc<rustls::ServerConfig>> {
         // Load client CA certificate
         let client_ca_pem =
             std::fs::read(client_ca_cert_path).context("Failed to read client CA certificate")?;
@@ -134,10 +152,11 @@ impl TlsConfig {
         let mut client_auth_roots = rustls::RootCertStore::empty();
         client_auth_roots.add_parsable_certificates(client_ca_certs);
 
-        let client_cert_verifier =
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots))
-                .build()
-                .context("Failed to build client cert verifier")?;
+        let builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
+        let builder = if required { builder } else { builder.allow_unauthenticated() };
+        let client_cert_verifier = builder
+            .build()
+            .context("Failed to build client cert verifier")?;
 
         let config = rustls::ServerConfig::builder()
             .with_client_cert_verifier(client_cert_verifier)

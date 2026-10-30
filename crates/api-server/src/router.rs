@@ -733,11 +733,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     let skip_auth = state.skip_auth;
 
     // Routes that don't require authentication
-    let public_routes = Router::new()
+    // Health only: no credentials needed (probes from the node itself).
+    let health_routes = Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/healthz/verbose", get(handlers::health::healthz_verbose))
         .route("/livez", get(handlers::health::healthz))
-        .route("/readyz", get(handlers::health::readyz))
+        .route("/readyz", get(handlers::health::readyz));
+
+    // Any authenticated user: metrics, the issuer documents, discovery, OpenAPI.
+    let public_routes = Router::new()
         .route("/metrics", get(handlers::health::metrics))
         // OIDC discovery endpoints for service account issuer
         .route(
@@ -887,7 +891,13 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             },
         ));
 
-    let public_routes = public_routes.merge(discovery_routes);
+    let mut public_routes = public_routes.merge(discovery_routes);
+    if !skip_auth {
+        public_routes = public_routes
+            .layer(axum_middleware::from_fn(middleware::auth_middleware))
+            .layer(Extension(state.token_manager.clone()))
+            .layer(Extension(state.bootstrap_token_manager.clone()));
+    }
 
     // Routes that require authentication (unless skip_auth is enabled)
     let mut protected_routes = Router::new()
@@ -2450,7 +2460,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
+            .layer(axum_middleware::from_fn(middleware::authz_middleware))
             .layer(axum_middleware::from_fn(middleware::auth_middleware))
+            .layer(Extension(state.authorizer.clone()))
             .layer(Extension(state.token_manager.clone()))
             .layer(Extension(state.bootstrap_token_manager.clone()));
     }
@@ -2458,7 +2470,7 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     // Combine routes and add shared state.
     // K8s (Go) treats /path and /path/ identically. Axum doesn't, so we
     // normalize URIs by stripping trailing slashes before routing.
-    let mut app = Router::new().merge(public_routes).merge(protected_routes);
+    let mut app = Router::new().merge(health_routes).merge(public_routes).merge(protected_routes);
 
     // Serve the console SPA at /console/ when a console directory is configured.
     if let Some(dir) = console_dir {

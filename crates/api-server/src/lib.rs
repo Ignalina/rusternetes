@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod admission_webhook;
+pub mod authn;
 pub mod bootstrap;
 pub mod conversion;
 pub mod dynamic_routes;
@@ -10,6 +11,7 @@ pub mod handlers;
 pub mod ip_allocator;
 pub mod kubelet_client;
 pub mod middleware;
+pub mod node_authz;
 pub mod openapi;
 pub mod patch;
 pub mod prometheus_client;
@@ -28,7 +30,6 @@ pub mod watch_cache;
 
 use axum_server::tls_rustls::RustlsConfig;
 use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::tls::TlsConfig;
 use rusternetes_storage::{Storage, StorageBackend};
@@ -67,7 +68,10 @@ impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "0.0.0.0:6443".to_string(),
-            jwt_secret: "rusternetes-secret-change-in-production".to_string(),
+            // No shared default: without the cluster's key (installed with
+            // rusternetes_common::auth::install_cluster_token_manager) or a
+            // secret, tokens are signed with a random per-process secret.
+            jwt_secret: String::new(),
             tls: false,
             tls_cert_file: None,
             tls_key_file: None,
@@ -93,14 +97,28 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         info!("Kubelet node servers: mutual TLS (CA {}, client certificate {})", t.ca_file, t.cert_file);
     }
 
-    let token_manager = Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()));
+    let token_manager = match rusternetes_common::auth::cluster_token_manager() {
+        Some(tm) => {
+            info!("ServiceAccount tokens: signed and checked with the cluster's service-account key");
+            tm
+        }
+        None if !config.jwt_secret.is_empty()
+            && config.jwt_secret != "rusternetes-secret-change-in-production" =>
+        {
+            Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()))
+        }
+        None => {
+            warn!("No service-account key: ServiceAccount tokens are signed with a random secret of this process only");
+            Arc::new(TokenManager::new_random())
+        }
+    };
 
     let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");
         Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
     } else {
-        info!("Initializing RBAC Authorizer");
-        Arc::new(RBACAuthorizer::new(storage.clone()))
+        info!("Authorization: Node authorizer + RBAC (system:masters is admin)");
+        Arc::new(node_authz::ClusterAuthorizer::new(storage.clone()))
     };
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
@@ -121,7 +139,12 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         } else {
             anyhow::bail!("TLS enabled but no certificate provided");
         };
-        tls_config.cert_pem.clone()
+        // The CA pods trust (kube-root-ca.crt, token Secrets' ca.crt): the
+        // cluster CA when there is one, else the serving certificate.
+        match &config.client_ca_file {
+            Some(ca) => Some(std::fs::read_to_string(ca)?),
+            None => tls_config.cert_pem.clone(),
+        }
     } else {
         None
     };
@@ -148,8 +171,14 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
     // made good here.
     {
         let storage = storage.clone();
+        let root_ca = ca_cert_pem.clone().filter(|_| config.client_ca_file.is_some());
         tokio::spawn(async move {
             loop {
+                if let Some(ca) = &root_ca {
+                    if let Err(e) = bootstrap::publish_root_ca(&storage, ca).await {
+                        tracing::debug!("kube-root-ca.crt: {e}");
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
                     tracing::debug!("system namespaces: {e}");
@@ -282,13 +311,20 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
                 "Client certificate authentication enabled (CA: {})",
                 client_ca
             );
-            tls_config.into_mtls_server_config(client_ca)?
+            if config.skip_auth {
+                tls_config.into_mtls_server_config(client_ca)?
+            } else {
+                // A client certificate is optional: pods come with a
+                // ServiceAccount bearer token; no credentials at all is 401.
+                tls_config.into_optional_mtls_server_config(client_ca)?
+            }
         } else {
             tls_config.into_server_config()?
         };
         let rustls_config = RustlsConfig::from_config(server_config);
         info!("HTTPS server listening on {}", config.bind_address);
-        let mut server = axum_server::bind_rustls(config.bind_address.parse()?, rustls_config);
+        let mut server = axum_server::bind_rustls(config.bind_address.parse()?, rustls_config)
+            .map(|inner| authn::PeerCertAcceptor { inner });
         server
             .http_builder()
             .http2()
