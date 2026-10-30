@@ -450,19 +450,7 @@ impl Kubelet {
                     address: self.node_name.clone(),
                 },
             ]),
-            node_info: Some(rusternetes_common::resources::NodeSystemInfo {
-                machine_id: format!("rusternetes-{}", self.node_name),
-                system_uuid: format!("rusternetes-{}", self.node_name),
-                boot_id: format!("rusternetes-{}", self.node_name),
-                kernel_version: "6.1.0-rusternetes".to_string(),
-                os_image: "Rusternetes OS".to_string(),
-                container_runtime_version: "containerd://1.7.0".to_string(),
-                kubelet_version: "v1.35.0-rusternetes".to_string(),
-                kube_proxy_version: "v1.35.0-rusternetes".to_string(),
-                operating_system: "linux".to_string(),
-                architecture: "amd64".to_string(),
-                swap: None,
-            }),
+            node_info: Some(node_system_info(&self.node_name)),
             images: None,
             volumes_in_use: None,
             volumes_attached: None,
@@ -585,26 +573,9 @@ impl Kubelet {
                     ("ephemeral-storage".to_string(), "100Gi".to_string()),
                 ]));
             }
-            // Ensure nodeInfo is populated (may have been lost during updates)
-            if status
-                .node_info
-                .as_ref()
-                .is_none_or(|ni| ni.machine_id.is_empty())
-            {
-                status.node_info = Some(rusternetes_common::resources::NodeSystemInfo {
-                    machine_id: format!("rusternetes-{}", self.node_name),
-                    system_uuid: format!("rusternetes-{}", self.node_name),
-                    boot_id: format!("rusternetes-{}", self.node_name),
-                    kernel_version: "6.1.0-rusternetes".to_string(),
-                    os_image: "Rusternetes OS".to_string(),
-                    container_runtime_version: "containerd://1.7.0".to_string(),
-                    kubelet_version: "v1.35.0-rusternetes".to_string(),
-                    kube_proxy_version: "v1.35.0-rusternetes".to_string(),
-                    operating_system: "linux".to_string(),
-                    architecture: "amd64".to_string(),
-                    swap: None,
-                });
-            }
+            // nodeInfo is read from the machine on every status update (a
+            // node upgraded to another kernel or runtime shows it at once).
+            status.node_info = Some(node_system_info(&self.node_name));
         }
 
         // Ensure node addresses are populated (may have failed during initial registration)
@@ -629,6 +600,17 @@ impl Kubelet {
         // Only write to storage if the heartbeat is stale (>10s old) or status changed.
         // This prevents rv churn that causes PATCH conflicts for external node updates.
         let mut needs_write = false;
+        // The node's own facts (RUSTERNETES_NODE_ANNOTATIONS_FILE, a JSON
+        // object of strings that the node's init keeps current) as annotations.
+        if let Some(facts) = node_facts() {
+            let ann = node.metadata.annotations.get_or_insert_with(HashMap::new);
+            for (k, v) in facts {
+                if ann.get(&k) != Some(&v) {
+                    ann.insert(k, v);
+                    needs_write = true;
+                }
+            }
+        }
         if let Some(ref mut status) = node.status {
             if let Some(ref mut conditions) = status.conditions {
                 for condition in conditions.iter_mut() {
@@ -657,6 +639,7 @@ impl Kubelet {
         if needs_write {
             self.storage.update(&key, &node).await?;
         }
+        write_node_status_file(&node);
 
         // Collect and publish node metrics to storage
         self.publish_node_metrics().await;
@@ -4096,6 +4079,91 @@ impl Kubelet {
     }
 }
 
+/// The node's facts for its annotations: the JSON object (string values) in
+/// the file `RUSTERNETES_NODE_ANNOTATIONS_FILE` names; `None` without one.
+fn node_facts() -> Option<Vec<(String, String)>> {
+    let path = std::env::var("RUSTERNETES_NODE_ANNOTATIONS_FILE").ok().filter(|p| !p.is_empty())?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(
+        v.as_object()?
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+            .collect(),
+    )
+}
+
+/// After each status round the kubelet posted: `ready=<the Ready condition's
+/// status>`, `unschedulable=<bool>` and `at=<unix seconds>` into the file
+/// `RUSTERNETES_NODE_STATUS_FILE` names (the node's console reads it).
+fn write_node_status_file(node: &Node) {
+    let Ok(path) = std::env::var("RUSTERNETES_NODE_STATUS_FILE") else { return };
+    if path.is_empty() {
+        return;
+    }
+    let ready = node
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.condition_type == "Ready"))
+        .map_or("Unknown", |c| c.status.as_str());
+    let unsched = node.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false);
+    let text = format!("ready={ready}\nunschedulable={unsched}\nat={}\n", chrono::Utc::now().timestamp());
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// The Node's `status.nodeInfo`, read from the machine (upstream: cAdvisor's
+/// machine info and the container runtime's version): the kernel release
+/// (`uname -r`), the boot id, the machine id, the OS image
+/// (`KUBELET_OS_IMAGE`, else `/etc/os-release`'s PRETTY_NAME), the
+/// container runtime (`youki://<libcontainer version>` with the youki
+/// backend) and the architecture.
+pub fn node_system_info(node_name: &str) -> rusternetes_common::resources::NodeSystemInfo {
+    let read = |p: &str| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let os_image = std::env::var("KUBELET_OS_IMAGE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            read("/etc/os-release").and_then(|r| {
+                r.lines()
+                    .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+                    .map(|v| v.trim_matches('"').to_string())
+            })
+        })
+        .unwrap_or_else(|| "Linux".to_string());
+    let runtime = if std::env::var("KUBELET_CONTAINER_BACKEND").as_deref() == Ok("youki") {
+        format!("youki://{}", env!("RUSTERNETES_YOUKI_VERSION"))
+    } else {
+        "docker://unknown".to_string()
+    };
+    let architecture = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    rusternetes_common::resources::NodeSystemInfo {
+        machine_id: read("/etc/machine-id").unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        system_uuid: read("/sys/class/dmi/id/product_uuid").unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        boot_id: read("/proc/sys/kernel/random/boot_id").unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        kernel_version: read("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".to_string()),
+        os_image,
+        container_runtime_version: runtime,
+        kubelet_version: "v1.35.0-rusternetes".to_string(),
+        kube_proxy_version: "v1.35.0-rusternetes".to_string(),
+        operating_system: std::env::consts::OS.to_string(),
+        architecture: architecture.to_string(),
+        swap: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rusternetes_common::resources::pod::PodSpec;
@@ -4689,5 +4757,16 @@ mod tests {
         // Step 3: Kubelet completes resize, sets to ""
         pod.status.as_mut().unwrap().resize = Some(String::new());
         assert_eq!(pod.status.as_ref().unwrap().resize.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn node_info_is_read_from_the_machine() {
+        let i = super::node_system_info("n1");
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        assert_eq!(i.kernel_version, release.trim(), "uname -r");
+        assert_ne!(i.kernel_version, "6.1.0-rusternetes");
+        assert!(!i.container_runtime_version.starts_with("containerd://1.7.0"));
+        assert!(!env!("RUSTERNETES_YOUKI_VERSION").is_empty());
+        assert_eq!(i.operating_system, "linux");
     }
 }
