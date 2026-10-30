@@ -8,6 +8,8 @@
 //!   rusternetes --data-dir /var/lib/rusternetes.db # custom path
 //!   rusternetes --etcd-servers http://etcd:2379    # use etcd instead
 
+mod heartbeat;
+
 use anyhow::Result;
 use clap::Parser;
 use rusternetes_storage::{StorageBackend, StorageConfig};
@@ -389,12 +391,14 @@ async fn run() -> Result<()> {
     let sched_config = rusternetes_scheduler::SchedulerConfig {
         interval: args.scheduler_interval,
     };
+    let mut beats: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
     if on("scheduler") {
-        tokio::spawn(async move {
+        let h = tokio::spawn(async move {
             if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
                 error!("Scheduler error: {}", e);
             }
         });
+        beats.push(("kube-scheduler", h));
     }
 
     // --- Controller Manager ---
@@ -403,11 +407,18 @@ async fn run() -> Result<()> {
         sync_interval: args.sync_interval,
     };
     if on("controller-manager") {
-        tokio::spawn(async move {
+        let h = tokio::spawn(async move {
             if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {
                 error!("Controller manager error: {}", e);
             }
         });
+        beats.push(("kube-controller-manager", h));
+    }
+    // The control-plane components' heartbeats: one Lease each in kube-system, renewed while
+    // the component's task runs (src/heartbeat.rs) — what a rolling upgrade reads to know a
+    // control plane is up again.
+    if !beats.is_empty() || on("api-server") {
+        heartbeat::spawn(storage.clone(), args.node_name.clone(), beats, on("api-server"), args.bind_address.clone());
     }
 
     // --- Kubelet ---
