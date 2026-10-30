@@ -15,6 +15,9 @@ use std::time::Duration;
 use rusternetes_common::resources::{Lease, LeaseSpec};
 use rusternetes_storage::{Storage, StorageBackend};
 
+/// Whether a component is alive (its task runs, or it stands by for the control-plane lease).
+pub type Alive = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// How often a beat renews.
 pub const EVERY: Duration = Duration::from_secs(10);
 /// The label each heartbeat Lease carries, its value the component.
@@ -58,11 +61,12 @@ async fn renew(storage: &StorageBackend, component: &str, node: &str) {
     }
 }
 
-/// Renew each component's Lease while its task runs; the API server's while its port answers.
+/// Renew each component's Lease while it is alive ([`Alive`]); the API server's while its port
+/// answers.
 pub fn spawn(
     storage: Arc<StorageBackend>,
     node: String,
-    tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    tasks: Vec<(&'static str, Alive)>,
     api_server: bool,
     api_bind: String,
 ) {
@@ -76,8 +80,8 @@ pub fn spawn(
             {
                 renew(&storage, "kube-apiserver", &node).await;
             }
-            for (component, task) in &tasks {
-                if !task.is_finished() {
+            for (component, alive) in &tasks {
+                if alive() {
                     renew(&storage, component, &node).await;
                 }
             }
