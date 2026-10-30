@@ -14,6 +14,11 @@ pub async fn execute(
         anyhow::bail!("At least one port must be specified");
     }
 
+    // `pod/NAME` names the pod too.
+    let pod_name = pod_name
+        .strip_prefix("pod/")
+        .or_else(|| pod_name.strip_prefix("pods/"))
+        .unwrap_or(pod_name);
     // Fail before listening when the pod does not exist, as upstream does.
     let pod_path = format!("/api/v1/namespaces/{}/pods/{}", namespace, pod_name);
     if !client.resource_exists(&pod_path).await? {
@@ -23,6 +28,15 @@ pub async fn execute(
         );
     }
 
+    // `localhost` (the default) is 127.0.0.1 and ::1, as upstream binds it.
+    let addresses: Vec<(String, bool)> = if address == "localhost" {
+        vec![("127.0.0.1".into(), true), ("::1".into(), false)]
+    } else {
+        address
+            .split(',')
+            .map(|a| (a.trim().to_string(), true))
+            .collect()
+    };
     let mut listeners = Vec::new();
     for spec in ports {
         // "local:remote" or "port"
@@ -50,10 +64,17 @@ pub async fn execute(
                 .await
             })
         });
-        let address = address.to_string();
-        listeners.push(tokio::spawn(async move {
-            websocket::port_forward_listen(open, local_port, remote_port, &address).await
-        }));
+        for (addr, required) in &addresses {
+            let listener = match tokio::net::TcpListener::bind((addr.as_str(), local_port)).await {
+                Ok(l) => l,
+                Err(_) if !required => continue,
+                Err(e) => anyhow::bail!("unable to listen on {}:{}: {}", addr, local_port, e),
+            };
+            let (open, addr) = (open.clone(), addr.clone());
+            listeners.push(tokio::spawn(async move {
+                websocket::port_forward_serve(open, listener, &addr, local_port, remote_port).await
+            }));
+        }
     }
     // Run until interrupted or a listener fails.
     let (first, _, _) = futures::future::select_all(listeners).await;

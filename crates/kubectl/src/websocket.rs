@@ -375,18 +375,16 @@ pub async fn run_stream(ws: WsStream, stdin: bool) -> Result<i32> {
     exit.unwrap_or(Ok(0))
 }
 
-/// Forward `local_port` on `bind_address` to `remote_port` of the pod at
-/// `path` (`.../portforward`): one WebSocket per accepted connection, as
-/// upstream kubectl prints it.
-pub async fn port_forward_listen(
+/// Forward connections accepted on `listener` (bound to `bind_address`,
+/// `local_port`) to `remote_port` of the pod, one WebSocket from `open` per
+/// connection, printing what upstream kubectl prints.
+pub async fn port_forward_serve(
     open: Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<WsStream>> + Send + Sync>,
+    listener: tokio::net::TcpListener,
+    bind_address: &str,
     local_port: u16,
     remote_port: u16,
-    bind_address: &str,
 ) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind((bind_address, local_port))
-        .await
-        .with_context(|| format!("unable to listen on {}:{}", bind_address, local_port))?;
     let shown = if bind_address.contains(':') {
         format!("[{}]", bind_address)
     } else {
