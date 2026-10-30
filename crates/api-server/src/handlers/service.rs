@@ -15,6 +15,24 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, info};
 
+/// Mark every ClusterIP the stored Services hold as allocated. The
+/// allocator is per API server; with several API servers on one store (an HA
+/// control plane) each must see the others' allocations before it allocates.
+async fn sync_cluster_ips(state: &crate::state::ApiServerState) {
+    let services: Vec<Service> = state
+        .storage
+        .list("/registry/services/")
+        .await
+        .unwrap_or_default();
+    for svc in services {
+        if let Some(ip) = svc.spec.cluster_ip {
+            if ip != "None" && !ip.is_empty() {
+                state.ip_allocator.mark_allocated(ip);
+            }
+        }
+    }
+}
+
 /// Allocate a random NodePort in the range 30000-32767
 fn allocate_node_port() -> u16 {
     use std::time::SystemTime;
@@ -169,6 +187,9 @@ pub async fn create(
             service_type,
             ServiceType::ClusterIP | ServiceType::NodePort | ServiceType::LoadBalancer
         ) {
+            // Another API server (an HA control plane) may have allocated
+            // ClusterIPs since this one started: take the store's view first.
+            sync_cluster_ips(&state).await;
             // If ClusterIP is not specified, allocate one
             // "None" means headless service - don't allocate
             if service.spec.cluster_ip.as_deref() == Some("None") {

@@ -8,6 +8,14 @@ use tracing::{info, warn};
 /// Get the API server's IP address from the network interface
 /// This discovers the container's IP on the Docker/Podman network
 fn get_api_server_ip() -> Result<String> {
+    // An HA control plane advertises one address for all its API servers
+    // (the virtual IP that follows the store's Raft leader).
+    if let Ok(ip) = std::env::var("RUSTERNETES_ADVERTISE_ADDRESS") {
+        if !ip.trim().is_empty() {
+            info!("API server IP from RUSTERNETES_ADVERTISE_ADDRESS: {}", ip.trim());
+            return Ok(ip.trim().to_string());
+        }
+    }
     // Try to get IP from network interfaces
     // Look for non-loopback IPv4 addresses
     let interfaces = match get_if_addrs::get_if_addrs() {

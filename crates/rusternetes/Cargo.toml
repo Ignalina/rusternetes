@@ -47,6 +47,9 @@ etcd-tls = ["rusternetes-storage/etcd-tls", "tunnr-etcd?/tls", "dep:rustls"]
 # Per-node limits on the served store (--serve-etcd-node-authz): a kubelet's
 # client certificate CN=system:node:<node> writes only that node's objects.
 etcd-authz = ["etcd-tls", "tunnr-etcd?/authz"]
+# The served store as a Raft replica (tunnr-etcd feature raft): an HA control
+# plane of three, --store-raft-id/--store-raft-peers, plus --leader-elect.
+store-raft = ["redb", "tunnr-etcd?/raft"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }

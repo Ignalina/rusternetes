@@ -174,6 +174,36 @@ struct Args {
     #[arg(long)]
     etcd_keyfile: Option<String>,
 
+    /// Raft mode for the served store (feature `store-raft`): this replica's
+    /// id among --store-raft-peers. The store is then a tunnr-etcd Raft
+    /// replica in --store-raft-dir, served on --serve-etcd (with the
+    /// --serve-etcd-* TLS files, which also secure the peer link on port
+    /// 2380), and the components use it as etcd (--storage-backend etcd
+    /// --etcd-servers <this replica's own --serve-etcd URL>).
+    #[arg(long)]
+    store_raft_id: Option<u64>,
+
+    /// Every replica, this one included: `1=10.77.0.1,2=10.77.0.2,3=10.77.0.3`
+    /// (peer link on port 2380 unless `host:port` is given).
+    #[arg(long)]
+    store_raft_peers: Option<String>,
+
+    /// Where the Raft replica keeps its log, snapshot and state.
+    #[arg(long, default_value = "./data/raft")]
+    store_raft_dir: String,
+
+    /// Written `leader` / `follower` as this replica's leadership (confirmed by
+    /// a quorum) changes; a node follows it with its virtual IP.
+    #[arg(long)]
+    store_raft_leader_file: Option<String>,
+
+    /// Run the scheduler and the controller manager only while this process
+    /// holds the control-plane lease in the store (an HA control plane runs
+    /// one of each at a time). Needs --storage-backend etcd. A process that
+    /// loses the lease exits, so it starts again as a follower.
+    #[arg(long)]
+    leader_elect: bool,
+
     /// The embedded kubelet registers its Node with this pod CIDR
     /// (`spec.podCIDR`), for CNIs that allocate from the node's range.
     #[arg(long)]
@@ -306,6 +336,16 @@ async fn run() -> Result<()> {
 
     info!("Starting Rusternetes (all-in-one)");
 
+    // --- Raft mode: this process is a replica of the store; start it and
+    // serve it before the components connect to it as etcd. ---
+    let raft_mode = args.store_raft_id.is_some();
+    if let Some(id) = args.store_raft_id {
+        #[cfg(feature = "store-raft")]
+        start_store_replica(&args, id, serve_etcd_tls.clone()).await?;
+        #[cfg(not(feature = "store-raft"))]
+        anyhow::bail!("--store-raft-id {id} needs the store-raft feature");
+    }
+
     // Initialize storage — all components share one instance
     let storage_config = match args.storage_backend.as_str() {
         #[cfg(feature = "redb")]
@@ -373,7 +413,7 @@ async fn run() -> Result<()> {
     }
 
     // --- The embedded store, served to other nodes as etcd v3 ---
-    if let Some(addr) = args.serve_etcd.clone() {
+    if let Some(addr) = args.serve_etcd.clone().filter(|_| !raft_mode) {
         #[cfg(feature = "redb")]
         {
             let StorageBackend::Redb(redb) = storage.as_ref() else {
@@ -463,6 +503,57 @@ async fn run() -> Result<()> {
 
     // Give API server a moment to bind before starting clients
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // --- Leader election for the scheduler and the controller manager ---
+    let elector = if args.leader_elect && (on("scheduler") || on("controller-manager")) {
+        let StorageBackend::Etcd(etcd) = storage.as_ref() else {
+            anyhow::bail!("--leader-elect needs --storage-backend etcd");
+        };
+        let config = rusternetes_common::leader_election::LeaderElectionConfig {
+            identity: format!("{}-{}", args.node_name, std::process::id()),
+            lock_key: "/rusternetes/leader/control-plane".to_string(),
+            lease_duration: 15,
+            renew_interval: 5,
+            retry_interval: 2,
+        };
+        let el = Arc::new(rusternetes_common::leader_election::LeaderElector::with_client(
+            etcd.client(),
+            config,
+        ));
+        let run = el.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run.run().await {
+                error!("Leader election error: {}", e);
+            }
+        });
+        info!("Leader election on: the scheduler and the controller manager wait for the control-plane lease");
+        while !el.is_leader().await {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        info!("This control plane holds the lease: starting the scheduler and the controller manager");
+        let watch = el.clone();
+        tokio::spawn(async move {
+            // The lease runs 15 s: not leader for that long means another
+            // control plane may hold it now. The controllers do not stop
+            // cleanly, so the process ends and starts again as a follower.
+            let mut since: Option<std::time::Instant> = None;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                if watch.is_leader().await {
+                    since = None;
+                } else if since.get_or_insert_with(std::time::Instant::now).elapsed()
+                    > std::time::Duration::from_secs(15)
+                {
+                    error!("Lost the control-plane lease; exiting so this process starts again as a follower");
+                    std::process::exit(3);
+                }
+            }
+        });
+        Some(el)
+    } else {
+        None
+    };
+    let _elector = elector;
 
     // --- Scheduler ---
     let sched_storage = storage.clone();
@@ -566,5 +657,90 @@ async fn run() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Start this process's replica of the store (Raft mode) and serve it as
+/// etcd v3 on --serve-etcd; wait (up to two minutes) until it knows a leader.
+#[cfg(feature = "store-raft")]
+async fn start_store_replica(args: &Args, id: u64, tls: Option<[String; 3]>) -> Result<()> {
+    use tunnr_etcd::server::raft::{self, RaftConfig, RaftTls};
+    let addr = args
+        .serve_etcd
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--store-raft-id needs --serve-etcd <addr>"))?;
+    if args.storage_backend != "etcd" {
+        anyhow::bail!("--store-raft-id needs --storage-backend etcd (the components use the replica as etcd)");
+    }
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let client_port: u16 = addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("--serve-etcd {addr}: no port"))?;
+    let peers = raft::parse_peers(
+        args.store_raft_peers
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--store-raft-id needs --store-raft-peers"))?,
+        2380,
+        scheme,
+        client_port,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    let me = peers
+        .get(&id)
+        .ok_or_else(|| anyhow::anyhow!("--store-raft-id {id} is not in --store-raft-peers"))?;
+    let listen_port = me.raft_addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("2380");
+    let listen_host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0");
+    let listen: std::net::SocketAddr = format!("{listen_host}:{listen_port}").parse()?;
+    let mut cfg = RaftConfig::new(id, peers.clone(), listen, &args.store_raft_dir);
+    cfg.leader_file = args.store_raft_leader_file.clone().map(Into::into);
+    let read = |p: &str| std::fs::read(p).map_err(|e| anyhow::anyhow!("--serve-etcd TLS file {p}: {e}"));
+    let serve_tls = match &tls {
+        Some([cert, key, ca]) => {
+            cfg.tls = Some(RaftTls {
+                cert_pem: read(cert)?,
+                key_pem: read(key)?,
+                ca_pem: read(ca)?,
+                peer_certs: Vec::new(),
+            });
+            Some(tunnr_etcd::server::ServeTls {
+                cert_pem: read(cert)?,
+                key_pem: read(key)?,
+                client_ca_pem: read(ca)?,
+            })
+        }
+        None => None,
+    };
+    let node = raft::start(cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("the store replica: {e}"))?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!(
+        "Store replica {} of {} (Raft) serving etcd v3 on {} ({}), peers {:?}",
+        id,
+        peers.len(),
+        addr,
+        if serve_tls.is_some() { "mutual TLS" } else { "plaintext" },
+        peers.values().map(|p| p.raft_addr.clone()).collect::<Vec<_>>()
+    );
+    let opts = tunnr_etcd::server::ServeOptions {
+        client_url: format!("{scheme}://{addr}"),
+        tls: serve_tls,
+        ..Default::default()
+    };
+    let served = node.clone();
+    tokio::spawn(async move {
+        if let Err(e) = tunnr_etcd::server::serve_raft(served, listener, opts, std::future::pending()).await {
+            error!("store replica server error: {}", e);
+        }
+    });
+    let t0 = std::time::Instant::now();
+    while node.leader().is_none() && t0.elapsed() < std::time::Duration::from_secs(120) {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    match node.leader() {
+        Some(l) => info!("Store replica {}: leader is replica {}", id, l),
+        None => tracing::warn!("Store replica {}: no leader yet after two minutes; starting the components anyway", id),
+    }
     Ok(())
 }
