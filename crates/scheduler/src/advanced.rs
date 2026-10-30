@@ -413,8 +413,14 @@ fn matches_pod_affinity_term(
                 }
             }
 
-            // TODO: Check if the pod is on a node with matching topology value
-            // For now, we simplify by checking if any matching pod exists
+            // The pod must be in this node's topology domain. With the
+            // per-node key that is this node itself; other keys need every
+            // node's labels, which this check does not have: any matching
+            // pod counts there (stricter than Kubernetes, never looser).
+            if term.topology_key == "kubernetes.io/hostname" {
+                return p.spec.as_ref().and_then(|s| s.node_name.as_deref())
+                    == Some(node.metadata.name.as_str());
+            }
             true
         })
         .collect();
@@ -1250,6 +1256,42 @@ fn check_single_topology_constraint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(name: &str) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": name, "labels": {"kubernetes.io/hostname": name}}
+        }))
+        .unwrap()
+    }
+
+    fn web_pod(name: &str, on: Option<&str>) -> Pod {
+        let mut spec = serde_json::json!({
+            "containers": [{"name": "main", "image": "busybox"}],
+            "affinity": {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [
+                {"labelSelector": {"matchLabels": {"app": "web"}}, "topologyKey": "kubernetes.io/hostname"}]}}
+        });
+        if let Some(n) = on {
+            spec["nodeName"] = serde_json::json!(n);
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "labels": {"app": "web"}},
+            "spec": spec
+        }))
+        .unwrap()
+    }
+
+    /// Hostname anti-affinity spreads replicas: a matching pod on another
+    /// node does not keep a pod off this one (it kept every replica but the
+    /// first Pending).
+    #[test]
+    fn hostname_anti_affinity_only_counts_pods_on_the_same_node() {
+        let running = vec![web_pod("web-1", Some("w1"))];
+        let new = web_pod("web-2", None);
+        assert!(!check_pod_anti_affinity(&node("w1"), &new, &running).0);
+        assert!(check_pod_anti_affinity(&node("w2"), &new, &running).0);
+    }
 
     #[test]
     fn test_parse_cpu_quantity() {
