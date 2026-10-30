@@ -399,6 +399,14 @@ fn matches_pod_affinity_term(
             if p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none() {
                 return false;
             }
+            // A finished pod (Succeeded, Failed) holds no place on its node.
+            if matches!(
+                p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                Some(rusternetes_common::types::Phase::Succeeded)
+                    | Some(rusternetes_common::types::Phase::Failed)
+            ) {
+                return false;
+            }
 
             // Check if pod matches the label selector
             if !match_selector(&term.label_selector, &p.metadata.labels) {
@@ -1291,6 +1299,14 @@ mod tests {
         let new = web_pod("web-2", None);
         assert!(!check_pod_anti_affinity(&node("w1"), &new, &running).0);
         assert!(check_pod_anti_affinity(&node("w2"), &new, &running).0);
+    }
+
+    /// A Failed pod (a node rebooted under it) does not keep its replacement off the node.
+    #[test]
+    fn a_finished_pod_does_not_count_for_anti_affinity() {
+        let mut failed = web_pod("web-1", Some("w2"));
+        failed.status = Some(serde_json::from_value(serde_json::json!({"phase": "Failed"})).unwrap());
+        assert!(check_pod_anti_affinity(&node("w2"), &web_pod("web-2", None), &[failed]).0);
     }
 
     #[test]
