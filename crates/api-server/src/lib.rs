@@ -143,6 +143,23 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
             e
         );
     }
+    // Keep them (upstream reconciles every 10 s): a store not ready at start
+    // (an HA control plane without a Raft leader yet) or a deleted object is
+    // made good here.
+    {
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
+                    tracing::debug!("system namespaces: {e}");
+                }
+                if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
+                    tracing::debug!("kubernetes Service: {e}");
+                }
+            }
+        });
+    }
 
     // Create default ServiceCIDR
     {

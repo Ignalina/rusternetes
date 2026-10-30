@@ -3,7 +3,7 @@ use rusternetes_common::resources::{EndpointSlice, Endpoints};
 use rusternetes_storage::Storage;
 use rusternetes_storage::StorageBackend;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Get the API server's IP address from the network interface
 /// This discovers the container's IP on the Docker/Podman network
@@ -12,7 +12,7 @@ fn get_api_server_ip() -> Result<String> {
     // (the virtual IP that follows the store's Raft leader).
     if let Ok(ip) = std::env::var("RUSTERNETES_ADVERTISE_ADDRESS") {
         if !ip.trim().is_empty() {
-            info!("API server IP from RUSTERNETES_ADVERTISE_ADDRESS: {}", ip.trim());
+            debug!("API server IP from RUSTERNETES_ADVERTISE_ADDRESS: {}", ip.trim());
             return Ok(ip.trim().to_string());
         }
     }
@@ -82,12 +82,12 @@ pub async fn bootstrap_kubernetes_service(
     storage: Arc<StorageBackend>,
     api_server_port: u16,
 ) -> Result<()> {
-    info!("Bootstrapping kubernetes Service and Endpoints");
+    debug!("Bootstrapping kubernetes Service and Endpoints");
 
     // Get the API server's IP address
     let api_server_ip = get_api_server_ip().context("Failed to discover API server IP address")?;
 
-    info!(
+    debug!(
         "API server IP: {}, Port: {}",
         api_server_ip, api_server_port
     );
@@ -98,7 +98,7 @@ pub async fn bootstrap_kubernetes_service(
     match storage.get::<Endpoints>(endpoints_key).await {
         Ok(mut endpoints) => {
             // Update existing endpoints
-            info!("Updating existing kubernetes Endpoints");
+            debug!("Updating existing kubernetes Endpoints");
             // endpoints.subsets is Vec<EndpointSubset>
             if let Some(subset) = endpoints.subsets.first_mut() {
                 // subset.addresses is Option<Vec<EndpointAddress>>
@@ -115,7 +115,7 @@ pub async fn bootstrap_kubernetes_service(
                                 .await
                                 .context("Failed to update kubernetes Endpoints")?;
                         } else {
-                            info!("API server IP already correct: {}", api_server_ip);
+                            debug!("API server IP already correct: {}", api_server_ip);
                         }
                     }
                 }
@@ -263,5 +263,88 @@ pub async fn bootstrap_kubernetes_service(
         }
     }
 
-    Ok(())
+    ensure_kubernetes_service(&storage, api_server_port).await
+}
+
+/// The `kubernetes` Service's ClusterIP: the first address of the service
+/// CIDR (10.96.0.0/12, the ClusterIP allocator's and the default
+/// ServiceCIDR's range), as upstream reserves it.
+pub const KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
+
+/// The `default/kubernetes` Service object (upstream: the API server's
+/// `kubernetes` service controller, `pkg/controlplane/controller/kubernetesservice`):
+/// ClusterIP [`KUBERNETES_SERVICE_IP`], port 443 `https` to the API servers'
+/// port, no selector (its Endpoints are the advertised address above).
+/// Created when missing; an existing one is left as it is.
+pub async fn ensure_kubernetes_service(storage: &Arc<StorageBackend>, api_server_port: u16) -> Result<()> {
+    let key = rusternetes_storage::build_key("services", Some("default"), "kubernetes");
+    if storage.get::<serde_json::Value>(&key).await.is_ok() {
+        return Ok(());
+    }
+    let svc = kubernetes_service(api_server_port)?;
+    match storage.create(&key, &svc).await {
+        Ok(_) => {
+            info!("Created the kubernetes Service (ClusterIP {KUBERNETES_SERVICE_IP}, 443 -> {api_server_port})");
+            Ok(())
+        }
+        // Another API server of the same store was first.
+        Err(rusternetes_common::Error::AlreadyExists(_)) => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("Failed to create the kubernetes Service: {e}")),
+    }
+}
+
+/// The `default/kubernetes` Service as upstream writes it.
+pub fn kubernetes_service(api_server_port: u16) -> Result<rusternetes_common::resources::Service> {
+    let meta = rusternetes_common::types::ObjectMeta::new("kubernetes");
+    let v = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "kubernetes",
+            "namespace": "default",
+            "uid": meta.uid,
+            "creationTimestamp": meta.creation_timestamp,
+            "labels": {"component": "apiserver", "provider": "kubernetes"},
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "clusterIP": KUBERNETES_SERVICE_IP,
+            "clusterIPs": [KUBERNETES_SERVICE_IP],
+            "ipFamilies": ["IPv4"],
+            "ipFamilyPolicy": "SingleStack",
+            "internalTrafficPolicy": "Cluster",
+            "sessionAffinity": "None",
+            "ports": [{"name": "https", "port": 443, "protocol": "TCP", "targetPort": api_server_port}],
+        },
+    });
+    serde_json::from_value(v).context("the kubernetes Service")
+}
+
+#[cfg(test)]
+mod kubernetes_service_tests {
+    use super::*;
+
+    #[test]
+    fn the_kubernetes_service_is_upstreams() {
+        let svc = kubernetes_service(6443).unwrap();
+        let v = serde_json::to_value(&svc).unwrap();
+        assert_eq!(v["metadata"]["namespace"], "default");
+        assert_eq!(v["metadata"]["labels"]["component"], "apiserver");
+        assert_eq!(v["metadata"]["labels"]["provider"], "kubernetes");
+        assert_eq!(v["spec"]["type"], "ClusterIP");
+        assert_eq!(v["spec"]["clusterIP"], "10.96.0.1");
+        assert_eq!(v["spec"]["ports"][0]["name"], "https");
+        assert_eq!(v["spec"]["ports"][0]["port"], 443);
+        assert_eq!(v["spec"]["ports"][0]["targetPort"], 6443);
+        assert!(v["spec"].get("selector").is_none_or(|s| s.is_null()), "no selector: its Endpoints are the API servers'");
+        assert!(!v["metadata"]["uid"].as_str().unwrap_or("").is_empty());
+        assert!(v["metadata"]["creationTimestamp"].is_string());
+    }
+
+    #[test]
+    fn the_first_service_ip_is_reserved_for_it() {
+        // The allocator's first address is the kubernetes Service's.
+        let a = crate::ip_allocator::ClusterIPAllocator::new();
+        assert_eq!(a.allocate().as_deref(), Some(KUBERNETES_SERVICE_IP));
+    }
 }
