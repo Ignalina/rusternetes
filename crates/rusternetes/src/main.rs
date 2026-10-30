@@ -197,6 +197,12 @@ struct Args {
     #[arg(long)]
     store_raft_leader_file: Option<String>,
 
+    /// Written every half second: this replica's Raft state (role, term,
+    /// leader, log and applied index, each follower's lag on the leader) as
+    /// `key=value` lines; a node's console shows it.
+    #[arg(long)]
+    store_raft_status_file: Option<String>,
+
     /// Run the scheduler and the controller manager only while this process
     /// holds the control-plane lease in the store (an HA control plane runs
     /// one of each at a time). Needs --storage-backend etcd. A process that
@@ -714,6 +720,7 @@ async fn start_store_replica(args: &Args, id: u64, tls: Option<[String; 3]>) -> 
     let listen: std::net::SocketAddr = format!("{listen_host}:{listen_port}").parse()?;
     let mut cfg = RaftConfig::new(id, peers.clone(), listen, &args.store_raft_dir);
     cfg.leader_file = args.store_raft_leader_file.clone().map(Into::into);
+    cfg.status_file = args.store_raft_status_file.clone().map(Into::into);
     let read = |p: &str| std::fs::read(p).map_err(|e| anyhow::anyhow!("--serve-etcd TLS file {p}: {e}"));
     let serve_tls = match &tls {
         Some([cert, key, ca]) => {
