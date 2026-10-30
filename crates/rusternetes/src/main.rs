@@ -148,6 +148,16 @@ struct Args {
     #[arg(long)]
     serve_etcd_client_ca_file: Option<String>,
 
+    /// With the --serve-etcd TLS files: limit each node by its client
+    /// certificate (CN=system:node:<node>), as the NodeRestriction admission
+    /// plugin and the Node authorizer do — its own Node, Lease and CSINode,
+    /// the status of pods bound to it, and the reads a kubelet makes; other
+    /// cluster-CA certificates (the control plane) keep full access; nodes
+    /// revoked in ConfigMap kube-system/tunnr-revoked-nodes are refused.
+    /// Needs the etcd-authz feature.
+    #[arg(long, default_value = "false")]
+    serve_etcd_node_authz: bool,
+
     /// The CA the etcd servers' certificates must chain to (PEM). With
     /// --etcd-certfile and --etcd-keyfile, the etcd backend connects over
     /// TLS with that client certificate (https:// endpoints only).
@@ -340,9 +350,21 @@ async fn run() -> Result<()> {
             } else {
                 info!("Serving the embedded store as etcd v3 on {} (plaintext)", addr);
             }
+            if args.serve_etcd_node_authz {
+                if tls.is_none() {
+                    anyhow::bail!("--serve-etcd-node-authz needs the --serve-etcd TLS files: a node is known by its client certificate");
+                }
+                #[cfg(not(feature = "etcd-authz"))]
+                anyhow::bail!("--serve-etcd-node-authz needs the etcd-authz feature");
+                #[cfg(feature = "etcd-authz")]
+                info!("Served store: per-node limits on (CN=system:node:<node> writes its own objects only)");
+            }
             let opts = tunnr_etcd::server::ServeOptions {
                 client_url: format!("{scheme}://{addr}"),
                 tls,
+                node_authz: args
+                    .serve_etcd_node_authz
+                    .then(tunnr_etcd::server::NodeAuthz::default),
                 ..Default::default()
             };
             tokio::spawn(async move {

@@ -44,6 +44,9 @@ youki = ["rusternetes-kubelet/youki"]
 # for a client, --serve-etcd-cert-file/--serve-etcd-key-file/
 # --serve-etcd-client-ca-file for the served store.
 etcd-tls = ["rusternetes-storage/etcd-tls", "tunnr-etcd?/tls", "dep:rustls"]
+# Per-node limits on the served store (--serve-etcd-node-authz): a kubelet's
+# client certificate CN=system:node:<node> writes only that node's objects.
+etcd-authz = ["etcd-tls", "tunnr-etcd?/authz"]
 
 [dependencies]
 rusternetes-api-server = { path = "../api-server" }
