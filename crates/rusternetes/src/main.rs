@@ -124,6 +124,11 @@ struct Args {
     #[arg(long)]
     service_account_key_file: Option<String>,
 
+    /// Nodes publish ConfigMaps kube-system/<prefix><node>: a node may get
+    /// every node's and create, update and patch its own (the Node authorizer).
+    #[arg(long)]
+    node_configmap_prefix: Option<String>,
+
     /// By default, a pod's resolv.conf lists the node's own DNS server first
     /// so pods can resolve sibling container names under Docker Compose.
     /// Set this flag outside Compose so pods resolve cluster Service names.
@@ -522,6 +527,7 @@ async fn run() -> Result<()> {
         console_dir: args.console_dir.map(std::path::PathBuf::from),
         client_ca_file: args.client_ca_file,
         kubelet_client_tls,
+        node_configmap_prefix: args.node_configmap_prefix.clone(),
         ..Default::default()
     };
     let api_handle = if on("api-server") {

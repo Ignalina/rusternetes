@@ -19,6 +19,7 @@
 //! | secrets, configmaps, persistentvolumeclaims, serviceaccounts | get, only when a pod bound to it refers to it |
 //! | persistentvolumes | get, only when bound to such a claim |
 //! | tokenreviews, subjectaccessreviews | create |
+//! | configmaps `kube-system/<prefix><node>` (with [`ClusterAuthorizer::with_node_configmaps`]) | get any node's; create, update, patch its own (a node publishes facts its peers read, e.g. a WireGuard public key) |
 //!
 //! Everything else goes to RBAC, where `system:nodes` has no binding: 403.
 
@@ -42,11 +43,24 @@ pub fn node_of(user: &UserInfo) -> Option<&str> {
 pub struct ClusterAuthorizer {
     storage: Arc<StorageBackend>,
     rbac: RBACAuthorizer<StorageBackend>,
+    /// `kube-system/<prefix><node>` ConfigMaps nodes publish (`--node-configmap-prefix`).
+    node_configmap_prefix: Option<String>,
 }
+
+/// The namespace of the ConfigMaps nodes publish.
+pub const NODE_CONFIGMAP_NAMESPACE: &str = "kube-system";
 
 impl ClusterAuthorizer {
     pub fn new(storage: Arc<StorageBackend>) -> Self {
-        Self { rbac: RBACAuthorizer::new(storage.clone()), storage }
+        Self { rbac: RBACAuthorizer::new(storage.clone()), storage, node_configmap_prefix: None }
+    }
+
+    /// Nodes publish ConfigMaps `kube-system/<prefix><node>`: each node may
+    /// get every node's, and create, update and patch its own; never list
+    /// (kube-system holds other ConfigMaps).
+    pub fn with_node_configmaps(mut self, prefix: Option<String>) -> Self {
+        self.node_configmap_prefix = prefix.filter(|p| !p.is_empty());
+        self
     }
 
     /// The pods bound to `node`, in `namespace` (all namespaces: `None`).
@@ -124,6 +138,16 @@ impl ClusterAuthorizer {
             | ("storage.k8s.io", "csidrivers")
             | ("node.k8s.io", "runtimeclasses") => read && sub.is_none(),
             ("", "namespaces") => v == "get" && sub.is_none(),
+            ("", "configmaps")
+                if self.node_configmap_prefix.as_deref().is_some_and(|p| {
+                    a.namespace.as_deref() == Some(NODE_CONFIGMAP_NAMESPACE)
+                        && sub.is_none()
+                        && a.name.as_deref().is_some_and(|n| n.starts_with(p))
+                        && (v == "get" || (matches!(v, "create" | "update" | "patch") && a.name.as_deref() == Some(&format!("{p}{node}"))))
+                }) =>
+            {
+                true
+            }
             ("", r @ ("secrets" | "configmaps" | "persistentvolumeclaims" | "serviceaccounts")) => {
                 match (v, sub, a.namespace.as_deref(), a.name.as_deref()) {
                     ("get", None, Some(ns), Some(name)) => self.referenced(node, ns, r, name).await?,
@@ -332,6 +356,25 @@ mod tests {
         // The name alone is not a node: system:nodes is needed.
         let fake = user("system:node:w1", &[]);
         assert!(!allowed(&az, &fake, "get", "", "nodes", None, Some("w1"), None).await);
+    }
+
+    #[tokio::test]
+    async fn nodes_publish_their_own_prefixed_configmap_and_read_the_others() {
+        let st = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+        let w1 = user("system:node:w1", &["system:nodes"]);
+        let ks = Some("kube-system");
+        let off = ClusterAuthorizer::new(st.clone());
+        assert!(!allowed(&off, &w1, "create", "", "configmaps", ks, Some("tunnr-wg-w1"), None).await);
+        let az = ClusterAuthorizer::new(st).with_node_configmaps(Some("tunnr-wg-".into()));
+        assert!(allowed(&az, &w1, "create", "", "configmaps", ks, Some("tunnr-wg-w1"), None).await);
+        assert!(allowed(&az, &w1, "update", "", "configmaps", ks, Some("tunnr-wg-w1"), None).await);
+        assert!(allowed(&az, &w1, "get", "", "configmaps", ks, Some("tunnr-wg-w2"), None).await);
+        assert!(!allowed(&az, &w1, "update", "", "configmaps", ks, Some("tunnr-wg-w2"), None).await);
+        assert!(!allowed(&az, &w1, "delete", "", "configmaps", ks, Some("tunnr-wg-w2"), None).await);
+        assert!(!allowed(&az, &w1, "list", "", "configmaps", ks, None, None).await);
+        assert!(!allowed(&az, &w1, "get", "", "configmaps", ks, Some("tunnr-join-tokens"), None).await);
+        assert!(!allowed(&az, &w1, "create", "", "configmaps", Some("default"), Some("tunnr-wg-w1"), None).await);
+        assert!(!allowed(&az, &w1, "create", "", "configmaps", ks, None, None).await);
     }
 
     #[tokio::test]

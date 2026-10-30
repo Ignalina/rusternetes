@@ -62,6 +62,9 @@ pub struct ApiServerConfig {
     /// certificate and key presented (`--kubelet-certificate-authority`,
     /// `--kubelet-client-certificate`, `--kubelet-client-key`). `None`: plain HTTP.
     pub kubelet_client_tls: Option<kubelet_client::KubeletClientTls>,
+    /// Nodes publish ConfigMaps `kube-system/<prefix><node>` (the Node
+    /// authorizer: get any node's, write its own). `None`: none.
+    pub node_configmap_prefix: Option<String>,
 }
 
 impl Default for ApiServerConfig {
@@ -82,6 +85,7 @@ impl Default for ApiServerConfig {
             console_dir: None,
             client_ca_file: None,
             kubelet_client_tls: None,
+            node_configmap_prefix: None,
         }
     }
 }
@@ -118,7 +122,10 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
     } else {
         info!("Authorization: Node authorizer + RBAC (system:masters is admin)");
-        Arc::new(node_authz::ClusterAuthorizer::new(storage.clone()))
+        Arc::new(
+            node_authz::ClusterAuthorizer::new(storage.clone())
+                .with_node_configmaps(config.node_configmap_prefix.clone()),
+        )
     };
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
