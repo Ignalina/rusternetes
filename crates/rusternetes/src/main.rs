@@ -426,8 +426,42 @@ async fn run() -> Result<()> {
     // Give API server a moment to bind before starting clients
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    // --- Leader election for the scheduler and the controller manager ---
-    let elector = if args.leader_elect && (on("scheduler") || on("controller-manager")) {
+    // --- Scheduler and Controller Manager ---
+    let sched_storage = storage.clone();
+    let sched_config = rusternetes_scheduler::SchedulerConfig {
+        interval: args.scheduler_interval,
+    };
+    let cm_storage = storage.clone();
+    let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
+        sync_interval: args.sync_interval,
+    };
+    let (run_sched, run_cm) = (on("scheduler"), on("controller-manager"));
+    let start_sched_cm = move || {
+        let mut started: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
+        if run_sched {
+            started.push(("kube-scheduler", tokio::spawn(async move {
+                if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
+                    error!("Scheduler error: {}", e);
+                }
+            })));
+        }
+        if run_cm {
+            started.push(("kube-controller-manager", tokio::spawn(async move {
+                if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {
+                    error!("Controller manager error: {}", e);
+                }
+            })));
+        }
+        started
+    };
+    // The control-plane components' heartbeats (src/heartbeat.rs): each component's Lease is
+    // renewed while it is alive. Under --leader-elect a control plane that stands by (another
+    // one holds the lease) is alive too: its election task runs and takes over when needed.
+    let mut beats: Vec<(&'static str, heartbeat::Alive)> = Vec::new();
+    if args.leader_elect && (run_sched || run_cm) {
+        // An HA control plane runs one scheduler and one controller manager
+        // at a time: they start once this process holds the control-plane
+        // lease in the store (the rest of the process does not wait).
         let StorageBackend::Etcd(etcd) = storage.as_ref() else {
             anyhow::bail!("--leader-elect needs --storage-backend etcd");
         };
@@ -449,19 +483,22 @@ async fn run() -> Result<()> {
             }
         });
         info!("Leader election on: the scheduler and the controller manager wait for the control-plane lease");
-        while !el.is_leader().await {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-        info!("This control plane holds the lease: starting the scheduler and the controller manager");
-        let watch = el.clone();
-        tokio::spawn(async move {
+        let running: Arc<std::sync::Mutex<Vec<(&'static str, tokio::task::JoinHandle<()>)>>> =
+            Arc::default();
+        let slot = running.clone();
+        let waiter = Arc::new(tokio::spawn(async move {
+            while !el.is_leader().await {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+            info!("This control plane holds the lease: starting the scheduler and the controller manager");
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = start_sched_cm();
             // The lease runs 15 s: not leader for that long means another
             // control plane may hold it now. The controllers do not stop
             // cleanly, so the process ends and starts again as a follower.
             let mut since: Option<std::time::Instant> = None;
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                if watch.is_leader().await {
+                if el.is_leader().await {
                     since = None;
                 } else if since.get_or_insert_with(std::time::Instant::now).elapsed()
                     > std::time::Duration::from_secs(15)
@@ -470,44 +507,27 @@ async fn run() -> Result<()> {
                     std::process::exit(3);
                 }
             }
-        });
-        Some(el)
+        }));
+        for (component, wanted) in [("kube-scheduler", run_sched), ("kube-controller-manager", run_cm)] {
+            if !wanted {
+                continue;
+            }
+            let (waiter, running) = (waiter.clone(), running.clone());
+            beats.push((component, Arc::new(move || {
+                if waiter.is_finished() {
+                    return false;
+                }
+                let r = running.lock().unwrap_or_else(|e| e.into_inner());
+                // Standing by (not started here), or started and running.
+                r.iter().find(|(c, _)| *c == component).is_none_or(|(_, h)| !h.is_finished())
+            })));
+        }
     } else {
-        None
-    };
-    let _elector = elector;
-
-    // --- Scheduler ---
-    let sched_storage = storage.clone();
-    let sched_config = rusternetes_scheduler::SchedulerConfig {
-        interval: args.scheduler_interval,
-    };
-    let mut beats: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
-    if on("scheduler") {
-        let h = tokio::spawn(async move {
-            if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
-                error!("Scheduler error: {}", e);
-            }
-        });
-        beats.push(("kube-scheduler", h));
+        for (component, h) in start_sched_cm() {
+            let h = Arc::new(h);
+            beats.push((component, Arc::new(move || !h.is_finished())));
+        }
     }
-
-    // --- Controller Manager ---
-    let cm_storage = storage.clone();
-    let cm_config = rusternetes_controller_manager::ControllerManagerConfig {
-        sync_interval: args.sync_interval,
-    };
-    if on("controller-manager") {
-        let h = tokio::spawn(async move {
-            if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {
-                error!("Controller manager error: {}", e);
-            }
-        });
-        beats.push(("kube-controller-manager", h));
-    }
-    // The control-plane components' heartbeats: one Lease each in kube-system, renewed while
-    // the component's task runs (src/heartbeat.rs) — what a rolling upgrade reads to know a
-    // control plane is up again.
     if !beats.is_empty() || on("api-server") {
         heartbeat::spawn(storage.clone(), args.node_name.clone(), beats, on("api-server"), args.bind_address.clone());
     }
