@@ -222,7 +222,7 @@ pub fn check_pod_anti_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (boo
 }
 
 /// Check if node matches a node selector
-fn matches_node_selector(node: &Node, selector: &NodeSelector) -> bool {
+pub fn matches_node_selector(node: &Node, selector: &NodeSelector) -> bool {
     // At least one term must match (OR logic)
     selector
         .node_selector_terms
