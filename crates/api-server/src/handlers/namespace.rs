@@ -6,9 +6,8 @@ use axum::{
     Extension, Json,
 };
 use rusternetes_common::{
-    auth::ServiceAccountClaims,
     authz::{Decision, RequestAttributes},
-    resources::{Namespace, Secret, ServiceAccount},
+    resources::{Namespace, ServiceAccount},
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
@@ -581,53 +580,10 @@ async fn create_default_service_account(
     let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
     let created_sa = state.storage.create(&sa_key, &service_account).await?;
 
-    // Generate ServiceAccount token and store it in a Secret
-    let sa_uid = created_sa.metadata.uid.clone();
-
-    // Generate JWT token (valid for 10 years - Kubernetes default for static tokens)
-    let claims = ServiceAccountClaims::new(
-        sa_name.to_string(),
-        namespace.to_string(),
-        sa_uid.clone(),
-        87600, // 10 years in hours
-    );
-
-    let token = state.token_manager.generate_token(claims)?;
-
-    // Create Secret to store the token
-    let secret_name = format!("{}-token", sa_name);
-    let mut string_data = HashMap::new();
-    string_data.insert("token".to_string(), token);
-    string_data.insert("namespace".to_string(), namespace.to_string());
-
-    let mut secret =
-        Secret::new(&secret_name, namespace).with_type("kubernetes.io/service-account-token");
-
-    // Add labels and annotations
-    secret.metadata.labels = Some({
-        let mut labels = HashMap::new();
-        labels.insert(
-            "kubernetes.io/service-account.name".to_string(),
-            sa_name.to_string(),
-        );
-        labels
-    });
-    secret.metadata.annotations = Some({
-        let mut annotations = HashMap::new();
-        annotations.insert("kubernetes.io/service-account.uid".to_string(), sa_uid);
-        annotations
-    });
-    secret.string_data = Some(string_data);
-
-    // Normalize: convert stringData to base64-encoded data before storing
-    secret.normalize();
-
-    // Store the secret
-    let secret_key = build_key("secrets", Some(namespace), &secret_name);
-    state.storage.create(&secret_key, &secret).await?;
-
+    // No long-lived token Secret: bound tokens through TokenRequest.
+    let _ = created_sa;
     info!(
-        "Created default ServiceAccount and token secret in namespace: {}",
+        "Created default ServiceAccount in namespace: {}",
         namespace
     );
     Ok(())
