@@ -44,7 +44,7 @@ chrono.workspace = true
 axum = { workspace = true, features = ["ws"] }
 url = "2"
 futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tonic.workspace = true
 prost.workspace = true
 prost-types.workspace = true

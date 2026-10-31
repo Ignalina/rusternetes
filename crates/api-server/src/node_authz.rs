@@ -269,6 +269,11 @@ impl ClusterAuthorizer {
                     ("get", None, Some(ns), Some(name)) => {
                         self.referenced(node, ns, r, name).await?
                     }
+                    // A bound token for a ServiceAccount its pods run as
+                    // (TokenRequest; the handler checks the bound pod is on this node).
+                    ("create", Some("token"), Some(ns), Some(name)) if r == "serviceaccounts" => {
+                        self.referenced(node, ns, r, name).await?
+                    }
                     _ => false,
                 }
             }
@@ -284,8 +289,7 @@ impl ClusterAuthorizer {
 }
 
 /// What a pod refers to, by resource: Secrets (volumes incl. projected and
-/// CSI, env, envFrom, imagePullSecrets, its ServiceAccount's
-/// `<name>-token`), ConfigMaps (volumes incl. projected, env, envFrom),
+/// CSI, env, envFrom, imagePullSecrets), ConfigMaps (volumes incl. projected, env, envFrom),
 /// PersistentVolumeClaims (volumes) and its ServiceAccount.
 pub fn pod_refs(pod: &Value, resource: &str) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -302,7 +306,8 @@ pub fn pod_refs(pod: &Value, resource: &str) -> HashSet<String> {
         .collect();
     match resource {
         "secrets" => {
-            out.insert(format!("{sa}-token"));
+            // Not the ServiceAccount's long-lived `<sa>-token` Secret: pods get
+            // bound tokens through TokenRequest.
             for v in arr(spec.get("volumes")) {
                 out.extend(s(v.pointer("/secret/secretName")));
                 out.extend(s(v.pointer("/csi/nodePublishSecretRef/name")));
@@ -573,7 +578,61 @@ mod tests {
         assert!(!allowed(&az, &w1, "create", "", "pods", d, None, None).await);
         // Secrets, ConfigMaps, claims and volumes its pods use; no others, no lists.
         assert!(allowed(&az, &w1, "get", "", "secrets", d, Some("s-a"), None).await);
-        assert!(allowed(&az, &w1, "get", "", "secrets", d, Some("web-token"), None).await);
+        // No long-lived ServiceAccount token Secret: a bound token through TokenRequest,
+        // for the ServiceAccount its pods run as only.
+        assert!(!allowed(&az, &w1, "get", "", "secrets", d, Some("web-token"), None).await);
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "create",
+                "",
+                "serviceaccounts",
+                d,
+                Some("web"),
+                Some("token")
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "",
+                "serviceaccounts",
+                d,
+                Some("other"),
+                Some("token")
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "",
+                "serviceaccounts",
+                Some("kube-system"),
+                Some("web"),
+                Some("token")
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "serviceaccounts",
+                d,
+                Some("web"),
+                Some("token")
+            )
+            .await
+        );
         assert!(!allowed(&az, &w1, "get", "", "secrets", d, Some("s-b"), None).await);
         assert!(!allowed(&az, &w1, "list", "", "secrets", d, None, None).await);
         assert!(!allowed(&az, &w1, "watch", "", "secrets", None, None, None).await);
