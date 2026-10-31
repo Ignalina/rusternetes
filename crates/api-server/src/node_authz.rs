@@ -15,7 +15,7 @@
 //! | pods | get/list/watch; update, patch (incl. status) and delete of pods bound to it (`spec.nodeName`) |
 //! | events (core, events.k8s.io) | create, update, patch |
 //! | services, endpoints, endpointslices, volumeattachments, csidrivers, runtimeclasses | get/list/watch |
-//! | namespaces | get |
+//! | namespaces, networkpolicies (networking.k8s.io) | get/list/watch (a node's CNI enforces NetworkPolicy) |
 //! | secrets, configmaps, persistentvolumeclaims, serviceaccounts | get, only when a pod bound to it refers to it |
 //! | persistentvolumes | get, only when bound to such a claim |
 //! | tokenreviews, subjectaccessreviews | create |
@@ -137,7 +137,9 @@ impl ClusterAuthorizer {
             | ("storage.k8s.io", "volumeattachments")
             | ("storage.k8s.io", "csidrivers")
             | ("node.k8s.io", "runtimeclasses") => read && sub.is_none(),
-            ("", "namespaces") => v == "get" && sub.is_none(),
+            // Namespaces and NetworkPolicies: read, as a node's own CNI
+            // agent enforces policies (tunnr's aya row; Cilium's agent role).
+            ("", "namespaces") | ("networking.k8s.io", "networkpolicies") => read && sub.is_none(),
             ("", "configmaps")
                 if self.node_configmap_prefix.as_deref().is_some_and(|p| {
                     a.namespace.as_deref() == Some(NODE_CONFIGMAP_NAMESPACE)
@@ -352,6 +354,10 @@ mod tests {
         assert!(!allowed(&az, &w1, "create", "apiextensions.k8s.io", "customresourcedefinitions", None, None, None).await);
         assert!(!allowed(&az, &w1, "get", "", "pods", d, Some("a"), Some("exec")).await);
         assert!(allowed(&az, &w1, "create", "", "events", d, None, None).await);
+        assert!(allowed(&az, &w1, "list", "", "namespaces", None, None, None).await);
+        assert!(allowed(&az, &w1, "list", "networking.k8s.io", "networkpolicies", None, None, None).await);
+        assert!(!allowed(&az, &w1, "create", "networking.k8s.io", "networkpolicies", d, Some("allow-all"), None).await);
+        assert!(!allowed(&az, &w1, "update", "", "namespaces", None, Some("default"), None).await);
         assert!(allowed(&az, &w1, "list", "", "services", None, None, None).await);
         // The name alone is not a node: system:nodes is needed.
         let fake = user("system:node:w1", &[]);
