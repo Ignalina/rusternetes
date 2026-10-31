@@ -11,6 +11,8 @@ mod kubelet;
 #[allow(dead_code)]
 mod netns;
 mod runtime;
+#[allow(dead_code)]
+mod seccomp;
 
 use anyhow::Result;
 use axum::{
