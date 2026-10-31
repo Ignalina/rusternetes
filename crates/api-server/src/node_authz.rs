@@ -45,6 +45,13 @@ pub struct ClusterAuthorizer {
     rbac: RBACAuthorizer<StorageBackend>,
     /// `kube-system/<prefix><node>` ConfigMaps nodes publish (`--node-configmap-prefix`).
     node_configmap_prefix: Option<String>,
+    /// Custom resources a node writes when named `<node>.<…>`
+    /// (`--node-named-resource <plural>.<group>`): (group, plural).
+    node_named: Vec<(String, String)>,
+    /// Custom resources whose status a node writes when labelled
+    /// `<key>=<node>` (`--node-status-resource <plural>.<group>=<key>`):
+    /// (group, plural, label key).
+    node_status: Vec<(String, String, String)>,
 }
 
 /// The namespace of the ConfigMaps nodes publish.
@@ -52,7 +59,24 @@ pub const NODE_CONFIGMAP_NAMESPACE: &str = "kube-system";
 
 impl ClusterAuthorizer {
     pub fn new(storage: Arc<StorageBackend>) -> Self {
-        Self { rbac: RBACAuthorizer::new(storage.clone()), storage, node_configmap_prefix: None }
+        Self { rbac: RBACAuthorizer::new(storage.clone()), storage, node_configmap_prefix: None, node_named: Vec::new(), node_status: Vec::new() }
+    }
+
+    /// Custom resources nodes write themselves (cluster-scoped views of what
+    /// a node sees, e.g. tunnr's `tunnrdisks.disks.tunnr.io`):
+    ///
+    /// * `named` (`<plural>.<group>`): every node may get, list and watch
+    ///   them; create, update, patch (incl. status) and delete only those
+    ///   named `<node>.<…>`;
+    /// * `status` (`<plural>.<group>=<label key>`): every node may get, list
+    ///   and watch them; update and patch only the status of an object whose
+    ///   STORED label `<label key>` is the node (the label is the control
+    ///   plane's: a status write cannot change it); never create or delete.
+    ///
+    /// A spec that does not parse is left out.
+    pub fn with_node_resources(self, named: &[String], status: &[String]) -> Self {
+        let _ = (named, status);
+        self
     }
 
     /// Nodes publish ConfigMaps `kube-system/<prefix><node>`: each node may
@@ -381,6 +405,55 @@ mod tests {
         assert!(!allowed(&az, &w1, "get", "", "configmaps", ks, Some("tunnr-join-tokens"), None).await);
         assert!(!allowed(&az, &w1, "create", "", "configmaps", Some("default"), Some("tunnr-wg-w1"), None).await);
         assert!(!allowed(&az, &w1, "create", "", "configmaps", ks, None, None).await);
+    }
+
+    #[tokio::test]
+    async fn nodes_write_only_their_own_custom_resource_views() {
+        let st = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+        let key = |n: &str| build_key("disks_tunnr_io_tunnrvolumes", None, n);
+        for (name, labels) in [("pvc-a", json!({"tunnr.io/node": "w1"})), ("pvc-b", json!({"tunnr.io/node": "w2"})), ("pvc-c", json!({}))] {
+            st.create(&key(name), &json!({"apiVersion": "disks.tunnr.io/v1alpha1", "kind": "TunnrVolume", "metadata": {"name": name, "labels": labels}})).await.unwrap();
+        }
+        let w1 = user("system:node:w1", &["system:nodes"]);
+        let g = "disks.tunnr.io";
+        let (td, tv) = ("tunnrdisks", "tunnrvolumes");
+        // Not configured: a node writes none of them.
+        let off = ClusterAuthorizer::new(st.clone());
+        assert!(!allowed(&off, &w1, "create", g, td, None, Some("w1.td-drv-a"), None).await);
+        assert!(!allowed(&off, &w1, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
+        let az = ClusterAuthorizer::new(st).with_node_resources(&["tunnrdisks.disks.tunnr.io".into(), "nonsense".into()], &["tunnrvolumes.disks.tunnr.io=tunnr.io/node".into(), "bad".into()]);
+        // TunnrDisks: its own, by name <node>.<drive>; every node's readable.
+        for v in ["create", "update", "patch", "delete"] {
+            assert!(allowed(&az, &w1, v, g, td, None, Some("w1.td-drv-a"), None).await, "{v} own");
+            assert!(!allowed(&az, &w1, v, g, td, None, Some("w2.td-drv-a"), None).await, "{v} another node's");
+            assert!(!allowed(&az, &w1, v, g, td, None, Some("w10.td-drv-a"), None).await, "{v} w10 is not w1");
+            assert!(!allowed(&az, &w1, v, g, td, None, Some("w1"), None).await, "{v} the bare node name");
+        }
+        assert!(allowed(&az, &w1, "patch", g, td, None, Some("w1.td-drv-a"), Some("status")).await);
+        assert!(allowed(&az, &w1, "update", g, td, None, Some("w1.td-drv-a"), Some("status")).await);
+        assert!(!allowed(&az, &w1, "patch", g, td, None, Some("w2.td-drv-a"), Some("status")).await);
+        assert!(!allowed(&az, &w1, "create", g, td, None, None, None).await, "a create without a name");
+        assert!(!allowed(&az, &w1, "deletecollection", g, td, None, None, None).await);
+        for v in ["get", "list", "watch"] {
+            assert!(allowed(&az, &w1, v, g, td, None, if v == "get" { Some("w2.td-drv-a") } else { None }, None).await, "{v}");
+            assert!(allowed(&az, &w1, v, g, tv, None, if v == "get" { Some("pvc-b") } else { None }, None).await, "{v}");
+        }
+        // TunnrVolumes: only the status of one labelled tunnr.io/node=w1.
+        assert!(allowed(&az, &w1, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
+        assert!(allowed(&az, &w1, "update", g, tv, None, Some("pvc-a"), Some("status")).await);
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-b"), Some("status")).await, "labelled w2");
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-c"), Some("status")).await, "no label");
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-z"), Some("status")).await, "not there");
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-a"), None).await, "the object itself (labels)");
+        assert!(!allowed(&az, &w1, "update", g, tv, None, Some("pvc-a"), None).await);
+        assert!(!allowed(&az, &w1, "create", g, tv, None, Some("pvc-a"), None).await);
+        assert!(!allowed(&az, &w1, "delete", g, tv, None, Some("pvc-a"), None).await);
+        // Another group of the same plural is not configured.
+        assert!(!allowed(&az, &w1, "create", "other.io", td, None, Some("w1.td-drv-a"), None).await);
+        // Without system:nodes the name is nothing.
+        let fake = user("system:node:w1", &[]);
+        assert!(!allowed(&az, &fake, "create", g, td, None, Some("w1.td-drv-a"), None).await);
+        assert!(!allowed(&az, &fake, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
     }
 
     #[tokio::test]
