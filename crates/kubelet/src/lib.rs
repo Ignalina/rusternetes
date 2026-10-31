@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod seccomp;
 pub mod serving_tls;
 pub mod streaming;
+pub mod token_request;
 
 pub use kubelet::PodWorkerState;
 

@@ -13,9 +13,12 @@ use tracing::{debug, error, info, warn};
 ///
 /// Responsibilities:
 /// 1. Create "default" ServiceAccount in each namespace
-/// 2. Create ServiceAccount tokens as Secrets, signed with the cluster's
-///    service-account key (rusternetes_common::auth::cluster_token_manager);
-///    without that key no token Secret is created (never an unsigned token)
+/// 2. NO long-lived token Secret per ServiceAccount (upstream since 1.24):
+///    pods get bound, short-lived tokens through TokenRequest. A Secret of
+///    type `kubernetes.io/service-account-token` a user creates with the
+///    annotation `kubernetes.io/service-account.name` is filled with a token
+///    signed with the cluster's key (upstream's token controller; never an
+///    unsigned one)
 /// 3. Handle ServiceAccount deletion and cleanup
 pub struct ServiceAccountController<S: Storage> {
     storage: Arc<S>,
@@ -249,99 +252,46 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             Err(e) => return Err(e.into()),
         }
 
-        // Create a token Secret for the ServiceAccount
-        self.create_token_secret(namespace, sa_name).await?;
-
         info!("Created default ServiceAccount in namespace {}", namespace);
         Ok(())
     }
 
-    /// Create a token Secret for a ServiceAccount
-    async fn create_token_secret(&self, namespace: &str, sa_name: &str) -> Result<()> {
-        let secret_name = format!("{}-token", sa_name);
-        let secret_key = build_key("secrets", Some(namespace), &secret_name);
-
+    /// Fill the token Secrets a user asked for (type
+    /// `kubernetes.io/service-account-token`, annotation
+    /// `kubernetes.io/service-account.name: <sa>`, no token yet): a token
+    /// signed with the cluster's key, plus `namespace`. Nothing without the key.
+    async fn fill_requested_token_secrets(&self, namespace: &str, sa: &ServiceAccount) -> Result<()> {
         if self.tokens.is_none() {
             return Ok(());
         }
-        // Check if token secret already exists
-        if self.storage.get::<Secret>(&secret_key).await.is_ok() {
-            debug!(
-                "Token secret already exists for ServiceAccount {}/{}",
-                namespace, sa_name
-            );
-            return Ok(());
-        }
-
-        debug!(
-            "Creating token secret for ServiceAccount {}/{}",
-            namespace, sa_name
-        );
-
-        // Get the ServiceAccount to retrieve its UID
-        let sa_key = build_key("serviceaccounts", Some(namespace), sa_name);
-        let sa: ServiceAccount = self.storage.get(&sa_key).await?;
-        let sa_uid = &sa.metadata.uid;
-
-        // Generate a JWT token (or fallback to simple token if no signing key)
-        let token = self.generate_token(namespace, sa_name, sa_uid)?;
-
-        let mut annotations = HashMap::new();
-        annotations.insert(
-            "kubernetes.io/service-account.name".to_string(),
-            sa_name.to_string(),
-        );
-        annotations.insert(
-            "kubernetes.io/service-account.uid".to_string(),
-            sa_uid.clone(),
-        );
-
-        let secret = Secret {
-            type_meta: TypeMeta {
-                kind: "Secret".to_string(),
-                api_version: "v1".to_string(),
-            },
-            metadata: ObjectMeta {
-                name: secret_name.clone(),
-                generate_name: None,
-                generation: None,
-                managed_fields: None,
-                namespace: Some(namespace.to_string()),
-                uid: String::new(),
-                resource_version: None,
-                deletion_grace_period_seconds: None,
-                finalizers: None,
-                owner_references: None,
-                creation_timestamp: None,
-                deletion_timestamp: None,
-                labels: None,
-                annotations: Some(annotations),
-            },
-            secret_type: Some("kubernetes.io/service-account-token".to_string()),
-            data: {
-                let mut data = HashMap::new();
-                // Secret data is raw bytes (not base64 encoded - that's done on serialization)
-                data.insert("token".to_string(), token.as_bytes().to_vec());
-                // Add namespace and ca.crt (empty for now)
-                data.insert("namespace".to_string(), namespace.as_bytes().to_vec());
-                data.insert("ca.crt".to_string(), Vec::new());
-                Some(data)
-            },
-            string_data: None,
-            immutable: None,
-        };
-
-        match self.storage.create(&secret_key, &secret).await {
-            Ok(_) => {
-                info!(
-                    "Created token secret {} for ServiceAccount {}/{}",
-                    secret_name, namespace, sa_name
-                );
+        let sa_name = &sa.metadata.name;
+        let secrets: Vec<Secret> = self.storage.list(&build_prefix("secrets", Some(namespace))).await?;
+        for mut secret in secrets {
+            let wanted = secret.secret_type.as_deref() == Some("kubernetes.io/service-account-token")
+                && secret
+                    .metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get("kubernetes.io/service-account.name"))
+                    == Some(sa_name);
+            let has = secret.data.as_ref().is_some_and(|d| d.get("token").is_some_and(|t| !t.is_empty()));
+            if !wanted || has {
+                continue;
             }
-            Err(rusternetes_common::Error::AlreadyExists(_)) => {
-                debug!("Token secret already exists for {}/{}", namespace, sa_name);
+            let token = self.generate_token(namespace, sa_name, &sa.metadata.uid)?;
+            let data = secret.data.get_or_insert_with(HashMap::new);
+            data.insert("token".to_string(), token.into_bytes());
+            data.insert("namespace".to_string(), namespace.as_bytes().to_vec());
+            secret
+                .metadata
+                .annotations
+                .get_or_insert_with(HashMap::new)
+                .insert("kubernetes.io/service-account.uid".to_string(), sa.metadata.uid.clone());
+            let key = build_key("secrets", Some(namespace), &secret.metadata.name);
+            match self.storage.update(&key, &secret).await {
+                Ok(_) => info!("Filled the requested token Secret {}/{} for ServiceAccount {}", namespace, secret.metadata.name, sa_name),
+                Err(e) => warn!("Token Secret {}/{}: {}", namespace, secret.metadata.name, e),
             }
-            Err(e) => return Err(e.into()),
         }
         Ok(())
     }
@@ -378,8 +328,8 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
             return self.cleanup_serviceaccount_tokens(namespace, sa_name).await;
         }
 
-        // Ensure the SA has a token
-        self.create_token_secret(namespace, sa_name).await?;
+        // Token Secrets a user asked for (no automatic one).
+        self.fill_requested_token_secrets(namespace, &sa).await?;
 
         Ok(())
     }
@@ -434,6 +384,26 @@ mod tests {
     async fn test_serviceaccount_controller_creation() {
         let storage = Arc::new(MemoryStorage::new());
         let _controller = ServiceAccountController::new(storage);
+    }
+
+    #[tokio::test]
+    async fn no_token_secret_by_default_only_a_requested_one_is_filled() {
+        let storage = Arc::new(MemoryStorage::new());
+        let mut c = ServiceAccountController::new(storage.clone());
+        c.tokens = Some(Arc::new(TokenManager::new_random()));
+        let mut sa = ServiceAccount::new("app", "default");
+        sa.metadata.ensure_uid();
+        storage.create(&build_key("serviceaccounts", Some("default"), "app"), &sa).await.unwrap();
+        c.reconcile_serviceaccount("default", "app").await.unwrap();
+        assert!(storage.get::<Secret>(&build_key("secrets", Some("default"), "app-token")).await.is_err());
+        // A user asks for a long-lived token Secret.
+        let mut req = Secret::new("app-legacy", "default").with_type("kubernetes.io/service-account-token");
+        req.metadata.annotations = Some(HashMap::from([("kubernetes.io/service-account.name".to_string(), "app".to_string())]));
+        storage.create(&build_key("secrets", Some("default"), "app-legacy"), &req).await.unwrap();
+        c.reconcile_serviceaccount("default", "app").await.unwrap();
+        let got: Secret = storage.get(&build_key("secrets", Some("default"), "app-legacy")).await.unwrap();
+        let t = String::from_utf8(got.data.unwrap()["token"].clone()).unwrap();
+        assert_eq!(t.split('.').count(), 3);
     }
 
     #[test]

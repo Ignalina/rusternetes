@@ -4266,6 +4266,7 @@ dependencies = [
  "rusternetes-scheduler",
  "rusternetes-storage",
  "rustls 0.23.43",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
