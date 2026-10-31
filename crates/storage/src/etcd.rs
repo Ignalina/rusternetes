@@ -16,6 +16,41 @@ pub struct EtcdStorage {
     encryption: crate::Encryption,
 }
 
+/// How long a read waits out a store that is briefly not answering.
+const READ_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Is this a transient "not answering" error (gRPC Unavailable: a Raft
+/// replica whose linearizable read could not confirm a quorum this round,
+/// an election under way)?
+pub fn transient(e: &etcd_client::Error) -> bool {
+    // 14 = gRPC UNAVAILABLE.
+    matches!(e, etcd_client::Error::GRpcStatus(s) if s.code() as i32 == 14)
+}
+
+/// A (linearizable) range read, asked again for up to [`READ_RETRY_FOR`]
+/// while the store answers Unavailable: a read is never wrongly empty, and
+/// a short quorum hiccup is not an error (nor, through the authorizer, a
+/// 403) for the caller.
+pub async fn read_retrying(
+    client: &mut etcd_client::Client,
+    key: impl Into<Vec<u8>>,
+    options: Option<etcd_client::GetOptions>,
+) -> std::result::Result<etcd_client::GetResponse, etcd_client::Error> {
+    let key: Vec<u8> = key.into();
+    let deadline = tokio::time::Instant::now() + READ_RETRY_FOR;
+    let mut pause = std::time::Duration::from_millis(25);
+    loop {
+        match client.get(key.clone(), options.clone()).await {
+            Err(e) if transient(&e) && tokio::time::Instant::now() + pause < deadline => {
+                tracing::debug!("store read not answered ({e}); again in {pause:?}");
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(std::time::Duration::from_millis(400));
+            }
+            other => return other,
+        }
+    }
+}
+
 impl EtcdStorage {
     fn connect_options() -> etcd_client::ConnectOptions {
         etcd_client::ConnectOptions::new()
@@ -285,8 +320,7 @@ impl Storage for EtcdStorage {
     {
         let mut client = self.client.clone();
 
-        let resp = client
-            .get(key, None)
+        let resp = read_retrying(&mut client, key, None)
             .await
             .map_err(|e| Error::Storage(format!("Failed to get resource: {}", e)))?;
 
@@ -499,8 +533,7 @@ impl Storage for EtcdStorage {
                 Some(key) => key.clone(),
             };
 
-            let resp = client
-                .get(query_key, Some(get_options))
+            let resp = read_retrying(&mut client, query_key, Some(get_options))
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to list resources: {}", e)))?;
 
