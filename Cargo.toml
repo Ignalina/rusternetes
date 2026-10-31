@@ -12,6 +12,8 @@ members = [
     "crates/cloud-providers",
     "crates/rusternetes",
 ]
+# vendor/libcontainer: a patched crates.io crate, not a member.
+exclude = ["vendor/libcontainer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -79,3 +81,7 @@ strip = "symbols"
 # sibling checkout until a release carries it.
 [patch.crates-io]
 tunnr-etcd = { path = "../tunnr-etcd/crates/tunnr-etcd" }
+# youki's libcontainer 0.7.0 plus a pure-Rust seccomp backend (feature
+# `seccomp-bpf`: seccompiler + syscalls, no libseccomp C library) and the
+# noNewPrivileges=false fix (node/rtclass; candidate upstream youki PRs).
+libcontainer = { path = "vendor/libcontainer" }

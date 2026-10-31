@@ -59,7 +59,8 @@ tower = { workspace = true, features = ["util"] }
 tar = "0.4"
 sysinfo = "0.32"
 libc = "0.2"
-libcontainer = { version = "0.7", default-features = false, features = ["v2"], optional = true }
+# seccomp-bpf: securityContext.seccompProfile enforced in pure Rust (vendor/libcontainer).
+libcontainer = { version = "0.7", default-features = false, features = ["v2", "seccomp-bpf"], optional = true }
 oci-spec = { version = "0.10", default-features = false, features = ["runtime"], optional = true }
 nix = { version = "0.29", features = ["mount", "sched", "signal", "process", "net", "fs"], optional = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }

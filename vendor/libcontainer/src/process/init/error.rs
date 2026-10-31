@@ -2,7 +2,7 @@ use crate::namespaces::NamespaceError;
 use crate::process::channel;
 use crate::process::memory_policy::MemoryPolicyError;
 use crate::rootfs::device::DeviceError;
-#[cfg(feature = "libseccomp")]
+#[cfg(any(feature = "libseccomp", feature = "seccomp-bpf"))]
 use crate::seccomp;
 use crate::syscall::SyscallError;
 use crate::workload::{ExecutorSetEnvsError, ExecutorValidationError};
@@ -43,7 +43,7 @@ pub enum InitProcessError {
     #[error("invalid umask")]
     InvalidUmask(u32),
     #[error(transparent)]
-    #[cfg(feature = "libseccomp")]
+    #[cfg(any(feature = "libseccomp", feature = "seccomp-bpf"))]
     Seccomp(#[from] seccomp::SeccompError),
     #[error("invalid executable: {0}")]
     InvalidExecutable(String),
