@@ -533,52 +533,71 @@ impl ContainerRuntime {
         self
     }
 
-    /// Setup CNI networking for a pod
-    /// Creates a network namespace and configures CNI networking
-    /// Returns None if CNI setup fails (will fall back to Podman networking)
-    async fn setup_pod_network(&self, pod: &Pod) -> Option<String> {
+    /// The pod's sandbox network: a network namespace `cni-<pod>` with the
+    /// CNI attachment in it; returns the namespace's path.
+    ///
+    /// A namespace this process attached and never tore down is live (the
+    /// pod's containers are being restarted, or a start was cut off by the
+    /// start timeout): it is kept, IP and all, as the upstream kubelet keeps
+    /// a ready sandbox. Any other namespace of that name is stale (an earlier
+    /// kubelet's, or one a failed cleanup left): CNI DEL first, then a fresh
+    /// namespace, then ADD; an ADD on top of it hits "already exists"
+    /// (Cilium's endpoint, the bridge's eth0, host-local's reservation) on
+    /// every retry. A failed ADD is followed by DEL, as the CNI spec asks, so
+    /// a half-done ADD gives its IP back.
+    async fn setup_pod_network(&self, pod: &Pod) -> Result<String> {
         let pod_name = pod.metadata.name.as_str();
-        info!("Setting up CNI network for pod: {}", pod_name);
-
-        // Create network namespace
+        let cni = self
+            .cni
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no CNI runtime on this node"))?;
         let netns_name = format!("cni-{}", pod_name);
-        match self.netns.add(&netns_name) {
-            Ok(()) => info!("Created network namespace: {}", netns_name),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                info!(
-                    "Network namespace {} already exists, reusing it",
-                    netns_name
-                );
-            }
-            Err(e) => {
-                warn!("Failed to create network namespace for pod {}: {}. Falling back to Podman networking.", pod_name, e);
-                return None;
-            }
-        }
-
-        // Get the network namespace path
         let netns_path = self.netns.path(&netns_name).to_string_lossy().into_owned();
 
-        // Setup CNI networking in the namespace
-        if let Some(cni) = &self.cni {
-            let args = cni_args(pod, pod_name);
-            match cni.setup_network_with_args(pod_name, &netns_path, "eth0", None, Some(&args)) {
-                Ok(result) => {
-                    info!(
-                        "CNI network setup successful for pod {}: IP={:?}",
-                        pod_name, result.ips
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to setup CNI network for pod {}: {}. Falling back to Podman networking.", pod_name, e);
-                    // Clean up the network namespace on failure
-                    let _ = self.netns.del(&netns_name);
-                    return None;
-                }
+        if std::path::Path::new(&netns_path).exists() {
+            if cni
+                .get_attachments(pod_name)
+                .iter()
+                .any(|a| a.netns == netns_path)
+            {
+                info!("Pod {} keeps its sandbox network {}", pod_name, netns_path);
+                return Ok(netns_path);
+            }
+            warn!(
+                "Stale sandbox network {} for pod {} (an earlier start or kubelet): CNI DEL and a fresh namespace before ADD",
+                netns_name, pod_name
+            );
+            if let Err(e) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+                warn!("CNI DEL of the stale network of pod {}: {}", pod_name, e);
+            }
+            if let Err(e) = self.netns.del(&netns_name) {
+                warn!("Failed to delete stale network namespace {}: {}", netns_name, e);
             }
         }
 
-        Some(netns_path)
+        info!("Setting up CNI network for pod: {}", pod_name);
+        self.netns
+            .add(&netns_name)
+            .with_context(|| format!("network namespace {netns_name}"))?;
+
+        let args = cni_args(pod, pod_name);
+        match cni.setup_network_with_args(pod_name, &netns_path, "eth0", None, Some(&args)) {
+            Ok(result) => {
+                info!(
+                    "CNI network setup successful for pod {}: IP={:?}",
+                    pod_name, result.ips
+                );
+                Ok(netns_path)
+            }
+            Err(e) => {
+                warn!("CNI ADD failed for pod {}: {}; CNI DEL and the namespace removed", pod_name, e);
+                if let Err(d) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+                    warn!("CNI DEL after the failed ADD of pod {}: {}", pod_name, d);
+                }
+                let _ = self.netns.del(&netns_name);
+                Err(anyhow::anyhow!("CNI ADD: {e}"))
+            }
+        }
     }
 
     /// Teardown CNI networking for a pod
@@ -807,8 +826,8 @@ impl ContainerRuntime {
         // CNI attachment the retry would trip over.
         check_seccomp_profiles(pod, &crate::seccomp::profile_root())?;
 
-        // Create network namespace and setup CNI networking if enabled
-        // If CNI setup fails, netns_path will be None and we fall back to Podman networking
+        // The sandbox network (CNI); a pod whose network cannot be set up
+        // waits (NetworkNotReady).
         let host_network = is_host_network(pod);
         if host_network {
             self.host_network_pods
@@ -818,20 +837,67 @@ impl ContainerRuntime {
         }
         let netns_path = if self.use_cni && !host_network {
             match self.setup_pod_network(pod).await {
-                Some(p) => Some(p),
+                Ok(p) => Some(p),
                 // No network yet (the CNI plugin or its config is not there,
                 // e.g. a CNI agent still starting): the pod waits and is tried
                 // again, as the upstream kubelet's NetworkNotReady does, instead
                 // of starting its containers without a network and failing.
-                None => anyhow::bail!(
-                    "CreateContainerError: the pod network is not ready (CNI ADD failed for {}/{})",
+                Err(e) => anyhow::bail!(
+                    "CreateContainerError: the pod network is not ready ({}/{}): {:#}",
                     namespace,
-                    pod_name
+                    pod_name,
+                    e
                 ),
             }
         } else {
             None
         };
+
+        let started = self
+            .start_pod_in_sandbox(pod, host_network, netns_path.clone())
+            .await;
+        if let Err(e) = &started {
+            // A failed start gives its sandbox network back (CNI DEL, the
+            // namespace removed) unless a container of the pod runs in it,
+            // so the retry under the same name starts from nothing.
+            if netns_path.is_some() && !self.any_pod_container_running(pod_name).await {
+                warn!(
+                    "Start of pod {}/{} failed ({:#}): its sandbox network is torn down before a retry",
+                    namespace, pod_name, e
+                );
+                if let Err(t) = self.teardown_pod_network(pod_name).await {
+                    warn!("Teardown of the network of pod {}: {}", pod_name, t);
+                }
+            }
+        }
+        started
+    }
+
+    /// Whether any container of the pod (init, app, sidecar) is running.
+    async fn any_pod_container_running(&self, pod_name: &str) -> bool {
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), vec![format!("^/{}_", pod_name)]);
+        match self
+            .backend
+            .list_containers(ListContainersOptions { all: false, filters })
+            .await
+        {
+            Ok(c) => !c.is_empty(),
+            // Unknown: keep the network rather than cut a running pod off.
+            Err(_) => true,
+        }
+    }
+
+    /// The part of [`Self::start_pod`] after the sandbox network: volumes,
+    /// images, init containers, app containers.
+    async fn start_pod_in_sandbox(
+        &self,
+        pod: &Pod,
+        host_network: bool,
+        netns_path: Option<String>,
+    ) -> Result<()> {
+        let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
         // Ensure the pod has a kube-api-access volume for SA tokens.
         // Controllers that create pods directly in etcd bypass the API server's

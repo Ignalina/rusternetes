@@ -63,6 +63,56 @@ pub struct Kubelet {
     /// When a watch event arrives for a pod, we signal its channel to
     /// trigger an immediate reconciliation without a full sync_loop.
     pod_workers: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
+    /// Back-off between failed starts of a pending pod.
+    start_backoff: Mutex<StartBackoff>,
+}
+
+/// Back-off between failed starts of a pending pod: 5 s, doubling, at most
+/// 5 min (the upstream kubelet's cap); a changed pod spec (the cause
+/// fixed, e.g. a new image) starts again at once. Without it a pod whose
+/// start fails was tried again on every sync and every watch event.
+#[derive(Default)]
+pub(crate) struct StartBackoff {
+    /// By pod UID: (spec hash, failures, not before).
+    entries: HashMap<String, (u64, u32, std::time::Instant)>,
+}
+
+impl StartBackoff {
+    const BASE: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(300);
+
+    /// A hash of the pod's spec.
+    pub(crate) fn spec_hash(pod: &Pod) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&pod.spec).unwrap_or_default().hash(&mut h);
+        h.finish()
+    }
+
+    /// The time left before the next try, if the pod is backing off.
+    pub(crate) fn wait(&self, uid: &str, spec: u64, now: std::time::Instant) -> Option<Duration> {
+        match self.entries.get(uid) {
+            Some((h, _, at)) if *h == spec && *at > now => Some(*at - now),
+            _ => None,
+        }
+    }
+
+    /// Record a failed start; returns the delay before the next try.
+    pub(crate) fn failed(&mut self, uid: &str, spec: u64, now: std::time::Instant) -> Duration {
+        let n = match self.entries.get(uid) {
+            Some((h, n, _)) if *h == spec => n + 1,
+            _ => 1,
+        };
+        let delay = Self::BASE
+            .saturating_mul(1u32 << (n - 1).min(16))
+            .min(Self::MAX);
+        self.entries.insert(uid.to_string(), (spec, n, now + delay));
+        delay
+    }
+
+    pub(crate) fn succeeded(&mut self, uid: &str) {
+        self.entries.remove(uid);
+    }
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -119,6 +169,7 @@ impl Kubelet {
             pod_sync_locks: Mutex::new(HashSet::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
+            start_backoff: Mutex::new(StartBackoff::default()),
             pod_cidr: None,
         })
     }
@@ -1725,6 +1776,21 @@ impl Kubelet {
         match current_phase {
             // If pod is Pending and has been scheduled to this node, start it
             Phase::Pending if !is_running => {
+                let pod_uid = pod.metadata.uid.clone();
+                let spec_hash = StartBackoff::spec_hash(pod);
+                if let Some(left) = self.start_backoff.lock().unwrap().wait(
+                    &pod_uid,
+                    spec_hash,
+                    std::time::Instant::now(),
+                ) {
+                    debug!(
+                        "Pod {}/{} start backing off ({}s left)",
+                        namespace,
+                        pod_name,
+                        left.as_secs()
+                    );
+                    return Ok(());
+                }
                 // Don't overwrite error status — the test needs to observe it.
                 // For ErrImagePull, skip retry for this sync cycle to prevent
                 // blocking the sync loop with repeated pull failures.
@@ -1890,6 +1956,7 @@ impl Kubelet {
                     Ok(result) => match result {
                         Ok(_) => {
                             info!("Pod {}/{} started successfully", namespace, pod_name);
+                            self.start_backoff.lock().unwrap().succeeded(&pod_uid);
 
                             // Re-fetch the pod from etcd to get the latest resourceVersion.
                             // Between start_pod being called and now, the admission controller or
@@ -1997,6 +2064,17 @@ impl Kubelet {
                         }
                         Err(e) => {
                             let err_msg = e.to_string();
+                            let delay = self.start_backoff.lock().unwrap().failed(
+                                &pod_uid,
+                                spec_hash,
+                                std::time::Instant::now(),
+                            );
+                            info!(
+                                "Pod {}/{} start failed; next try in {}s",
+                                namespace,
+                                pod_name,
+                                delay.as_secs()
+                            );
 
                             // K8s retries volume mounting when secrets/configmaps
                             // aren't available yet. The pod stays Pending with
@@ -4807,5 +4885,41 @@ mod same_status_tests {
         assert!(same_status(Some(&st("a")), Some(&st("a"))));
         assert!(!same_status(Some(&st("a")), Some(&st("b"))));
         assert!(!same_status(None, Some(&st("a"))));
+    }
+}
+
+#[cfg(test)]
+mod start_backoff_tests {
+    use super::StartBackoff;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn failed_starts_back_off_doubling_to_five_minutes() {
+        let mut b = StartBackoff::default();
+        let t = Instant::now();
+        assert_eq!(b.wait("u", 1, t), None, "a new pod starts at once");
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(5));
+        assert_eq!(b.wait("u", 1, t + Duration::from_secs(4)), Some(Duration::from_secs(1)));
+        assert_eq!(b.wait("u", 1, t + Duration::from_secs(5)), None);
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(10));
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(20));
+        for _ in 0..20 {
+            b.failed("u", 1, t);
+        }
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(300));
+        assert_eq!(b.wait("other", 1, t), None, "per pod");
+    }
+
+    #[test]
+    fn a_changed_spec_or_a_success_starts_over() {
+        let mut b = StartBackoff::default();
+        let t = Instant::now();
+        b.failed("u", 1, t);
+        b.failed("u", 1, t);
+        assert_eq!(b.wait("u", 2, t), None, "the cause fixed in the spec: try now");
+        assert_eq!(b.failed("u", 2, t), Duration::from_secs(5));
+        b.succeeded("u");
+        assert_eq!(b.wait("u", 2, t), None);
+        assert_eq!(b.failed("u", 2, t), Duration::from_secs(5));
     }
 }
