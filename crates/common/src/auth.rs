@@ -131,6 +131,72 @@ pub fn cluster_token_manager() -> Option<std::sync::Arc<TokenManager>> {
     CLUSTER_TOKEN_MANAGER.get().cloned()
 }
 
+/// The shortest bound token (upstream TokenRequest: 10 minutes).
+pub const MIN_TOKEN_EXPIRATION: i64 = 600;
+/// A projected token's default lifetime (upstream's kube-api-access: 3607 s).
+pub const DEFAULT_PROJECTED_EXPIRATION: i64 = 3607;
+
+/// `--service-account-max-token-expiration` (seconds, 0 = none): the longest
+/// token a TokenRequest (or a control plane's kubelet) issues.
+static MAX_TOKEN_EXPIRATION: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Set the longest token lifetime this process issues (0: no cap).
+pub fn set_max_token_expiration(seconds: i64) {
+    MAX_TOKEN_EXPIRATION.store(seconds.max(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The lifetime a bound token gets for `requested` seconds (none: one
+/// hour): at least [`MIN_TOKEN_EXPIRATION`], at most the configured cap.
+pub fn token_expiration(requested: Option<i64>) -> i64 {
+    let max = MAX_TOKEN_EXPIRATION.load(std::sync::atomic::Ordering::Relaxed);
+    let t = requested.unwrap_or(3600).max(MIN_TOKEN_EXPIRATION);
+    if max > 0 {
+        t.min(max.max(MIN_TOKEN_EXPIRATION))
+    } else {
+        t
+    }
+}
+
+/// A JWT's `iat` and `exp`, read WITHOUT checking its signature (the
+/// kubelet's renewal clock for the token files it writes).
+pub fn token_times(token: &str) -> Option<(i64, i64)> {
+    let payload = token.trim().split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some((v.get("iat")?.as_i64()?, v.get("exp")?.as_i64()?))
+}
+
+/// Is a projected token due for renewal at `now`: 80 % of its lifetime
+/// gone, or older than 24 h, or not a token at all (upstream kubelet's
+/// token manager).
+pub fn token_renew_due(token: &str, now: i64) -> bool {
+    match token_times(token) {
+        Some((iat, exp)) if exp > iat => now >= iat + (exp - iat) * 4 / 5 || now >= iat + 86400,
+        _ => true,
+    }
+}
+
+/// The pod a ServiceAccount user's token is bound to: (namespace, pod name,
+/// pod uid), from the authenticated user's extra (a bound token).
+pub fn bound_pod(user: &UserInfo) -> Option<(String, String, String)> {
+    let ns = user.username.strip_prefix("system:serviceaccount:")?.split(':').next()?.to_string();
+    let one = |k: &str| user.extra.get(k).and_then(|v| v.first()).filter(|s| !s.is_empty()).cloned();
+    let name = one("authentication.kubernetes.io/pod-name")?;
+    let uid = one("authentication.kubernetes.io/pod-uid").unwrap_or_default();
+    Some((ns, name, uid))
+}
+
+/// The node a bound token was issued for (its pod's node), from the user's extra.
+pub fn bound_node(user: &UserInfo) -> Option<String> {
+    user.extra
+        .get("authentication.kubernetes.io/node-name")
+        .and_then(|v| v.first())
+        .filter(|s| !s.is_empty())
+        .cloned()
+}
+
 impl TokenManager {
     /// Create a new TokenManager with a secret key (HS256 — fallback)
     pub fn new(secret: &[u8]) -> Self {
@@ -387,6 +453,21 @@ pub struct UserInfo {
 impl UserInfo {
     pub fn from_service_account_claims(claims: &ServiceAccountClaims) -> Self {
         let mut extra = std::collections::HashMap::new();
+
+        // The binding in the nested kubernetes.io claim (upstream's form),
+        // overridden by the flat claims below when they are there.
+        if let Some(k) = &claims.kubernetes {
+            for (key, r) in [("pod", &k.pod), ("node", &k.node)] {
+                if let Some(r) = r {
+                    if !r.name.is_empty() {
+                        extra.insert(format!("authentication.kubernetes.io/{key}-name"), vec![r.name.clone()]);
+                    }
+                    if !r.uid.is_empty() {
+                        extra.insert(format!("authentication.kubernetes.io/{key}-uid"), vec![r.uid.clone()]);
+                    }
+                }
+            }
+        }
 
         // Include pod/node binding info in extra if present
         if let Some(ref pod_name) = claims.pod_name {
@@ -1272,5 +1353,47 @@ mod tests {
             claims.iss.starts_with("https://"),
             "Issuer must start with https://"
         );
+    }
+
+    #[test]
+    fn a_projected_token_is_renewed_at_80_percent_of_its_life() {
+        let tm = TokenManager::new_random();
+        let mut c = ServiceAccountClaims::new("web".into(), "default".into(), "u".into(), 1);
+        c.iat = 1_000_000;
+        c.exp = 1_000_000 + 600;
+        let t = tm.generate_token(c).unwrap();
+        assert_eq!(token_times(&t), Some((1_000_000, 1_000_600)));
+        assert!(!token_renew_due(&t, 1_000_000 + 479));
+        assert!(token_renew_due(&t, 1_000_000 + 480));
+        // Not a token (an empty file): due now.
+        assert!(token_renew_due("", 0));
+        assert!(token_renew_due("a.b.c", 0));
+    }
+
+    #[test]
+    fn token_lifetimes_are_at_least_ten_minutes_and_capped() {
+        // One process-wide cap: this is the only test that sets it.
+        assert_eq!(token_expiration(None), 3600);
+        assert_eq!(token_expiration(Some(60)), MIN_TOKEN_EXPIRATION);
+        assert_eq!(token_expiration(Some(7200)), 7200);
+        set_max_token_expiration(900);
+        assert_eq!(token_expiration(Some(3607)), 900);
+        assert_eq!(token_expiration(Some(60)), 600);
+        set_max_token_expiration(0);
+        assert_eq!(token_expiration(Some(3607)), 3607);
+    }
+
+    #[test]
+    fn a_bound_token_names_its_pod_and_node() {
+        let mut c = ServiceAccountClaims::new("web".into(), "default".into(), "u".into(), 1);
+        if let Some(k) = c.kubernetes.as_mut() {
+            k.pod = Some(KubeRef { name: "web-1".into(), uid: "p-1".into() });
+            k.node = Some(KubeRef { name: "w1".into(), uid: "n-1".into() });
+        }
+        let u = UserInfo::from_service_account_claims(&c);
+        assert_eq!(bound_pod(&u), Some(("default".into(), "web-1".into(), "p-1".into())));
+        assert_eq!(bound_node(&u).as_deref(), Some("w1"));
+        let legacy = UserInfo::from_service_account_claims(&ServiceAccountClaims::new("web".into(), "default".into(), "u".into(), 1));
+        assert_eq!(bound_pod(&legacy), None);
     }
 }

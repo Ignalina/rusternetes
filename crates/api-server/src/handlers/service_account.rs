@@ -6,9 +6,8 @@ use axum::{
     Extension, Json,
 };
 use rusternetes_common::{
-    auth::ServiceAccountClaims,
     authz::{Decision, RequestAttributes},
-    resources::{Secret, ServiceAccount},
+    resources::ServiceAccount,
     List, Result,
 };
 use rusternetes_storage::{build_key, build_prefix, Storage};
@@ -64,80 +63,9 @@ pub async fn create(
         &service_account.metadata.name,
     );
     let created = state.storage.create(&key, &service_account).await?;
-    info!("ServiceAccount stored successfully, preparing to create token Secret");
-
-    // Generate ServiceAccount token and store it in a Secret
-    let sa_uid = created.metadata.uid.clone();
-    let sa_name = created.metadata.name.clone();
-    info!("ServiceAccount UID: {}, Name: {}", sa_uid, sa_name);
-
-    // Generate JWT token (valid for 10 years - Kubernetes default for static tokens)
-    let claims = ServiceAccountClaims::new(
-        sa_name.clone(),
-        namespace.clone(),
-        sa_uid.clone(),
-        87600, // 10 years in hours
-    );
-
-    let token = state.token_manager.generate_token(claims)?;
-
-    // Create Secret to store the token
-    let secret_name = format!("{}-token", sa_name);
-    let mut string_data = HashMap::new();
-    string_data.insert("token".to_string(), token.clone());
-    string_data.insert("namespace".to_string(), namespace.clone());
-
-    // Add CA certificate if available
-    if let Some(ref ca_cert) = state.ca_cert_pem {
-        string_data.insert("ca.crt".to_string(), ca_cert.clone());
-    }
-
-    let mut secret =
-        Secret::new(&secret_name, &namespace).with_type("kubernetes.io/service-account-token");
-
-    // Add labels and annotations
-    secret.metadata.labels = Some({
-        let mut labels = HashMap::new();
-        labels.insert(
-            "kubernetes.io/service-account.name".to_string(),
-            sa_name.clone(),
-        );
-        labels
-    });
-    secret.metadata.annotations = Some({
-        let mut annotations = HashMap::new();
-        annotations.insert(
-            "kubernetes.io/service-account.uid".to_string(),
-            sa_uid.clone(),
-        );
-        annotations
-    });
-    secret.string_data = Some(string_data);
-
-    // Normalize: convert stringData to base64-encoded data before storing
-    secret.normalize();
-
-    // Store the secret
-    let secret_key = build_key("secrets", Some(&namespace), &secret_name);
-    info!(
-        "Attempting to create ServiceAccount token secret: {}",
-        secret_name
-    );
-    match state.storage.create(&secret_key, &secret).await {
-        Ok(_) => {
-            info!(
-                "Successfully created ServiceAccount token secret: {}",
-                secret_name
-            );
-        }
-        Err(e) => {
-            info!(
-                "Warning: Failed to create ServiceAccount token secret {}: {}",
-                secret_name, e
-            );
-            // Don't fail the ServiceAccount creation if secret creation fails
-        }
-    }
+    // No long-lived token Secret (upstream since 1.24): pods get bound,
+    // short-lived tokens through TokenRequest.
+    info!("ServiceAccount {}/{} stored", namespace, created.metadata.name);
 
     Ok((StatusCode::CREATED, Json(created)))
 }

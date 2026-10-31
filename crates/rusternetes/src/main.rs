@@ -124,6 +124,18 @@ struct Args {
     #[arg(long)]
     service_account_key_file: Option<String>,
 
+    /// The longest bound ServiceAccount token issued (seconds; 0 = no cap):
+    /// TokenRequests and a control plane's kubelet. At least 600.
+    #[arg(long, default_value_t = 0)]
+    service_account_max_token_expiration: i64,
+
+    /// The kubelet of a node without the service-account key (a worker)
+    /// asks these API servers for its pods' bound tokens (TokenRequest),
+    /// comma-separated `https://<host>:<port>`, with the --etcd-cafile,
+    /// --etcd-certfile and --etcd-keyfile identity (the node certificate).
+    #[arg(long, value_delimiter = ',')]
+    kubelet_api_servers: Vec<String>,
+
     /// Nodes publish ConfigMaps kube-system/<prefix><node>: a node may get
     /// every node's and create, update and patch its own (the Node authorizer).
     #[arg(long)]
@@ -522,8 +534,8 @@ async fn run() -> Result<()> {
 
     // The cluster's ServiceAccount key: tokens are signed and checked with it
     // in this process (API server, kubelet, controller manager). A node
-    // without it (a worker) signs none: its pods get their ServiceAccount's
-    // token Secret, signed on a control plane.
+    // without it (a worker) signs none: its kubelet asks an API server for
+    // each pod's bound token (--kubelet-api-servers).
     match (&args.service_account_signing_key_file, &args.service_account_key_file) {
         (Some(private), Some(public)) => {
             let tm = rusternetes_common::auth::TokenManager::from_key_files(private, public)?;
@@ -532,6 +544,21 @@ async fn run() -> Result<()> {
         }
         (None, None) => {}
         _ => anyhow::bail!("--service-account-signing-key-file and --service-account-key-file go together"),
+    }
+    rusternetes_common::auth::set_max_token_expiration(args.service_account_max_token_expiration);
+    if !args.kubelet_api_servers.is_empty() {
+        match (&args.etcd_cafile, &args.etcd_certfile, &args.etcd_keyfile) {
+            (Some(ca), Some(cert), Some(key)) => {
+                rusternetes_kubelet::token_request::install(rusternetes_kubelet::token_request::ApiTokenClient {
+                    servers: args.kubelet_api_servers.clone(),
+                    ca_file: ca.clone(),
+                    cert_file: cert.clone(),
+                    key_file: key.clone(),
+                });
+                info!("Kubelet: pods' ServiceAccount tokens by TokenRequest from {:?}", args.kubelet_api_servers);
+            }
+            _ => anyhow::bail!("--kubelet-api-servers needs --etcd-cafile, --etcd-certfile and --etcd-keyfile (the node's identity)"),
+        }
     }
     if !args.skip_auth && on("api-server") && args.service_account_signing_key_file.is_none() {
         warn!("--skip-auth=false without --service-account-signing-key-file: ServiceAccount tokens hold for this process only");
