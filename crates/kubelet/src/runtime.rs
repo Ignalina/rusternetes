@@ -2128,7 +2128,8 @@ impl ContainerRuntime {
                                     .ok()
                                     .and_then(|t| t.elapsed().ok())
                                     .map(|d| d.as_secs());
-                                if age.is_none_or(|a| a * 5 >= life * 4) {
+                                let empty = std::fs::metadata(&file_path).map(|m| m.len() == 0).unwrap_or(true);
+                                if empty || age.is_none_or(|a| a * 5 >= life * 4) {
                                     match self.projected_sa_token(pod, pod_name, namespace, sa_token).await {
                                         Ok(token) => {
                                             let tmp = format!("{file_path}.new");
@@ -3187,7 +3188,17 @@ impl ContainerRuntime {
                         if let Some(parent) = std::path::Path::new(&token_path).parent() {
                             std::fs::create_dir_all(parent)?;
                         }
-                        let token = self.projected_sa_token(pod, &pod_name, namespace, sa_token).await?;
+                        // No token yet (a worker before its ServiceAccount's token
+                        // Secret exists): an empty file, filled by refresh_volumes as
+                        // soon as there is one; the pod starts either way (a failed
+                        // start after the network is set up would leak it).
+                        let token = match self.projected_sa_token(pod, &pod_name, namespace, sa_token).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                warn!("{e:#}; the token file stays empty until there is one");
+                                String::new()
+                            }
+                        };
                         std::fs::write(&token_path, &token)?;
                         #[cfg(unix)]
                         {
