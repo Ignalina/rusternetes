@@ -27,6 +27,8 @@ async fn custom_resource_fallback(
 ) -> Result<Response, StatusCode> {
     let path = uri.path();
     debug!("Fallback handler called for path: {}", path);
+    let wants_table = handlers::table::wants_table(req.headers().get(axum::http::header::ACCEPT).and_then(|v| v.to_str().ok()));
+    let is_watch_query = uri.query().is_some_and(|q| q.split('&').any(|kv| kv == "watch=true" || kv == "watch=1"));
 
     // Parse URI to extract custom resource information
     // Expected formats:
@@ -726,6 +728,10 @@ async fn custom_resource_fallback(
         }
     };
 
+    // `kubectl get`: a Table from the CRD's printer columns.
+    if method == Method::GET && subresource.is_none() && wants_table && !is_watch_query {
+        return Ok(handlers::custom_resource::table_response(&state, group, version, plural, response).await);
+    }
     Ok(response)
 }
 

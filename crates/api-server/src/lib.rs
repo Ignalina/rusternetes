@@ -65,6 +65,12 @@ pub struct ApiServerConfig {
     /// Nodes publish ConfigMaps `kube-system/<prefix><node>` (the Node
     /// authorizer: get any node's, write its own). `None`: none.
     pub node_configmap_prefix: Option<String>,
+    /// Custom resources nodes write when named `<node>.<…>`
+    /// (`<plural>.<group>`, node_authz `with_node_resources`).
+    pub node_named_resources: Vec<String>,
+    /// Custom resources whose status a node writes when their label names it
+    /// (`<plural>.<group>=<label key>`).
+    pub node_status_resources: Vec<String>,
 }
 
 impl Default for ApiServerConfig {
@@ -86,6 +92,8 @@ impl Default for ApiServerConfig {
             client_ca_file: None,
             kubelet_client_tls: None,
             node_configmap_prefix: None,
+            node_named_resources: Vec::new(),
+            node_status_resources: Vec::new(),
         }
     }
 }
@@ -124,7 +132,8 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         info!("Authorization: Node authorizer + RBAC (system:masters is admin)");
         Arc::new(
             node_authz::ClusterAuthorizer::new(storage.clone())
-                .with_node_configmaps(config.node_configmap_prefix.clone()),
+                .with_node_configmaps(config.node_configmap_prefix.clone())
+                .with_node_resources(&config.node_named_resources, &config.node_status_resources),
         )
     };
 
