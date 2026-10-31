@@ -64,6 +64,25 @@ fn append(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
+/// **The shim's own filter for its waiting** (tunnr lane layers): the node's
+/// PID 1, which starts every shim, names an approved seccomp profile (OCI
+/// `linux.seccomp` JSON) here. The shim installs it on itself once the
+/// container's process exists — its containers were forked before and keep
+/// their own profiles; from then on the shim only waits, reaps and writes the
+/// exit file, and that is all its filter allows. Unset: no filter of its own.
+pub const WAIT_PROFILE_ENV: &str = "RUSTERNETES_SHIM_WAIT_SECCOMP";
+
+/// Read the wait-phase profile at `path` (OCI `linux.seccomp`).
+pub fn load_wait_profile(path: &Path) -> anyhow::Result<oci_spec::runtime::LinuxSeccomp> {
+    let _ = path;
+    anyhow::bail!("not built yet")
+}
+
+/// Install the wait-phase profile [`WAIT_PROFILE_ENV`] names, if any; a
+/// profile that cannot be installed is said on stderr (the shim log) and the
+/// shim goes on waiting (its container must not lose its reaper).
+pub fn tighten() {}
+
 /// Entry point of the shim binary; returns the process exit code.
 pub fn main(args: Vec<String>) -> i32 {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -186,5 +205,60 @@ fn exec(state: PathBuf, id: &str, args: &Path, out: &Path, err: &Path, exit: &Pa
             write_exit(exit, code, Some(msg));
             code as i32
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A heimdall-generated profile as the node packs it (OCI JSON with
+    /// argument conditions), the shape PID 1 hands the shim.
+    const WAIT_PROFILE: &str = r#"{
+  "architectures": ["SCMP_ARCH_X86_64"],
+  "defaultAction": "SCMP_ACT_KILL_PROCESS",
+  "syscalls": [
+    {"action": "SCMP_ACT_ALLOW", "names": ["exit_group", "exit", "wait4", "write", "rt_sigreturn"]},
+    {"action": "SCMP_ACT_ALLOW", "args": [{"index": 1, "op": "SCMP_CMP_MASKED_EQ", "value": 4294967295, "valueTwo": 2}], "names": ["fcntl"]}
+  ]
+}"#;
+
+    fn write_profile(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("shim-wait-{tag}-{}.json", std::process::id()));
+        std::fs::write(&p, WAIT_PROFILE).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_wait_profile_loads_from_the_nodes_oci_json() {
+        let s = load_wait_profile(&write_profile("load")).unwrap();
+        assert_eq!(s.default_action(), oci_spec::runtime::LinuxSeccompAction::ScmpActKillProcess);
+        assert_eq!(s.syscalls().as_ref().map(|v| v.len()), Some(2));
+        assert!(load_wait_profile(Path::new("/nonexistent/shim.json")).is_err());
+    }
+
+    /// The kernel's word: after `tighten`, a call outside the wait profile kills the shim.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn after_tighten_a_call_outside_the_wait_profile_is_killed() {
+        let p = write_profile("kill");
+        // SAFETY: the child makes raw syscalls only and leaves with _exit.
+        match unsafe { libc_fork() } {
+            0 => {
+                std::env::set_var(WAIT_PROFILE_ENV, &p);
+                tighten();
+                // SAFETY: a raw getppid, outside the profile.
+                unsafe { nix::libc::syscall(nix::libc::SYS_getppid) };
+                unsafe { nix::libc::_exit(0) }
+            }
+            pid => {
+                let st = waitpid(Pid::from_raw(pid), None).unwrap();
+                assert!(matches!(st, WaitStatus::Signaled(_, nix::sys::signal::Signal::SIGSYS, _)), "{st:?}");
+            }
+        }
+    }
+
+    unsafe fn libc_fork() -> i32 {
+        unsafe { nix::libc::fork() }
     }
 }
