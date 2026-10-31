@@ -131,6 +131,7 @@ impl ImageStore {
                 .root
                 .join("tmp")
                 .join(uuid::Uuid::new_v4().simple().to_string());
+            let _scratch = TmpGuard(tmp.clone());
             fs::create_dir_all(&tmp)?;
             let stored = StoredImage {
                 id: id.clone(),
@@ -196,14 +197,26 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 pub struct TmpGuard(pub PathBuf);
 
 impl Drop for TmpGuard {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 }
 
 /// Remove every leftover pull directory below `root/tmp` (none is in flight
 /// when the backend starts).
 pub fn clean_tmp(root: &Path) -> usize {
-    let _ = root;
-    0
+    let Ok(dir) = fs::read_dir(root.join("tmp")) else {
+        return 0;
+    };
+    dir.flatten()
+        .filter(|e| {
+            fs::remove_dir_all(e.path())
+                .or_else(|_| fs::remove_file(e.path()))
+                .is_ok()
+        })
+        .count()
 }
 
 #[cfg(test)]
