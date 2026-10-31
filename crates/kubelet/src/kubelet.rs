@@ -2088,6 +2088,7 @@ impl Kubelet {
                                     Ok(p) => p,
                                     _ => pod.clone(),
                                 };
+                                let old_status = fresh_pod.status.clone();
                                 let mut new_pod = fresh_pod;
 
                                 // Build container statuses with the failed container
@@ -2148,10 +2149,21 @@ impl Kubelet {
                                     pod_i_ps: None,
                                     nominated_node_name: None,
                                     qos_class: Some(qos),
-                                    start_time: Some(chrono::Utc::now()),
+                                    // The first attempt's time: a retry that fails the
+                                    // same way writes nothing (each write is a watch
+                                    // event that started the next retry at once).
+                                    start_time: old_status
+                                        .as_ref()
+                                        .and_then(|s| s.start_time)
+                                        .or_else(|| Some(chrono::Utc::now())),
                                 });
 
-                                if let Err(e) = self.storage.update(&key, &new_pod).await {
+                                if same_status(old_status.as_ref(), new_pod.status.as_ref()) {
+                                    debug!(
+                                        "pod {}/{}: the same container error again, status unchanged",
+                                        namespace, pod_name
+                                    );
+                                } else if let Err(e) = self.storage.update(&key, &new_pod).await {
                                     warn!(
                                     "Failed to update pod {}/{} status to container error: {}, retrying",
                                     namespace, pod_name, e
@@ -4768,5 +4780,32 @@ mod tests {
         assert!(!i.container_runtime_version.starts_with("containerd://1.7.0"));
         assert!(!env!("RUSTERNETES_YOUKI_VERSION").is_empty());
         assert_eq!(i.operating_system, "linux");
+    }
+}
+
+/// Two pod statuses are the same as the API would serve them.
+fn same_status(a: Option<&PodStatus>, b: Option<&PodStatus>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod same_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_container_error_is_the_same_status_and_a_new_one_is_not() {
+        let st = |msg: &str| PodStatus {
+            phase: Some(Phase::Pending),
+            message: Some(msg.to_string()),
+            reason: Some("CreateContainerError".into()),
+            ..Default::default()
+        };
+        assert!(same_status(Some(&st("a")), Some(&st("a"))));
+        assert!(!same_status(Some(&st("a")), Some(&st("b"))));
+        assert!(!same_status(None, Some(&st("a"))));
     }
 }
