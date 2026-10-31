@@ -1,0 +1,53 @@
+[package]
+name = "libcontainer"
+version = "0.7.0" # MARK: Version
+description = "Library for container control"
+license = "Apache-2.0"
+repository = "https://github.com/youki-dev/youki"
+homepage = "https://youki-dev.github.io/youki/"
+readme = "README.md"
+authors = ["youki team"]
+edition = "2024"
+rust-version = "1.85.0"
+keywords = ["youki", "container", "cgroups"]
+
+[features]
+default = ["systemd", "v2", "v1", "libseccomp"]
+libseccomp = ["dep:libseccomp"]
+systemd = ["libcgroups/systemd", "v2"]
+v2 = ["libcgroups/v2"]
+v1 = ["libcgroups/v1"]
+cgroupsv2_devices = ["libcgroups/cgroupsv2_devices"]
+
+[dependencies]
+caps = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde"] }
+fastrand = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true, features = ["socket", "sched", "mount", "mman", "resource", "dir", "term", "hostname", "personality"] }
+oci-spec = { workspace = true }
+procfs = { workspace = true }
+prctl = { workspace = true }
+libcgroups = { path = "../libcgroups", default-features = false, version = "0.7.0" } # MARK: Version
+libseccomp = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+rust-criu = { workspace = true }
+regex = { workspace = true, features = ["std", "unicode-perl"] }
+thiserror = { workspace = true }
+tracing = { workspace = true, features = ["attributes"] }
+safe-path = { workspace = true }
+nc = { workspace = true }
+netlink-packet-route = { workspace = true }
+netlink-sys = { workspace = true }
+netlink-packet-core = { workspace = true }
+pathrs = { workspace = true }
+
+[dev-dependencies]
+oci-spec = { workspace = true, features = ["proptests"] }
+quickcheck = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+scopeguard = { workspace = true }
