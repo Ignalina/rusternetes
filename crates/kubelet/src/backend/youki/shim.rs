@@ -74,14 +74,27 @@ pub const WAIT_PROFILE_ENV: &str = "RUSTERNETES_SHIM_WAIT_SECCOMP";
 
 /// Read the wait-phase profile at `path` (OCI `linux.seccomp`).
 pub fn load_wait_profile(path: &Path) -> anyhow::Result<oci_spec::runtime::LinuxSeccomp> {
-    let _ = path;
-    anyhow::bail!("not built yet")
+    use anyhow::Context as _;
+    let bytes = std::fs::read(path).with_context(|| format!("{}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("{}: not an OCI linux.seccomp", path.display()))
 }
 
 /// Install the wait-phase profile [`WAIT_PROFILE_ENV`] names, if any; a
 /// profile that cannot be installed is said on stderr (the shim log) and the
 /// shim goes on waiting (its container must not lose its reaper).
-pub fn tighten() {}
+pub fn tighten() {
+    let Some(path) = std::env::var_os(WAIT_PROFILE_ENV) else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let installed = load_wait_profile(&path).and_then(|s| {
+        libcontainer::seccomp::initialize_seccomp(&s).map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(())
+    });
+    if let Err(e) = installed {
+        eprintln!("rusternetes-youki-shim: the wait-phase filter {} was NOT installed: {e:#}", path.display());
+    }
+}
 
 /// Entry point of the shim binary; returns the process exit code.
 pub fn main(args: Vec<String>) -> i32 {
@@ -133,6 +146,8 @@ fn create(state: PathBuf, id: &str, bundle: PathBuf, log: &Path, exit: &Path) ->
         Ok(pid) => {
             let _ = writeln!(stdout, "ok {}", pid);
             let _ = stdout.flush();
+            // From here the shim only waits: its own filter (the container keeps its own).
+            tighten();
             pid
         }
         Err(e) => {
@@ -182,6 +197,8 @@ fn exec(state: PathBuf, id: &str, args: &Path, out: &Path, err: &Path, exit: &Pa
             .with_container_args(args.cmd)
             .with_detach(true)
             .build()?;
+        // The exec'd process exists: from here the shim only waits.
+        tighten();
         Ok(wait_exit_code(pid))
     })();
     match result {
