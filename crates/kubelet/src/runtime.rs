@@ -542,10 +542,7 @@ impl ContainerRuntime {
 
         // Delete network namespace
         match crate::netns::del(&netns_name) {
-            Err(e) => warn!(
-                "Failed to delete network namespace {}: {}",
-                netns_name, e
-            ),
+            Err(e) => warn!("Failed to delete network namespace {}: {}", netns_name, e),
             Ok(()) => info!("Deleted network namespace: {}", netns_name),
         }
 
@@ -4709,6 +4706,25 @@ impl ContainerRuntime {
             }
         }
 
+        // The container's seccomp profile; a missing Localhost profile
+        // refuses the container (CreateContainerError).
+        let seccomp_setting = crate::seccomp::resolve(
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.security_context.as_ref())
+                .and_then(|sc| sc.seccomp_profile.as_ref()),
+            container
+                .security_context
+                .as_ref()
+                .and_then(|sc| sc.seccomp_profile.as_ref()),
+            container
+                .security_context
+                .as_ref()
+                .and_then(|sc| sc.privileged)
+                .unwrap_or(false),
+            &crate::seccomp::profile_root(),
+        )?;
+
         // Resolve runAsUser and runAsGroup from container or pod security context
         let run_as_user_id: Option<i64> = container
             .security_context
@@ -4896,6 +4912,8 @@ impl ContainerRuntime {
                     .security_context
                     .as_ref()
                     .and_then(|sc| sc.privileged),
+                // securityContext.seccompProfile (container over pod)
+                seccomp: seccomp_setting,
                 // Sysctls are set on the pause container (which owns the namespaces).
                 // App containers share namespaces via ipc_mode/pid_mode above.
                 ..Default::default()
@@ -12385,7 +12403,9 @@ mod host_network_and_cni_args_tests {
 
     #[test]
     fn host_network_is_read_from_the_spec() {
-        let on = pod(serde_json::json!({"metadata": {"name": "a"}, "spec": {"hostNetwork": true, "containers": []}}));
+        let on = pod(
+            serde_json::json!({"metadata": {"name": "a"}, "spec": {"hostNetwork": true, "containers": []}}),
+        );
         let off = pod(serde_json::json!({"metadata": {"name": "b"}, "spec": {"containers": []}}));
         assert!(is_host_network(&on));
         assert!(!is_host_network(&off));

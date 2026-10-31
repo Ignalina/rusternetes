@@ -391,7 +391,15 @@ fn to_bollard_config(c: ContainerConfig) -> bc::Config<String> {
             cpu_quota: h.cpu_quota,
             cpu_shares: h.cpu_shares,
             readonly_rootfs: h.readonly_rootfs,
-            security_opt: h.security_opt,
+            security_opt: {
+                let mut opts = h.security_opt.unwrap_or_default();
+                opts.extend(
+                    h.seccomp
+                        .as_ref()
+                        .and_then(crate::seccomp::docker_security_opt),
+                );
+                (!opts.is_empty()).then_some(opts)
+            },
             cap_add: h.cap_add,
             cap_drop: h.cap_drop,
             privileged: h.privileged,

@@ -8,6 +8,7 @@ pub mod eviction;
 pub mod kubelet;
 pub mod netns;
 pub mod runtime;
+pub mod seccomp;
 pub mod serving_tls;
 pub mod streaming;
 

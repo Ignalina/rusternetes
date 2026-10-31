@@ -355,8 +355,8 @@ pub fn build(input: &SpecInput) -> Result<Value> {
 /// like any other path).
 pub fn device_numbers(path: &Path) -> Result<(&'static str, u64, u64)> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let meta = std::fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("device {}: {}", path.display(), e))?;
+    let meta =
+        std::fs::metadata(path).map_err(|e| anyhow::anyhow!("device {}: {}", path.display(), e))?;
     let kind = if meta.file_type().is_block_device() {
         "b"
     } else if meta.file_type().is_char_device() {
@@ -510,6 +510,104 @@ mod tests {
         assert_eq!(spec["linux"]["cgroupsPath"], "/rusternetes/web_app");
     }
 
+    fn with_seccomp(sc: Option<crate::seccomp::Seccomp>, cap_drop: &[&str]) -> Value {
+        let c = ContainerConfig {
+            cmd: s(&["true"]),
+            host_config: Some(HostConfig {
+                seccomp: sc,
+                cap_drop: s(cap_drop),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let image = ImageConfig::default();
+        build(&input(&c, &image)).unwrap()
+    }
+
+    #[test]
+    fn runtime_default_becomes_an_oci_seccomp_libcontainer_reads() {
+        use crate::seccomp::Seccomp;
+        let spec = with_seccomp(Some(Seccomp::RuntimeDefault), &[]);
+        let sc: oci_spec::runtime::LinuxSeccomp =
+            serde_json::from_value(spec["linux"]["seccomp"].clone()).unwrap();
+        assert_eq!(
+            sc.default_action(),
+            oci_spec::runtime::LinuxSeccompAction::ScmpActErrno
+        );
+        assert!(sc.syscalls().as_ref().unwrap().len() > 3);
+        // The whole spec still parses as an OCI spec.
+        let _: oci_spec::runtime::Spec = serde_json::from_value(spec).unwrap();
+    }
+
+    #[test]
+    fn runtime_default_follows_the_capabilities_given() {
+        use crate::seccomp::Seccomp;
+        let has = |spec: &Value, name: &str| {
+            spec["linux"]["seccomp"]["syscalls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| {
+                    e["action"] == "SCMP_ACT_ALLOW"
+                        && e["names"].as_array().unwrap().contains(&json!(name))
+                })
+        };
+        // Docker's default caps include CAP_SYS_CHROOT: chroot allowed.
+        let spec = with_seccomp(Some(Seccomp::RuntimeDefault), &[]);
+        assert!(has(&spec, "chroot"));
+        let spec = with_seccomp(Some(Seccomp::RuntimeDefault), &["ALL"]);
+        assert!(!has(&spec, "chroot"));
+    }
+
+    #[test]
+    fn a_localhost_profile_is_written_into_the_spec() {
+        use crate::seccomp::Seccomp;
+        let profile = r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["mkdir","mkdirat"],"action":"SCMP_ACT_KILL_PROCESS"}]}"#;
+        let spec = with_seccomp(
+            Some(Seccomp::Localhost {
+                path: "/p/x.json".into(),
+                profile: profile.into(),
+            }),
+            &[],
+        );
+        assert_eq!(spec["linux"]["seccomp"]["defaultAction"], "SCMP_ACT_ALLOW");
+        assert_eq!(
+            spec["linux"]["seccomp"]["syscalls"][0]["action"],
+            "SCMP_ACT_KILL_PROCESS"
+        );
+    }
+
+    #[test]
+    fn a_bad_localhost_profile_refuses_the_container_by_name() {
+        use crate::seccomp::Seccomp;
+        let c = ContainerConfig {
+            cmd: s(&["true"]),
+            host_config: Some(HostConfig {
+                seccomp: Some(Seccomp::Localhost {
+                    path: "/p/x.json".into(),
+                    profile: r#"{"defaultAction":"SCMP_ACT_NOPE"}"#.into(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let image = ImageConfig::default();
+        let e = format!("{:#}", build(&input(&c, &image)).unwrap_err());
+        assert!(
+            e.starts_with("CreateContainerError: cannot load seccomp profile \"/p/x.json\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn unconfined_and_unset_carry_no_seccomp() {
+        use crate::seccomp::Seccomp;
+        assert!(with_seccomp(None, &[])["linux"].get("seccomp").is_none());
+        assert!(with_seccomp(Some(Seccomp::Unconfined), &[])["linux"]
+            .get("seccomp")
+            .is_none());
+    }
+
     #[test]
     fn joined_uts_drops_hostname_and_host_net_drops_namespace() {
         let c = ContainerConfig {
@@ -569,7 +667,14 @@ mod tests {
         let spec = build(&input(&c, &image)).unwrap();
         let dev = &spec["linux"]["devices"][0];
         assert_eq!(dev["path"], "/dev/xvda");
-        assert_eq!((dev["type"].as_str(), dev["major"].as_i64(), dev["minor"].as_i64()), (Some("c"), Some(1), Some(3)));
+        assert_eq!(
+            (
+                dev["type"].as_str(),
+                dev["major"].as_i64(),
+                dev["minor"].as_i64()
+            ),
+            (Some("c"), Some(1), Some(3))
+        );
         let rule = &spec["linux"]["resources"]["devices"][0];
         assert_eq!(rule["allow"], true);
         assert_eq!(rule["access"], "rwm");

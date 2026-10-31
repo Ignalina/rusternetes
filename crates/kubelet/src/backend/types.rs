@@ -131,6 +131,9 @@ pub struct HostConfig {
     pub cap_add: Option<Vec<String>>,
     pub cap_drop: Option<Vec<String>>,
     pub privileged: Option<bool>,
+    /// The container's `seccompProfile` (resolved by the kubelet); `None`
+    /// keeps the backend's own default.
+    pub seccomp: Option<crate::seccomp::Seccomp>,
     /// Device nodes to create in the container and allow in its device cgroup.
     pub devices: Option<Vec<DeviceMapping>>,
 }
