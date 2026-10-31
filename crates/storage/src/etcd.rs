@@ -13,6 +13,7 @@ use tracing::{debug, error, info};
 /// cloning the client is cheap and allows fully concurrent access.
 pub struct EtcdStorage {
     client: Client,
+    encryption: crate::Encryption,
 }
 
 impl EtcdStorage {
@@ -72,7 +73,15 @@ impl EtcdStorage {
 
         info!("Connected to etcd successfully");
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            encryption: None,
+        })
+    }
+
+    /// Encrypt values at rest with `t` (`--encryption-provider-config`).
+    pub fn set_encryption(&mut self, t: std::sync::Arc<crate::EncryptionTransformer>) {
+        self.encryption = Some(t);
     }
 
     /// The etcd client (cheap to clone), for leader election on the same
@@ -136,7 +145,7 @@ impl Storage for EtcdStorage {
         let txn = etcd_client::Txn::new()
             .when(vec![Compare::version(key, CompareOp::Equal, 0)])
             .and_then(vec![
-                TxnOp::put(key, json.clone(), None),
+                TxnOp::put(key, crate::seal(&self.encryption, key, json.clone().into_bytes())?, None),
                 TxnOp::get(key, None),
             ])
             .or_else(vec![]);
@@ -182,12 +191,10 @@ impl Storage for EtcdStorage {
             .map_err(|e| Error::Storage(format!("Failed to get resource: {}", e)))?;
 
         if let Some(kv) = resp.kvs().first() {
-            let json = kv
-                .value_str()
-                .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+            let json = crate::open_str(&self.encryption, key, kv.value())?;
 
             let mod_revision = kv.mod_revision();
-            let json_with_rv = Self::inject_resource_version(json, mod_revision);
+            let json_with_rv = Self::inject_resource_version(&json, mod_revision);
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         } else {
             Err(Error::NotFound(key.to_string()))
@@ -224,7 +231,7 @@ impl Storage for EtcdStorage {
                     expected_mod_revision,
                 )])
                 .and_then(vec![
-                    TxnOp::put(key, json.clone(), None),
+                    TxnOp::put(key, crate::seal(&self.encryption, key, json.clone().into_bytes())?, None),
                     TxnOp::get(key, None),
                 ])
                 .or_else(vec![TxnOp::get(key, None)]);
@@ -286,7 +293,7 @@ impl Storage for EtcdStorage {
             }
 
             client
-                .put(key, json.clone(), None)
+                .put(key, crate::seal(&self.encryption, key, json.clone().into_bytes())?, None)
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
 
@@ -324,7 +331,7 @@ impl Storage for EtcdStorage {
         }
 
         client
-            .put(key, json, None)
+            .put(key, crate::seal(&self.encryption, key, json.into_bytes())?, None)
             .await
             .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
 
@@ -404,13 +411,17 @@ impl Storage for EtcdStorage {
                     return Ok(results);
                 }
 
-                let json = kv
-                    .value_str()
-                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+                let json = match crate::open_str(&self.encryption, key_str, kv.value()) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        error!("Failed to read value at {}: {}", key_str, e);
+                        continue;
+                    }
+                };
                 let mod_revision = kv.mod_revision();
 
                 // Inject resourceVersion and deserialize in one step
-                let json_with_rv = Self::inject_resource_version(json, mod_revision);
+                let json_with_rv = Self::inject_resource_version(&json, mod_revision);
                 match serde_json::from_str::<T>(&json_with_rv) {
                     Ok(value) => {
                         results.push(value);
@@ -469,6 +480,7 @@ impl Storage for EtcdStorage {
         // emit all of them — not just the first one.
         // IMPORTANT: Move `watcher` into the closure to keep the watch alive.
         // Dropping it closes the gRPC stream, which terminates the watch.
+        let enc = self.encryption.clone();
         let watch_stream = stream.flat_map(move |watch_resp| {
             let _ = &watcher;
             let events: Vec<Result<WatchEvent>> = match watch_resp {
@@ -480,10 +492,11 @@ impl Storage for EtcdStorage {
                             .unwrap_or_default();
                         match event.event_type() {
                             etcd_client::EventType::Put => {
-                                let raw_value = event
-                                    .kv()
-                                    .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
-                                    .unwrap_or_default();
+                                let raw_value = match event.kv() {
+                                    Some(kv) => crate::open(&enc, &key, kv.value())
+                                        .map(|v| String::from_utf8_lossy(&v).to_string())?,
+                                    None => String::new(),
+                                };
                                 let mod_revision = event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
                                 let value = Self::inject_resource_version(&raw_value, mod_revision);
                                 // Use etcd key version to distinguish create vs update:
@@ -507,7 +520,8 @@ impl Storage for EtcdStorage {
                                 // minimal JSON object with just metadata so watchers
                                 // can still deliver the DELETE event.
                                 let prev_value = if let Some(prev_kv) = event.prev_kv() {
-                                    let raw = String::from_utf8_lossy(prev_kv.value()).to_string();
+                                    let raw = crate::open(&enc, &key, prev_kv.value())
+                                        .map(|v| String::from_utf8_lossy(&v).to_string())?;
                                     Self::inject_resource_version(&raw, mod_revision)
                                 } else {
                                     // Extract name from key: /registry/{type}/{ns}/{name}
@@ -547,6 +561,7 @@ impl Storage for EtcdStorage {
         // Use flat_map to handle multiple events per etcd watch response.
         // IMPORTANT: Move `watcher` into the closure to keep the watch alive.
         // Dropping it closes the gRPC stream, which terminates the watch.
+        let enc = self.encryption.clone();
         let watch_stream = stream.flat_map(move |watch_resp| {
             let _ = &watcher;
             let events: Vec<Result<WatchEvent>> = match watch_resp {
@@ -561,11 +576,10 @@ impl Storage for EtcdStorage {
 
                         match event.event_type() {
                             etcd_client::EventType::Put => {
-                                let raw_value = event
-                                    .kv()
-                                    .and_then(|kv| kv.value_str().ok())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let raw_value = match event.kv() {
+                                    Some(kv) => crate::open_str(&enc, &key, kv.value())?,
+                                    None => String::new(),
+                                };
 
                                 let mod_revision =
                                     event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
@@ -578,11 +592,10 @@ impl Storage for EtcdStorage {
                                 }
                             }
                             etcd_client::EventType::Delete => {
-                                let raw_prev = event
-                                    .prev_kv()
-                                    .and_then(|kv| kv.value_str().ok())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let raw_prev = match event.prev_kv() {
+                                    Some(kv) => crate::open_str(&enc, &key, kv.value())?,
+                                    None => String::new(),
+                                };
                                 let mod_revision =
                                     event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
                                 let prev_value =

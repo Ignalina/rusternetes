@@ -31,3 +31,11 @@ tracing.workspace = true
 futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+# Encryption at rest through a served store (tests/encryption.rs).
+tunnr-etcd = { version = "0.2", features = ["server"] }
+
+[[test]]
+name = "encryption"
+required-features = ["redb"]

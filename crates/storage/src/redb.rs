@@ -24,6 +24,7 @@ const COMPACT_INTERVAL: Duration = Duration::from_secs(300);
 /// Storage backed by an embedded redb file.
 pub struct RedbStorage {
     store: Store,
+    encryption: crate::Encryption,
 }
 
 impl RedbStorage {
@@ -58,7 +59,15 @@ impl RedbStorage {
                 }
             }
         });
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            encryption: None,
+        })
+    }
+
+    /// Encrypt values at rest with `t` (`--encryption-provider-config`).
+    pub fn set_encryption(&mut self, t: Arc<crate::EncryptionTransformer>) {
+        self.encryption = Some(t);
     }
 
     /// The underlying store, for example to attach a twin.
@@ -76,8 +85,9 @@ impl RedbStorage {
         serde_json::to_string(&v).map_err(Error::Serialization)
     }
 
-    fn decode<T: DeserializeOwned>(json: &[u8], mod_revision: i64) -> Result<T> {
-        let s = Self::inject_resource_version(json, mod_revision)?;
+    fn decode<T: DeserializeOwned>(&self, key: &str, stored: &[u8], mod_revision: i64) -> Result<T> {
+        let json = crate::open(&self.encryption, key, stored)?;
+        let s = Self::inject_resource_version(&json, mod_revision)?;
         serde_json::from_str(&s).map_err(Error::Serialization)
     }
 
@@ -120,24 +130,24 @@ fn key_str(key: &[u8]) -> String {
     String::from_utf8_lossy(key).into_owned()
 }
 
-fn to_watch_event(ev: &Event) -> Result<WatchEvent> {
+fn to_watch_event(enc: &crate::Encryption, ev: &Event) -> Result<WatchEvent> {
+    let text = |key: &[u8], value: &[u8], rev: i64| -> Result<String> {
+        let json = crate::open(enc, &key_str(key), value)?;
+        RedbStorage::inject_resource_version(&json, rev)
+    };
     Ok(match ev {
         Event::Put {
             rev,
             key,
             kv,
             prev: None,
-        } => WatchEvent::Added(
-            key_str(key),
-            RedbStorage::inject_resource_version(&kv.value, *rev)?,
-        ),
-        Event::Put { rev, key, kv, .. } => WatchEvent::Modified(
-            key_str(key),
-            RedbStorage::inject_resource_version(&kv.value, *rev)?,
-        ),
+        } => WatchEvent::Added(key_str(key), text(key, &kv.value, *rev)?),
+        Event::Put { rev, key, kv, .. } => {
+            WatchEvent::Modified(key_str(key), text(key, &kv.value, *rev)?)
+        }
         Event::Delete { rev, key, prev } => WatchEvent::Deleted(
             key_str(key),
-            RedbStorage::inject_resource_version(&prev.value, *rev)?,
+            text(key, &prev.value, *rev)?,
         ),
         // Watches only carry key events; lease events never reach them.
         other => return Err(Error::Storage(format!("unexpected store event {other:?}"))),
@@ -161,14 +171,18 @@ impl Storage for RedbStorage {
                 metadata["generation"] = serde_json::json!(1);
             }
         }
-        let json = serde_json::to_vec(&v).map_err(Error::Serialization)?;
+        let json = crate::seal(
+            &self.encryption,
+            key,
+            serde_json::to_vec(&v).map_err(Error::Serialization)?,
+        )?;
         let k = key.to_string();
         let kv = self
             .blocking(move |s| s.create(&k, &json))
             .await
             .map_err(|e| map_err(key, e))?;
         debug!("Created resource at key: {}", key);
-        Self::decode(&kv.value, kv.mod_rev)
+        self.decode(key, &kv.value, kv.mod_rev)
     }
 
     async fn get<T>(&self, key: &str) -> Result<T>
@@ -179,7 +193,7 @@ impl Storage for RedbStorage {
             .store
             .get(key)
             .ok_or_else(|| Error::NotFound(key.to_string()))?;
-        Self::decode(&kv.value, kv.mod_rev)
+        self.decode(key, &kv.value, kv.mod_rev)
     }
 
     async fn update<T>(&self, key: &str, value: &T) -> Result<T>
@@ -195,6 +209,7 @@ impl Storage for RedbStorage {
             Some(rv) => Some(concurrency::resource_version_to_mod_revision(&rv)?),
             None => None,
         };
+        let json = crate::seal(&self.encryption, key, json)?;
         let k = key.to_string();
         // Without a resourceVersion the store's writer makes the
         // read-check-write atomic, so no retry loop is needed.
@@ -203,11 +218,15 @@ impl Storage for RedbStorage {
             .await
             .map_err(|e| map_err(key, e))?;
         debug!("Updated resource at key: {}", key);
-        Self::decode(&kv.value, kv.mod_rev)
+        self.decode(key, &kv.value, kv.mod_rev)
     }
 
     async fn update_raw(&self, key: &str, value: &serde_json::Value) -> Result<()> {
-        let json = serde_json::to_vec(value).map_err(Error::Serialization)?;
+        let json = crate::seal(
+            &self.encryption,
+            key,
+            serde_json::to_vec(value).map_err(Error::Serialization)?,
+        )?;
         let k = key.to_string();
         self.blocking(move |s| s.update(&k, &json, None))
             .await
@@ -232,7 +251,7 @@ impl Storage for RedbStorage {
         let rows = self.store.list(prefix);
         let mut results = Vec::with_capacity(rows.len());
         for (key, kv) in rows {
-            match Self::decode::<T>(&kv.value, kv.mod_rev) {
+            match self.decode::<T>(&key_str(&key), &kv.value, kv.mod_rev) {
                 Ok(v) => results.push(v),
                 Err(e) => error!("Failed to deserialize value at {}: {}", key_str(&key), e),
             }
@@ -259,9 +278,10 @@ impl Storage for RedbStorage {
             "Started watching prefix: {} from revision {}",
             prefix, revision
         );
+        let enc = self.encryption.clone();
         let stream = async_stream::stream! {
             while let Some(ev) = rx.recv().await {
-                yield to_watch_event(&ev);
+                yield to_watch_event(&enc, &ev);
             }
         };
         Ok(Box::pin(stream))

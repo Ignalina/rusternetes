@@ -2,7 +2,10 @@ use async_trait::async_trait;
 use rusternetes_common::authz::AuthzStorage;
 use rusternetes_common::Result;
 use serde::{de::DeserializeOwned, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
+
+pub use rusternetes_common::encryption::EncryptionTransformer;
 
 pub mod concurrency;
 pub mod etcd;
@@ -234,6 +237,27 @@ impl StorageBackend {
     pub fn new_memory() -> Self {
         StorageBackend::Memory(Arc::new(MemoryStorage::new()))
     }
+
+    /// Encrypt values at rest (`--encryption-provider-config`): written
+    /// encrypted by the transformer's resources, read back through it. Only
+    /// the etcd and redb backends store encrypted values; the others refuse
+    /// rather than keep the values in plaintext.
+    pub fn with_encryption(self, t: Arc<EncryptionTransformer>) -> Result<Self> {
+        match self {
+            StorageBackend::Etcd(mut s) => {
+                s.set_encryption(t);
+                Ok(StorageBackend::Etcd(s))
+            }
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(mut s) => {
+                s.set_encryption(t);
+                Ok(StorageBackend::Redb(s))
+            }
+            _ => Err(rusternetes_common::Error::Storage(
+                "--encryption-provider-config needs the etcd or redb storage backend".into(),
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -417,6 +441,27 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Memory(s) => AuthzStorage::list(s.as_ref(), namespace).await,
         }
     }
+}
+
+/// Encryption at rest (`--encryption-provider-config`) of a backend: `None`
+/// stores every value as it is.
+pub(crate) type Encryption = Option<Arc<EncryptionTransformer>>;
+
+/// The bytes to store for the serialized value `json` at `key`.
+pub(crate) fn seal(_enc: &Encryption, _key: &str, json: Vec<u8>) -> Result<Vec<u8>> {
+    Ok(json) // RED: not applied yet
+}
+
+/// The serialized value of the bytes stored at `key`.
+pub(crate) fn open<'a>(_enc: &Encryption, _key: &str, stored: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    Ok(Cow::Borrowed(stored)) // RED: not applied yet
+}
+
+/// [`open`] as UTF-8 text.
+pub(crate) fn open_str(enc: &Encryption, key: &str, stored: &[u8]) -> Result<String> {
+    let v = open(enc, key, stored)?;
+    String::from_utf8(v.into_owned())
+        .map_err(|e| rusternetes_common::Error::Storage(format!("Invalid UTF-8 in value at {key}: {e}")))
 }
 
 /// Helper function to build resource keys
