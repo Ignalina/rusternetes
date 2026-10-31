@@ -42,6 +42,11 @@ default = [
     "libseccomp",
 ]
 libseccomp = ["dep:libseccomp"]
+# Pure-Rust seccomp (Rusternetes node/rtclass): no libseccomp C library.
+seccomp-bpf = [
+    "dep:seccompiler",
+    "dep:syscalls",
+]
 systemd = [
     "libcgroups/systemd",
     "v2",
@@ -77,6 +82,16 @@ version = "0.2.186"
 [dependencies.libcgroups]
 version = "0.7.0"
 default-features = false
+
+[dependencies.seccompiler]
+version = "0.5.0"
+optional = true
+
+[dependencies.syscalls]
+version = "0.8.1"
+features = ["std"]
+default-features = false
+optional = true
 
 [dependencies.libseccomp]
 version = "0.4.0"

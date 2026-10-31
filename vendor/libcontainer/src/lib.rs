@@ -12,6 +12,9 @@ pub mod process;
 pub mod rootfs;
 #[cfg(feature = "libseccomp")]
 pub mod seccomp;
+#[cfg(all(feature = "seccomp-bpf", not(feature = "libseccomp")))]
+#[path = "seccomp_bpf.rs"]
+pub mod seccomp;
 pub mod signal;
 pub mod syscall;
 pub mod test_utils;
