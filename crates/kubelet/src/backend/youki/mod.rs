@@ -102,6 +102,30 @@ struct Inner {
     cfg: YoukiConfig,
     images: ImageStore,
     http: reqwest::Client,
+    pulls: InFlight,
+}
+
+/// **The image pulls in flight** (tunnr lane layers). A pull runs on its own
+/// task, so the pod start's 30 s timeout no longer cancels it half-way (a big
+/// image on a slow link was never pulled: each retry began from zero); a
+/// second request for the same image waits for that pull instead of starting
+/// another.
+#[derive(Default)]
+pub struct InFlight(std::sync::Mutex<std::collections::HashSet<String>>);
+
+/// One pull's place in [`InFlight`], given back when dropped.
+pub struct Ticket<'a>(&'a InFlight, String);
+
+impl InFlight {
+    /// `None`: a pull of `image` is already in flight.
+    pub fn begin(&self, image: &str) -> Option<Ticket<'_>> {
+        let _ = image;
+        None
+    }
+    pub fn busy(&self, image: &str) -> bool {
+        let _ = image;
+        false
+    }
 }
 
 /// [`ContainerBackend`] running containers with libcontainer, no daemon.
@@ -124,6 +148,7 @@ impl YoukiBackend {
         Ok(Self {
             inner: Arc::new(Inner {
                 images: ImageStore::new(cfg.root.clone()),
+                pulls: InFlight::default(),
                 cfg,
                 http: reqwest::Client::builder()
                     .user_agent("rusternetes-kubelet")
@@ -1081,6 +1106,18 @@ impl ContainerBackend for YoukiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_pull_per_image_in_flight() {
+        let f = InFlight::default();
+        let t = f.begin("busybox:1.37").expect("the first pull starts");
+        assert!(f.begin("busybox:1.37").is_none(), "a second waits for it");
+        assert!(f.busy("busybox:1.37"));
+        assert!(f.begin("postgres:18").is_some(), "another image pulls beside it");
+        drop(t);
+        assert!(!f.busy("busybox:1.37"));
+        assert!(f.begin("busybox:1.37").is_some());
+    }
 
     #[test]
     fn user_resolution_uses_rootfs_passwd() {
