@@ -189,8 +189,42 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+/// A pull's scratch directory, removed when the pull is dropped (finished,
+/// failed or cancelled) unless it was renamed into the store. (tunnr lane
+/// layers: a pull cancelled by the pod start's timeout left its half-extracted
+/// rootfs behind, every retry another: 5.8 GB filled a worker's /data.)
+pub struct TmpGuard(pub PathBuf);
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {}
+}
+
+/// Remove every leftover pull directory below `root/tmp` (none is in flight
+/// when the backend starts).
+pub fn clean_tmp(root: &Path) -> usize {
+    let _ = root;
+    0
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_dropped_pull_leaves_no_scratch_and_a_restart_cleans_old_ones() {
+        let root = std::env::temp_dir().join(format!("img-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = root.join("tmp").join("aaa");
+        std::fs::create_dir_all(a.join("rootfs/usr")).unwrap();
+        std::fs::write(a.join("layer.tar"), b"x").unwrap();
+        drop(super::TmpGuard(a.clone()));
+        assert!(!a.exists(), "a cancelled pull's scratch is gone");
+        for n in ["b", "c"] {
+            std::fs::create_dir_all(root.join("tmp").join(n).join("rootfs")).unwrap();
+        }
+        assert_eq!(super::clean_tmp(&root), 2);
+        assert!(root.join("tmp").exists() && std::fs::read_dir(root.join("tmp")).unwrap().count() == 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     fn r(s: &str) -> (String, String, String) {

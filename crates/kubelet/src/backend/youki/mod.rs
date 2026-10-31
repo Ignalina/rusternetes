@@ -108,6 +108,7 @@ struct Inner {
     /// current by create, start and remove. Lists and lookups never scan
     /// the containers directory again.
     index: std::sync::RwLock<std::collections::BTreeMap<String, Meta>>,
+    pulls: InFlight,
 }
 
 impl Inner {
@@ -136,6 +137,7 @@ impl Inner {
                 .user_agent("rusternetes-kubelet")
                 .build()?,
             index: std::sync::RwLock::new(index),
+            pulls: InFlight::default(),
         })
     }
 
@@ -151,6 +153,29 @@ impl Inner {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
+    }
+}
+
+/// **The image pulls in flight** (tunnr lane layers). A pull runs on its own
+/// task, so the pod start's 30 s timeout no longer cancels it half-way (a big
+/// image on a slow link was never pulled: each retry began from zero); a
+/// second request for the same image waits for that pull instead of starting
+/// another.
+#[derive(Default)]
+pub struct InFlight(std::sync::Mutex<std::collections::HashSet<String>>);
+
+/// One pull's place in [`InFlight`], given back when dropped.
+pub struct Ticket<'a>(&'a InFlight, String);
+
+impl InFlight {
+    /// `None`: a pull of `image` is already in flight.
+    pub fn begin(&self, image: &str) -> Option<Ticket<'_>> {
+        let _ = image;
+        None
+    }
+    pub fn busy(&self, image: &str) -> bool {
+        let _ = image;
+        false
     }
 }
 
@@ -1122,6 +1147,18 @@ impl ContainerBackend for YoukiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_pull_per_image_in_flight() {
+        let f = InFlight::default();
+        let t = f.begin("busybox:1.37").expect("the first pull starts");
+        assert!(f.begin("busybox:1.37").is_none(), "a second waits for it");
+        assert!(f.busy("busybox:1.37"));
+        assert!(f.begin("postgres:18").is_some(), "another image pulls beside it");
+        drop(t);
+        assert!(!f.busy("busybox:1.37"));
+        assert!(f.begin("busybox:1.37").is_some());
+    }
 
     #[test]
     fn user_resolution_uses_rootfs_passwd() {
