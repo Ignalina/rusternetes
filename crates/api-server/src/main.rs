@@ -54,6 +54,11 @@ struct Args {
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
 
+    /// Encryption at rest: an EncryptionConfiguration file
+    /// (apiserver.config.k8s.io/v1), as kube-apiserver takes it.
+    #[arg(long)]
+    encryption_provider_config: Option<String>,
+
     /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -153,7 +158,14 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let storage = Arc::new(StorageBackend::new(storage_config).await?);
+    let mut backend = StorageBackend::new(storage_config).await?;
+    if let Some(p) = &args.encryption_provider_config {
+        let t = rusternetes_storage::EncryptionTransformer::from_file(p)
+            .map_err(|e| anyhow::anyhow!("--encryption-provider-config {p}: {e:#}"))?;
+        backend = backend.with_encryption(Arc::new(t))?;
+        info!("Encryption at rest on ({})", p);
+    }
+    let storage = Arc::new(backend);
 
     // Initialize TokenManager — prefer RSA keys for RS256 (K8s OIDC compatible),
     // fall back to HMAC HS256 if no RSA keys found.

@@ -225,6 +225,16 @@ struct Args {
     #[arg(long)]
     leader_elect: bool,
 
+    /// Encryption at rest (kube-apiserver's flag): an EncryptionConfiguration
+    /// (apiserver.config.k8s.io/v1, YAML or JSON). The listed resources are
+    /// written encrypted by the first provider (`aesgcm`), read by any
+    /// listed one (`identity`: values stored before encryption was on). With
+    /// --serve-etcd, a node certificate reads such values decrypted (its
+    /// kubelet holds no key); the control plane gets the stored bytes. Every
+    /// control plane needs the same file.
+    #[arg(long)]
+    encryption_provider_config: Option<String>,
+
     /// The embedded kubelet registers its Node with this pod CIDR
     /// (`spec.podCIDR`), for CNIs that allocate from the node's range.
     #[arg(long)]
@@ -360,9 +370,16 @@ async fn run() -> Result<()> {
     // --- Raft mode: this process is a replica of the store; start it and
     // serve it before the components connect to it as etcd. ---
     let raft_mode = args.store_raft_id.is_some();
+    let encryption = match &args.encryption_provider_config {
+        Some(p) => Some(Arc::new(
+            rusternetes_storage::EncryptionTransformer::from_file(p)
+                .map_err(|e| anyhow::anyhow!("--encryption-provider-config {p}: {e:#}"))?,
+        )),
+        None => None,
+    };
     if let Some(id) = args.store_raft_id {
         #[cfg(feature = "store-raft")]
-        start_store_replica(&args, id, serve_etcd_tls.clone()).await?;
+        start_store_replica(&args, id, serve_etcd_tls.clone(), node_view(&encryption)).await?;
         #[cfg(not(feature = "store-raft"))]
         anyhow::bail!("--store-raft-id {id} needs the store-raft feature");
     }
@@ -421,7 +438,12 @@ async fn run() -> Result<()> {
             );
         }
     };
-    let storage = Arc::new(StorageBackend::new(storage_config).await?);
+    let mut backend = StorageBackend::new(storage_config).await?;
+    if let Some(t) = &encryption {
+        backend = backend.with_encryption(t.clone())?;
+        info!("Encryption at rest on ({})", args.encryption_provider_config.as_deref().unwrap_or(""));
+    }
+    let storage = Arc::new(backend);
 
     info!("Storage initialized, starting components...");
     let on = |c: &str| args.components.iter().any(|x| x == c);
@@ -483,6 +505,7 @@ async fn run() -> Result<()> {
                 node_authz: args
                     .serve_etcd_node_authz
                     .then(tunnr_etcd::server::NodeAuthz::default),
+                node_view: node_view(&encryption),
                 ..Default::default()
             };
             tokio::spawn(async move {
@@ -719,10 +742,29 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// What a node certificate reads of the served store: values encrypted at
+/// rest decrypted (a worker's kubelet reads the Secrets its pods use straight
+/// from the store and holds no key), the rest as stored.
+#[cfg(feature = "redb")]
+fn node_view(
+    encryption: &Option<Arc<rusternetes_storage::EncryptionTransformer>>,
+) -> Option<tunnr_etcd::server::NodeView> {
+    let t = encryption.clone()?;
+    Some(tunnr_etcd::server::NodeView::new(move |key: &[u8], value: &[u8]| {
+        let key = String::from_utf8_lossy(key);
+        t.decode_if(&key, value).map_err(|e| format!("{e:#}"))
+    }))
+}
+
 /// Start this process's replica of the store (Raft mode) and serve it as
 /// etcd v3 on --serve-etcd; wait (up to two minutes) until it knows a leader.
 #[cfg(feature = "store-raft")]
-async fn start_store_replica(args: &Args, id: u64, tls: Option<[String; 3]>) -> Result<()> {
+async fn start_store_replica(
+    args: &Args,
+    id: u64,
+    tls: Option<[String; 3]>,
+    node_view: Option<tunnr_etcd::server::NodeView>,
+) -> Result<()> {
     use tunnr_etcd::server::raft::{self, RaftConfig, RaftTls};
     let addr = args
         .serve_etcd
@@ -796,6 +838,7 @@ async fn start_store_replica(args: &Args, id: u64, tls: Option<[String; 3]>) -> 
         client_url: format!("{scheme}://{addr}"),
         tls: serve_tls,
         node_authz: args.serve_etcd_node_authz.then(tunnr_etcd::server::NodeAuthz::default),
+        node_view,
         ..Default::default()
     };
     let served = node.clone();

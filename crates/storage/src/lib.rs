@@ -448,13 +448,30 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
 pub(crate) type Encryption = Option<Arc<EncryptionTransformer>>;
 
 /// The bytes to store for the serialized value `json` at `key`.
-pub(crate) fn seal(_enc: &Encryption, _key: &str, json: Vec<u8>) -> Result<Vec<u8>> {
-    Ok(json) // RED: not applied yet
+pub(crate) fn seal(enc: &Encryption, key: &str, json: Vec<u8>) -> Result<Vec<u8>> {
+    match enc {
+        Some(t) if t.applies(key) => t
+            .encode(key, &json)
+            .map_err(|e| rusternetes_common::Error::Storage(format!("encrypting {key}: {e:#}"))),
+        _ => Ok(json),
+    }
 }
 
 /// The serialized value of the bytes stored at `key`.
-pub(crate) fn open<'a>(_enc: &Encryption, _key: &str, stored: &'a [u8]) -> Result<Cow<'a, [u8]>> {
-    Ok(Cow::Borrowed(stored)) // RED: not applied yet
+pub(crate) fn open<'a>(enc: &Encryption, key: &str, stored: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    match enc {
+        Some(t) => match t.decode_if(key, stored) {
+            Ok(Some(v)) => Ok(Cow::Owned(v)),
+            Ok(None) => Ok(Cow::Borrowed(stored)),
+            Err(e) => Err(rusternetes_common::Error::Storage(format!("decrypting {key}: {e:#}"))),
+        },
+        None if stored.starts_with(rusternetes_common::encryption::ENCRYPTED_PREFIX) => {
+            Err(rusternetes_common::Error::Storage(format!(
+                "{key} is encrypted at rest, but this process runs without --encryption-provider-config"
+            )))
+        }
+        None => Ok(Cow::Borrowed(stored)),
+    }
 }
 
 /// [`open`] as UTF-8 text.
