@@ -124,6 +124,33 @@ pub struct ContainerRuntime {
     host_network_pods: Mutex<std::collections::HashSet<String>>,
 }
 
+/// Resolve the seccomp profile of every (init and app) container of `pod`;
+/// the first one that cannot be used refuses the pod with its error.
+fn check_seccomp_profiles(pod: &Pod, root: &std::path::Path) -> Result<()> {
+    let Some(spec) = pod.spec.as_ref() else {
+        return Ok(());
+    };
+    let pod_profile = spec
+        .security_context
+        .as_ref()
+        .and_then(|sc| sc.seccomp_profile.as_ref());
+    for c in spec
+        .init_containers
+        .iter()
+        .flatten()
+        .chain(spec.containers.iter())
+    {
+        let sc = c.security_context.as_ref();
+        crate::seccomp::resolve(
+            pod_profile,
+            sc.and_then(|s| s.seccomp_profile.as_ref()),
+            sc.and_then(|s| s.privileged).unwrap_or(false),
+            root,
+        )?;
+    }
+    Ok(())
+}
+
 /// A container's `volumeDevices` as device mappings: each names a pod volume
 /// whose path is a device node (a raw block PersistentVolume, published by its
 /// CSI driver as a node bound onto `<volume dir>/block`).
@@ -738,6 +765,11 @@ impl ContainerRuntime {
                 .collect();
             let _ = futures_util::future::join_all(remove_futures).await;
         }
+
+        // Every container's seccomp profile resolves before the pod gets a
+        // network: a missing or bad profile refuses the pod here, without a
+        // CNI attachment the retry would trip over.
+        check_seccomp_profiles(pod, &crate::seccomp::profile_root())?;
 
         // Create network namespace and setup CNI networking if enabled
         // If CNI setup fails, netns_path will be None and we fall back to Podman networking
@@ -10109,6 +10141,36 @@ mod tests {
         let pod = make_pod_with_sysctls("no-sysctl-pod", None);
         let result = extract_sysctls(&pod);
         assert!(result.is_none(), "Pod without sysctls should return None");
+    }
+
+    #[test]
+    fn a_missing_seccomp_profile_of_any_container_refuses_the_pod_before_its_network() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("ok.json"),
+            r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[]}"#,
+        )
+        .unwrap();
+        let pod = |init: &str, app: &str| -> Pod {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "v1", "kind": "Pod",
+                "metadata": {"name": "p", "namespace": "default"},
+                "spec": {
+                    "initContainers": [{"name": "i", "image": "busybox",
+                        "securityContext": {"seccompProfile": {"type": "Localhost", "localhostProfile": init}}}],
+                    "containers": [{"name": "a", "image": "busybox",
+                        "securityContext": {"seccompProfile": {"type": "Localhost", "localhostProfile": app}}}]
+                }
+            }))
+            .unwrap()
+        };
+        assert!(super::check_seccomp_profiles(&pod("ok.json", "ok.json"), d.path()).is_ok());
+        let e = super::check_seccomp_profiles(&pod("missing.json", "ok.json"), d.path())
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("CreateContainerError: cannot load seccomp profile"), "{e}");
+        assert!(e.contains("missing.json"), "{e}");
+        assert!(super::check_seccomp_profiles(&pod("ok.json", "gone.json"), d.path()).is_err());
     }
 
     #[test]
