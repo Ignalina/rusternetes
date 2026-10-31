@@ -28,6 +28,8 @@ pub(crate) struct FakeState {
     next_id: u64,
     /// The last exec's command (`cat` echoes stdin, `false` exits 1).
     last_exec: Vec<String>,
+    /// Images whose containers cannot be created (a broken image).
+    pub failing_images: std::collections::BTreeSet<String>,
 }
 
 /// Containers live in a map; nothing runs.
@@ -59,6 +61,16 @@ impl FakeBackend {
                 config: ContainerConfig::default(),
             },
         );
+    }
+
+    /// Containers of `image` fail to be created until `fail` is false again.
+    pub fn fail_image(&self, image: &str, fail: bool) {
+        let mut st = self.state.lock().unwrap();
+        if fail {
+            st.failing_images.insert(image.to_string());
+        } else {
+            st.failing_images.remove(image);
+        }
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -118,6 +130,9 @@ impl ContainerBackend for FakeBackend {
         let mut st = self.state.lock().unwrap();
         if st.containers.contains_key(name) {
             return Err(anyhow!("409 Conflict: name {} already in use", name));
+        }
+        if config.image.as_ref().is_some_and(|i| st.failing_images.iter().any(|f| i.ends_with(f.as_str()))) {
+            return Err(anyhow!("500 cannot create {}: broken image", name));
         }
         st.next_id += 1;
         let id = format!("id{}", st.next_id);

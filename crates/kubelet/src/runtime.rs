@@ -122,6 +122,32 @@ pub struct ContainerRuntime {
     /// the node's network namespace, get no CNI attachment, and their pod IP
     /// is the node's address.
     host_network_pods: Mutex<std::collections::HashSet<String>>,
+    /// Where pod network namespaces are made (`/var/run/netns` on a node).
+    netns: Arc<dyn NetnsOps>,
+}
+
+/// Named network namespaces for pod sandboxes. The node's are
+/// [`HostNetns`] (`/var/run/netns`); unit tests use files in a directory.
+pub(crate) trait NetnsOps: Send + Sync {
+    /// Create `name`; an existing one is [`std::io::ErrorKind::AlreadyExists`].
+    fn add(&self, name: &str) -> std::io::Result<()>;
+    fn del(&self, name: &str) -> std::io::Result<()>;
+    fn path(&self, name: &str) -> PathBuf;
+}
+
+/// The node's named network namespaces ([`crate::netns`]).
+struct HostNetns;
+
+impl NetnsOps for HostNetns {
+    fn add(&self, name: &str) -> std::io::Result<()> {
+        crate::netns::add(name)
+    }
+    fn del(&self, name: &str) -> std::io::Result<()> {
+        crate::netns::del(name)
+    }
+    fn path(&self, name: &str) -> PathBuf {
+        crate::netns::path(name)
+    }
 }
 
 /// Resolve the seccomp profile of every (init and app) container of `pod`;
@@ -349,7 +375,17 @@ impl ContainerRuntime {
             starting_containers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             csi: Arc::new(crate::csi::CsiManager::from_env()),
             host_network_pods: Mutex::new(std::collections::HashSet::new()),
+            netns: Arc::new(HostNetns),
         })
+    }
+
+    /// Use this CNI runtime and these network namespaces (unit tests).
+    #[cfg(test)]
+    pub(crate) fn with_cni(mut self, cni: CniRuntime, netns: Arc<dyn NetnsOps>) -> Self {
+        self.cni = Some(cni);
+        self.use_cni = true;
+        self.netns = netns;
+        self
     }
 
     /// Use this CSI manager instead of the default one.
@@ -506,7 +542,7 @@ impl ContainerRuntime {
 
         // Create network namespace
         let netns_name = format!("cni-{}", pod_name);
-        match crate::netns::add(&netns_name) {
+        match self.netns.add(&netns_name) {
             Ok(()) => info!("Created network namespace: {}", netns_name),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 info!(
@@ -521,7 +557,7 @@ impl ContainerRuntime {
         }
 
         // Get the network namespace path
-        let netns_path = format!("/var/run/netns/{}", netns_name);
+        let netns_path = self.netns.path(&netns_name).to_string_lossy().into_owned();
 
         // Setup CNI networking in the namespace
         if let Some(cni) = &self.cni {
@@ -536,7 +572,7 @@ impl ContainerRuntime {
                 Err(e) => {
                     warn!("Failed to setup CNI network for pod {}: {}. Falling back to Podman networking.", pod_name, e);
                     // Clean up the network namespace on failure
-                    let _ = crate::netns::del(&netns_name);
+                    let _ = self.netns.del(&netns_name);
                     return None;
                 }
             }
@@ -555,7 +591,7 @@ impl ContainerRuntime {
         info!("Tearing down CNI network for pod: {}", pod_name);
 
         let netns_name = format!("cni-{}", pod_name);
-        let netns_path = format!("/var/run/netns/{}", netns_name);
+        let netns_path = self.netns.path(&netns_name).to_string_lossy().into_owned();
 
         // Teardown CNI networking
         if let Some(cni) = &self.cni {
@@ -568,7 +604,7 @@ impl ContainerRuntime {
         }
 
         // Delete network namespace
-        match crate::netns::del(&netns_name) {
+        match self.netns.del(&netns_name) {
             Err(e) => warn!("Failed to delete network namespace {}: {}", netns_name, e),
             Ok(()) => info!("Deleted network namespace: {}", netns_name),
         }
@@ -12483,5 +12519,223 @@ mod host_network_and_cni_args_tests {
             cni_args(&p, "web"),
             format!("IgnoreUnknown=1;K8S_POD_NAMESPACE=shop;K8S_POD_NAME=web;K8S_POD_INFRA_CONTAINER_ID={};K8S_POD_UID=u-1", crate::cni::runtime::cni_container_id("web"))
         );
+    }
+}
+
+/// A failed pod start must not leave its CNI attachment behind: the retry
+/// under the same pod name used to hit "already exists" (Cilium's endpoint,
+/// the bridge's eth0, host-local's reservation) on every ADD, forever.
+#[cfg(test)]
+mod cni_retry_tests {
+    use super::{ContainerRuntime, NetnsOps};
+    use crate::backend::fake::FakeBackend;
+    use crate::cni::CniRuntime;
+    use rusternetes_common::resources::Pod;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// Network namespaces as directories (the fake plugin puts `eth0` in one).
+    struct DirNetns(PathBuf);
+
+    impl NetnsOps for DirNetns {
+        fn add(&self, name: &str) -> std::io::Result<()> {
+            std::fs::create_dir(self.0.join(name))
+        }
+        fn del(&self, name: &str) -> std::io::Result<()> {
+            std::fs::remove_dir_all(self.0.join(name))
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    /// A CNI plugin that behaves like the real ones on a repeated ADD: an
+    /// endpoint per container ID (Cilium: "already exists"), an `eth0` in the
+    /// namespace (bridge: "already exists") and an IP reservation per ADD
+    /// (host-local) that only DEL gives back. `fail-add` in its state
+    /// directory makes ADD fail after the IP is taken (a half-done ADD).
+    const PLUGIN: &str = r#"#!/bin/sh
+d="$(dirname "$0")/state"; mkdir -p "$d"
+cat >/dev/null
+id="$CNI_CONTAINERID"
+case "$CNI_COMMAND" in
+ADD)
+  if [ -e "$d/ep-$id" ] || [ -e "$CNI_NETNS/eth0" ]; then
+    echo "ADD-EXISTS $id" >> "$d/log"
+    printf '{"cniVersion":"1.0.0","code":11,"msg":"endpoint already exists"}'; exit 1
+  fi
+  i=2; while [ -e "$d/ip-$i" ]; do i=$((i+1)); done
+  echo "$id" > "$d/ip-$i"
+  if [ -e "$d/fail-add" ]; then
+    echo "ADD-FAIL $id" >> "$d/log"
+    printf '{"cniVersion":"1.0.0","code":7,"msg":"veth setup failed"}'; exit 1
+  fi
+  touch "$d/ep-$id" "$CNI_NETNS/eth0"
+  echo "ADD $id" >> "$d/log"
+  printf '{"cniVersion":"1.0.0","interfaces":[{"name":"eth0","sandbox":"%s"}],"ips":[{"address":"10.1.0.%s/24","interface":0}]}' "$CNI_NETNS" "$i"
+  ;;
+DEL)
+  for f in "$d"/ip-*; do [ -e "$f" ] && [ "$(cat "$f")" = "$id" ] && rm -f "$f"; done
+  rm -f "$d/ep-$id" "$CNI_NETNS/eth0"
+  echo "DEL $id" >> "$d/log"
+  ;;
+esac
+exit 0
+"#;
+
+    struct Env {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        backend: Arc<FakeBackend>,
+        runtime: ContainerRuntime,
+        _volumes: tempfile::TempDir,
+    }
+
+    async fn runtime(root: &Path, backend: Arc<FakeBackend>) -> (ContainerRuntime, tempfile::TempDir) {
+        let volumes = tempfile::tempdir().unwrap();
+        let cni = CniRuntime::new(vec![root.join("bin")], root.join("net.d")).unwrap();
+        let runtime = ContainerRuntime::with_backend(
+            backend,
+            volumes.path().to_string_lossy().into_owned(),
+            "10.96.0.10".to_string(),
+            "cluster.local".to_string(),
+            "rusternetes".to_string(),
+            "10.96.0.1".to_string(),
+            false,
+        )
+        .await
+        .unwrap()
+        .with_cni(cni, Arc::new(DirNetns(root.join("netns"))));
+        (runtime, volumes)
+    }
+
+    async fn env() -> Env {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for d in ["bin", "net.d", "netns"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let plugin = root.join("bin/fakecni");
+        std::fs::write(&plugin, PLUGIN).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            root.join("net.d/10-fake.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"rusternetes","plugins":[{"type":"fakecni"}]}"#,
+        )
+        .unwrap();
+        let backend = Arc::new(FakeBackend::new("fake"));
+        let (runtime, volumes) = runtime(&root, backend.clone()).await;
+        Env { _dir: dir, root, backend, runtime, _volumes: volumes }
+    }
+
+    impl Env {
+        fn state(&self) -> PathBuf {
+            self.root.join("bin/state")
+        }
+        /// The plugin's calls, without the container ID.
+        fn log(&self) -> Vec<String> {
+            std::fs::read_to_string(self.state().join("log"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.split(' ').next().unwrap().to_string())
+                .collect()
+        }
+        /// IPs reserved and endpoints present.
+        fn held(&self) -> (usize, usize) {
+            let names: Vec<String> = std::fs::read_dir(self.state())
+                .map(|r| r.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .unwrap_or_default();
+            (
+                names.iter().filter(|n| n.starts_with("ip-")).count(),
+                names.iter().filter(|n| n.starts_with("ep-")).count(),
+            )
+        }
+        fn netns_exists(&self) -> bool {
+            self.root.join("netns/cni-web").exists()
+        }
+    }
+
+    fn pod() -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "ns", "uid": "uid-1"},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "app:1"}]
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_gives_its_network_back_and_the_retry_comes_up_under_the_same_name() {
+        let e = env().await;
+        e.backend.fail_image("app:1", true);
+
+        assert!(e.runtime.start_pod(&pod()).await.is_err());
+        assert_eq!(e.log(), vec!["ADD", "DEL"], "a failed start is followed by CNI DEL");
+        assert_eq!(e.held(), (0, 0), "no IP or endpoint kept by a failed start");
+        assert!(!e.netns_exists(), "no namespace (and no veth in it) kept");
+
+        assert!(e.runtime.start_pod(&pod()).await.is_err());
+        assert_eq!(e.log(), vec!["ADD", "DEL", "ADD", "DEL"]);
+        assert_eq!(e.held(), (0, 0));
+
+        // The cause is fixed (the image works now): same pod name, comes up.
+        e.backend.fail_image("app:1", false);
+        e.runtime.start_pod(&pod()).await.unwrap();
+        assert_eq!(e.log(), vec!["ADD", "DEL", "ADD", "DEL", "ADD"]);
+        assert_eq!(e.held(), (1, 1), "exactly one IP for the running pod");
+        assert!(e.netns_exists());
+        assert!(e.runtime.is_pod_running("web").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_add_is_followed_by_del_so_the_half_taken_ip_is_given_back() {
+        let e = env().await;
+        std::fs::create_dir_all(e.state()).unwrap();
+        std::fs::write(e.state().join("fail-add"), "").unwrap();
+
+        assert!(e.runtime.start_pod(&pod()).await.is_err());
+        assert_eq!(e.log(), vec!["ADD-FAIL", "DEL"]);
+        assert_eq!(e.held(), (0, 0));
+        assert!(!e.netns_exists());
+
+        std::fs::remove_file(e.state().join("fail-add")).unwrap();
+        e.runtime.start_pod(&pod()).await.unwrap();
+        assert_eq!(e.held(), (1, 1));
+    }
+
+    /// A start cut off after ADD (the kubelet's start timeout, or a kubelet
+    /// restart) leaves a namespace with an attachment this process does not
+    /// know: DEL it and make a fresh namespace before ADD.
+    #[tokio::test]
+    async fn a_stale_sandbox_network_from_an_earlier_kubelet_is_deleted_before_add() {
+        let e = env().await;
+        e.runtime.start_pod(&pod()).await.unwrap();
+        assert_eq!(e.held(), (1, 1));
+
+        // A new kubelet process: no containers, the old network still there.
+        let (fresh, _v) = runtime(&e.root, Arc::new(FakeBackend::new("fake"))).await;
+        fresh.start_pod(&pod()).await.unwrap();
+        assert_eq!(e.log(), vec!["ADD", "DEL", "ADD"]);
+        assert_eq!(e.held(), (1, 1), "the old IP was given back");
+    }
+
+    /// Restarting the containers of a pod whose network this process set up
+    /// keeps that network (and its IP), as the upstream kubelet keeps a
+    /// ready sandbox: no second ADD.
+    #[tokio::test]
+    async fn a_container_restart_keeps_the_live_sandbox_network() {
+        let e = env().await;
+        e.runtime.start_pod(&pod()).await.unwrap();
+        e.backend.state.lock().unwrap().containers.get_mut("web_app").unwrap().state = "exited";
+
+        e.runtime.start_pod(&pod()).await.unwrap();
+        assert_eq!(e.log(), vec!["ADD"]);
+        assert_eq!(e.held(), (1, 1));
     }
 }
