@@ -129,11 +129,13 @@ pub async fn create_token_request(
         namespace, service_account_name
     );
 
-    // Check authorization - requires permission to create token requests for the service account
-    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "create", "serviceaccounts/token")
+    // Check authorization: create serviceaccounts/token (the URL's attributes,
+    // as the authz middleware checks them).
+    let attrs = RequestAttributes::new(auth_ctx.user.clone(), "create", "serviceaccounts")
         .with_api_group("")
         .with_namespace(&namespace)
-        .with_name(&service_account_name);
+        .with_name(&service_account_name)
+        .with_subresource("token");
 
     if let Decision::Deny(reason) = state.authorizer.authorize(&attrs).await? {
         return Err(rusternetes_common::Error::Forbidden(reason));
@@ -148,8 +150,30 @@ pub async fn create_token_request(
         rusternetes_storage::build_key("serviceaccounts", Some(&namespace), &service_account_name);
     let sa: rusternetes_common::resources::ServiceAccount = state.storage.get(&sa_key).await?;
 
-    // Calculate expiration time
-    let expiration_seconds = token_request.spec.expiration_seconds.unwrap_or(3600);
+    // The bound object (a Pod): it must exist, have the uid asked for and run
+    // as this ServiceAccount. A node asks only for a pod bound to it
+    // (upstream NodeRestriction).
+    let bound = bound_pod_for(&state, &namespace, &service_account_name, token_request.spec.bound_object_ref.as_ref()).await?;
+    if let Some(node) = crate::node_authz::node_of(&auth_ctx.user) {
+        match &bound {
+            Some(b) if b.node.as_deref() == Some(node) => {}
+            Some(_) => {
+                return Err(rusternetes_common::Error::Forbidden(format!(
+                    "node {node} may request a token only for a pod bound to it"
+                )))
+            }
+            None => {
+                return Err(rusternetes_common::Error::Forbidden(format!(
+                    "node {node} may request only pod-bound tokens"
+                )))
+            }
+        }
+    }
+
+    // Lifetime: at least 10 minutes, at most --service-account-max-token-expiration.
+    let expiration_seconds =
+        rusternetes_common::auth::token_expiration(token_request.spec.expiration_seconds);
+    token_request.spec.expiration_seconds = Some(expiration_seconds);
 
     let now = chrono::Utc::now();
     let expiration_timestamp = now
@@ -158,7 +182,6 @@ pub async fn create_token_request(
             rusternetes_common::Error::Internal("Failed to calculate expiration time".to_string())
         })?;
 
-    // Generate a proper JWT service account token using direct seconds for precision
     let mut claims = rusternetes_common::auth::ServiceAccountClaims {
         sub: format!(
             "system:serviceaccount:{}:{}",
@@ -185,44 +208,18 @@ pub async fn create_token_request(
         node_uid: None,
     };
 
-    // Set audience from the request (TokenRequestSpec.audiences is Vec<String>, not Option)
     if !token_request.spec.audiences.is_empty() {
         claims.aud = token_request.spec.audiences.clone();
     }
 
-    // Set bound object reference (pod name/uid) in claims for projected SA tokens
-    if let Some(ref bound_ref) = token_request.spec.bound_object_ref {
-        if bound_ref.kind.as_deref() == Some("Pod") {
-            claims.pod_name = bound_ref.name.clone();
-            claims.pod_uid = bound_ref.uid.clone();
-
-            // Try to get node name and node UID from the pod
-            if let Some(ref pod_name) = bound_ref.name {
-                let pod_key = rusternetes_storage::build_key("pods", Some(&namespace), pod_name);
-                if let Ok(pod) = state
-                    .storage
-                    .get::<rusternetes_common::resources::Pod>(&pod_key)
-                    .await
-                {
-                    let node_name = pod.spec.as_ref().and_then(|s| s.node_name.clone());
-                    claims.node_name = node_name.clone();
-
-                    // Look up node UID from the Node object
-                    if let Some(ref n) = node_name {
-                        let node_key = rusternetes_storage::build_key("nodes", None::<&str>, n);
-                        if let Ok(node) = state
-                            .storage
-                            .get::<rusternetes_common::resources::Node>(&node_key)
-                            .await
-                        {
-                            let uid = node.metadata.uid.clone();
-                            if !uid.is_empty() {
-                                claims.node_uid = Some(uid);
-                            }
-                        }
-                    }
-                }
-            }
+    if let Some(b) = bound {
+        claims.pod_name = Some(b.name.clone());
+        claims.pod_uid = Some(b.uid.clone());
+        claims.node_name = b.node.clone();
+        claims.node_uid = b.node_uid.clone();
+        if let Some(k) = claims.kubernetes.as_mut() {
+            k.pod = Some(rusternetes_common::auth::KubeRef { name: b.name, uid: b.uid });
+            k.node = b.node.map(|n| rusternetes_common::auth::KubeRef { name: n, uid: b.node_uid.unwrap_or_default() });
         }
     }
 
@@ -239,6 +236,82 @@ pub async fn create_token_request(
     });
 
     Ok(Json(token_request))
+}
+
+/// The pod a TokenRequest binds to.
+pub(crate) struct BoundPod {
+    pub name: String,
+    pub uid: String,
+    pub node: Option<String>,
+    pub node_uid: Option<String>,
+}
+
+/// Resolve a TokenRequest's `boundObjectRef`: `None` without one; a Pod
+/// that exists, has the uid asked for (when one is given) and runs as
+/// `service_account`; any other kind is refused.
+pub(crate) async fn bound_pod_for(
+    state: &ApiServerState,
+    namespace: &str,
+    service_account: &str,
+    r: Option<&rusternetes_common::resources::BoundObjectReference>,
+) -> Result<Option<BoundPod>> {
+    let Some(r) = r else { return Ok(None) };
+    if r.kind.as_deref() == Some("Secret") {
+        // Bound to a Secret: it must exist (no pod binding).
+        let name = r.name.clone().unwrap_or_default();
+        state
+            .storage
+            .get::<serde_json::Value>(&rusternetes_storage::build_key("secrets", Some(namespace), &name))
+            .await
+            .map_err(|_| rusternetes_common::Error::Forbidden(format!("the bound secret {namespace}/{name} does not exist")))?;
+        return Ok(None);
+    }
+    if r.kind.as_deref() != Some("Pod") {
+        return Err(rusternetes_common::Error::InvalidResource(format!(
+            "boundObjectRef.kind {:?}: only Pod is supported",
+            r.kind
+        )));
+    }
+    let name = r
+        .name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| rusternetes_common::Error::InvalidResource("boundObjectRef.name is required".into()))?;
+    let pod: rusternetes_common::resources::Pod = state
+        .storage
+        .get(&rusternetes_storage::build_key("pods", Some(namespace), &name))
+        .await
+        .map_err(|_| rusternetes_common::Error::Forbidden(format!("the bound pod {namespace}/{name} does not exist")))?;
+    if let Some(uid) = r.uid.as_deref().filter(|u| !u.is_empty()) {
+        if uid != pod.metadata.uid {
+            return Err(rusternetes_common::Error::Forbidden(format!(
+                "the bound pod {namespace}/{name} has uid {}, not {uid}",
+                pod.metadata.uid
+            )));
+        }
+    }
+    let spec = pod.spec.as_ref();
+    let sa = spec
+        .and_then(|s| s.service_account_name.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    if sa != service_account {
+        return Err(rusternetes_common::Error::Forbidden(format!(
+            "the bound pod {namespace}/{name} runs as ServiceAccount {sa}, not {service_account}"
+        )));
+    }
+    let node = spec.and_then(|s| s.node_name.clone()).filter(|n| !n.is_empty());
+    let mut node_uid = None;
+    if let Some(n) = &node {
+        if let Ok(nd) = state
+            .storage
+            .get::<rusternetes_common::resources::Node>(&rusternetes_storage::build_key("nodes", None::<&str>, n))
+            .await
+        {
+            node_uid = Some(nd.metadata.uid.clone()).filter(|u| !u.is_empty());
+        }
+    }
+    Ok(Some(BoundPod { name, uid: pod.metadata.uid.clone(), node, node_uid }))
 }
 
 /// Create a SelfSubjectReview (authentication.k8s.io/v1)

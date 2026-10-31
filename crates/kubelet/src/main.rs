@@ -14,6 +14,8 @@ mod readiness_timing;
 mod runtime;
 #[allow(dead_code)]
 mod seccomp;
+#[allow(dead_code)]
+mod token_request;
 
 use anyhow::Result;
 use axum::{
