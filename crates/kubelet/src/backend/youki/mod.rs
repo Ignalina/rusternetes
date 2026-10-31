@@ -108,7 +108,7 @@ struct Inner {
     /// current by create, start and remove. Lists and lookups never scan
     /// the containers directory again.
     index: std::sync::RwLock<std::collections::BTreeMap<String, Meta>>,
-    pulls: InFlight,
+    pulls: Arc<InFlight>,
 }
 
 impl Inner {
@@ -122,6 +122,14 @@ impl Inner {
             cfg.state_root.clone(),
         ] {
             fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
+        }
+        // No pull is in flight at start: what is under tmp/ is a dead pull's scratch.
+        let n = image::clean_tmp(&cfg.root);
+        if n > 0 {
+            tracing::info!(
+                "youki: removed {n} leftover image pull dir(s) under {}",
+                cfg.root.join("tmp").display()
+            );
         }
         let index = fs::read_dir(cfg.root.join("containers"))
             .into_iter()
@@ -137,7 +145,7 @@ impl Inner {
                 .user_agent("rusternetes-kubelet")
                 .build()?,
             index: std::sync::RwLock::new(index),
-            pulls: InFlight::default(),
+            pulls: Arc::new(InFlight::default()),
         })
     }
 
@@ -165,17 +173,30 @@ impl Inner {
 pub struct InFlight(std::sync::Mutex<std::collections::HashSet<String>>);
 
 /// One pull's place in [`InFlight`], given back when dropped.
-pub struct Ticket<'a>(&'a InFlight, String);
+pub struct Ticket(Arc<InFlight>, String);
 
 impl InFlight {
     /// `None`: a pull of `image` is already in flight.
-    pub fn begin(&self, image: &str) -> Option<Ticket<'_>> {
-        let _ = image;
-        None
+    pub fn begin(self: &Arc<Self>, image: &str) -> Option<Ticket> {
+        let mut s = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        s.insert(image.to_string())
+            .then(|| Ticket(self.clone(), image.to_string()))
     }
     pub fn busy(&self, image: &str) -> bool {
-        let _ = image;
-        false
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(image)
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.0
+             .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.1);
     }
 }
 
@@ -787,9 +808,39 @@ impl ContainerBackend for YoukiBackend {
                     ..Default::default()
                 }));
             };
-            if let Err(e) = inner.images.pull(&inner.http, &image, &mut progress).await {
+            // On its own task: a caller that gives up (the pod start's timeout)
+            // does not cancel the pull; a caller that comes again waits for it.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<Option<String>>();
+            let task_inner = inner.clone();
+            let task_image = image.clone();
+            let ticket = inner.pulls.begin(&image);
+            let started = ticket.is_some();
+            if started {
+                tokio::spawn(async move {
+                    let _ticket = ticket;
+                    let r = task_inner
+                        .images
+                        .pull(&task_inner.http, &task_image, &mut progress)
+                        .await;
+                    let _ = done_tx.send(r.err().map(|e| format!("{:#}", e)));
+                });
+            } else {
+                drop(done_tx);
+            }
+            let err = if started {
+                done_rx
+                    .await
+                    .unwrap_or_else(|_| Some("the pull task ended without an answer".into()))
+            } else {
+                // Another request's pull is in flight: wait for it, then look.
+                while inner.pulls.busy(&image) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                inner.images.get(&image).err().map(|e| format!("{:#}", e))
+            };
+            if let Some(e) = err {
                 let _ = tx.unbounded_send(Ok(PullProgress {
-                    error: Some(format!("{:#}", e)),
+                    error: Some(e),
                     ..Default::default()
                 }));
             }
@@ -1150,7 +1201,7 @@ mod tests {
 
     #[test]
     fn one_pull_per_image_in_flight() {
-        let f = InFlight::default();
+        let f = Arc::new(InFlight::default());
         let t = f.begin("busybox:1.37").expect("the first pull starts");
         assert!(f.begin("busybox:1.37").is_none(), "a second waits for it");
         assert!(f.busy("busybox:1.37"));
