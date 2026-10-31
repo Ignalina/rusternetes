@@ -69,3 +69,6 @@ chrono.workspace = true
 # With `redb`: serve the embedded store to other nodes as etcd v3 (--serve-etcd).
 tunnr-etcd = { version = "0.2", optional = true, features = ["server"] }
 rustls = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true

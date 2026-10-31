@@ -144,6 +144,17 @@ fn subject_matches(subject: &Subject, user: &UserInfo) -> bool {
 }
 
 /// RBAC Authorizer that uses Role and RoleBinding resources
+/// A Role or ClusterRole a binding refers to: `None` when it does not
+/// exist (that binding grants nothing), an error when the store did not
+/// answer — never a silent denial (a transient store error is not a 403).
+fn found<T>(r: Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(t) => Ok(Some(t)),
+        Err(crate::error::Error::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub struct RBACAuthorizer<S: AuthzStorage> {
     storage: Arc<S>,
 }
@@ -163,13 +174,13 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         if let Some(namespace) = &attrs.namespace {
             for binding in &role_bindings {
                 if let Some(ref binding_ns) = binding.metadata.namespace {
-                    if binding_ns == namespace {
+                    if binding_ns == namespace && binding.role_ref.kind == "Role" {
                         // Get the referenced role
-                        if let Ok(role) = self
-                            .storage
-                            .get::<Role>(&binding.role_ref.name, Some(binding_ns))
-                            .await
-                        {
+                        if let Some(role) = found(
+                            self.storage
+                                .get::<Role>(&binding.role_ref.name, Some(binding_ns))
+                                .await,
+                        )? {
                             if self.check_policy_rules(&role.rules, attrs) {
                                 return Ok(Decision::Allow);
                             }
@@ -182,11 +193,11 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         // Check cluster-scoped roles via role bindings
         for binding in &role_bindings {
             if binding.role_ref.kind == "ClusterRole" {
-                if let Ok(cluster_role) = self
-                    .storage
-                    .get::<ClusterRole>(&binding.role_ref.name, None)
-                    .await
-                {
+                if let Some(cluster_role) = found(
+                    self.storage
+                        .get::<ClusterRole>(&binding.role_ref.name, None)
+                        .await,
+                )? {
                     if self.check_policy_rules(&cluster_role.rules, attrs) {
                         return Ok(Decision::Allow);
                     }
@@ -196,11 +207,11 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
 
         // Check cluster-scoped roles
         for binding in cluster_role_bindings {
-            if let Ok(cluster_role) = self
-                .storage
-                .get::<ClusterRole>(&binding.role_ref.name, None)
-                .await
-            {
+            if let Some(cluster_role) = found(
+                self.storage
+                    .get::<ClusterRole>(&binding.role_ref.name, None)
+                    .await,
+            )? {
                 if self.check_policy_rules(&cluster_role.rules, attrs) {
                     return Ok(Decision::Allow);
                 }
@@ -366,11 +377,11 @@ impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
                     }
                 }
             } else if binding.role_ref.kind == "ClusterRole" {
-                if let Ok(cluster_role) = self
-                    .storage
-                    .get::<ClusterRole>(&binding.role_ref.name, None)
-                    .await
-                {
+                if let Some(cluster_role) = found(
+                    self.storage
+                        .get::<ClusterRole>(&binding.role_ref.name, None)
+                        .await,
+                )? {
                     for rule in &cluster_role.rules {
                         resource_rules.push(crate::resources::ResourceRule {
                             verbs: rule.verbs.clone(),
@@ -401,11 +412,11 @@ impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
                 continue;
             }
 
-            if let Ok(cluster_role) = self
-                .storage
-                .get::<ClusterRole>(&binding.role_ref.name, None)
-                .await
-            {
+            if let Some(cluster_role) = found(
+                self.storage
+                    .get::<ClusterRole>(&binding.role_ref.name, None)
+                    .await,
+            )? {
                 for rule in &cluster_role.rules {
                     resource_rules.push(crate::resources::ResourceRule {
                         verbs: rule.verbs.clone(),
@@ -826,6 +837,44 @@ impl Authorizer for WebhookAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_store_that_does_not_answer_is_an_error_not_a_denial() {
+        // A binding whose Role cannot be read (the store is not answering):
+        // the request fails (the API server answers 503), it is not refused.
+        struct Down;
+        #[async_trait]
+        impl AuthzStorage for Down {
+            async fn get<T>(&self, _: &str, _: Option<&str>) -> Result<T>
+            where
+                T: DeserializeOwned + Send + Sync,
+            {
+                Err(crate::error::Error::Storage("no Raft leader for a linearizable read".into()))
+            }
+            async fn list<T>(&self, ns: Option<&str>) -> Result<Vec<T>>
+            where
+                T: serde::Serialize + DeserializeOwned + Send + Sync,
+            {
+                let b = serde_json::json!({"metadata": {"name": "b", "namespace": "default"},
+                    "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "r"},
+                    "subjects": [{"kind": "ServiceAccount", "name": "app", "namespace": "default"}]});
+                Ok(if ns.is_some() && std::any::type_name::<T>().contains("RoleBinding") {
+                    vec![serde_json::from_value(b).unwrap()]
+                } else {
+                    vec![]
+                })
+            }
+        }
+        let rbac = RBACAuthorizer::new(Arc::new(Down));
+        let u = UserInfo {
+            username: "system:serviceaccount:default:app".into(),
+            uid: String::new(),
+            groups: vec!["system:serviceaccounts".into()],
+            extra: Default::default(),
+        };
+        let a = RequestAttributes::new(u, "list", "pods").with_namespace("default");
+        assert!(rbac.authorize(&a).await.is_err());
+    }
 
     #[test]
     fn a_rule_for_a_resource_does_not_grant_its_subresources() {
