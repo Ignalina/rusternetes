@@ -21,6 +21,8 @@
 //! | tokenreviews, subjectaccessreviews | create |
 //! | configmaps `kube-system/<prefix><node>` (with [`ClusterAuthorizer::with_node_configmaps`]) | get any node's; create, update, patch its own (a node publishes facts its peers read, e.g. a WireGuard public key) |
 //!
+//! | custom resources named with [`ClusterAuthorizer::with_node_resources`] | `<plural>.<group>` (`--node-named-resource`): get/list/watch; create, update, patch (incl. status), delete of those named `<node>.<…>`; `<plural>.<group>=<label>` (`--node-status-resource`): get/list/watch; update, patch of the status of an object whose stored label `<label>` is the node |
+//!
 //! Everything else goes to RBAC, where `system:nodes` has no binding: 403.
 
 use std::collections::HashSet;
@@ -74,9 +76,51 @@ impl ClusterAuthorizer {
     ///   plane's: a status write cannot change it); never create or delete.
     ///
     /// A spec that does not parse is left out.
-    pub fn with_node_resources(self, named: &[String], status: &[String]) -> Self {
-        let _ = (named, status);
+    pub fn with_node_resources(mut self, named: &[String], status: &[String]) -> Self {
+        let split = |r: &str| -> Option<(String, String)> {
+            let (plural, group) = r.trim().split_once('.')?;
+            (!plural.is_empty() && !group.is_empty()).then(|| (group.to_string(), plural.to_string()))
+        };
+        self.node_named = named.iter().filter_map(|r| split(r)).collect();
+        self.node_status = status
+            .iter()
+            .filter_map(|r| {
+                let (res, label) = r.split_once('=')?;
+                let (g, p) = split(res)?;
+                (!label.is_empty()).then(|| (g, p, label.to_string()))
+            })
+            .collect();
         self
+    }
+
+    /// The rules of [`Self::with_node_resources`]: `Some(allowed)` for a
+    /// configured resource, `None` for anything else.
+    async fn node_resource(&self, node: &str, a: &RequestAttributes) -> Option<bool> {
+        let v = a.verb.as_str();
+        let read = matches!(v, "get" | "list" | "watch");
+        let sub = a.subresource.as_deref();
+        if self.node_named.iter().any(|(g, p)| *g == a.api_group && *p == a.resource) {
+            let own = a.name.as_deref().is_some_and(|n| n.len() > node.len() + 1 && n.starts_with(node) && n.as_bytes()[node.len()] == b'.');
+            return Some(match sub {
+                None => read || (own && matches!(v, "create" | "update" | "patch" | "delete")),
+                Some("status") => (v == "get" && a.name.is_some()) || (own && matches!(v, "update" | "patch")),
+                _ => false,
+            });
+        }
+        let (g, p, label) = self.node_status.iter().find(|(g, p, _)| *g == a.api_group && *p == a.resource)?;
+        Some(match (sub, a.name.as_deref()) {
+            (None, _) => read,
+            (Some("status"), Some(_)) if v == "get" => true,
+            (Some("status"), Some(name)) if matches!(v, "update" | "patch") => {
+                let key = build_key(&format!("{}_{}", g.replace('.', "_"), p), a.namespace.as_deref(), name);
+                self.storage
+                    .get::<Value>(&key)
+                    .await
+                    .ok()
+                    .is_some_and(|o| o.pointer("/metadata/labels").and_then(|l| l.get(label.as_str())).and_then(Value::as_str) == Some(node))
+            }
+            _ => false,
+        })
     }
 
     /// Nodes publish ConfigMaps `kube-system/<prefix><node>`: each node may
@@ -132,6 +176,9 @@ impl ClusterAuthorizer {
 
     /// The Node authorizer's decision for `node` (true = allow).
     async fn node_allows(&self, node: &str, a: &RequestAttributes) -> Result<bool> {
+        if let Some(allowed) = self.node_resource(node, a).await {
+            return Ok(allowed);
+        }
         let v = a.verb.as_str();
         let read = matches!(v, "get" | "list" | "watch");
         let sub = a.subresource.as_deref();

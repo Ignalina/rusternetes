@@ -129,6 +129,18 @@ struct Args {
     #[arg(long)]
     node_configmap_prefix: Option<String>,
 
+    /// A cluster-scoped custom resource (`<plural>.<group>`) nodes write about
+    /// themselves: a node may create, update, patch and delete those named
+    /// `<node>.<…>` (the Node authorizer). Repeatable.
+    #[arg(long)]
+    node_named_resource: Vec<String>,
+
+    /// A custom resource whose status a node writes (`<plural>.<group>=<label
+    /// key>`): a node may update and patch the status of an object whose label
+    /// names it (the Node authorizer). Repeatable.
+    #[arg(long)]
+    node_status_resource: Vec<String>,
+
     /// By default, a pod's resolv.conf lists the node's own DNS server first
     /// so pods can resolve sibling container names under Docker Compose.
     /// Set this flag outside Compose so pods resolve cluster Service names.
@@ -551,6 +563,8 @@ async fn run() -> Result<()> {
         client_ca_file: args.client_ca_file,
         kubelet_client_tls,
         node_configmap_prefix: args.node_configmap_prefix.clone(),
+        node_named_resources: args.node_named_resource.clone(),
+        node_status_resources: args.node_status_resource.clone(),
         ..Default::default()
     };
     let api_handle = if on("api-server") {
