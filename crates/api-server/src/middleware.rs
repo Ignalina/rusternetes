@@ -70,6 +70,7 @@ fn forbidden(msg: &str) -> Response {
 pub async fn auth_middleware(
     Extension(token_manager): Extension<Arc<TokenManager>>,
     Extension(bootstrap_token_manager): Extension<Arc<BootstrapTokenManager>>,
+    storage: Option<Extension<Arc<rusternetes_storage::StorageBackend>>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, Response> {
@@ -94,6 +95,20 @@ pub async fn auth_middleware(
             return Err(unauthorized(msg));
         }
     };
+    // A bound token (TokenRequest, projected by the kubelet) holds only while its pod does.
+    if let Some(Extension(st)) = &storage {
+        if let Err(msg) = crate::authn::check_bound(&user, st).await {
+            debug!("{} {}: {}", request.method(), request.uri().path(), msg);
+            if msg.starts_with("Unauthorized") {
+                return Err(unauthorized(&msg));
+            }
+            let body = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "metadata": {},
+                "status": "Failure", "message": msg, "reason": "ServiceUnavailable", "code": 503
+            });
+            return Err((StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response());
+        }
+    }
     debug!("Authenticated {} {:?}", user.username, user.groups);
     request.extensions_mut().insert(AuthContext { user });
     Ok(next.run(request).await)
@@ -154,7 +169,19 @@ pub async fn authz_middleware(
                 reason
             )))
         }
-        Err(e) => Err(forbidden(&format!("authorization failed: {e}"))),
+        // The store did not answer (no Raft leader yet, a replica catching
+        // up): not a denial — 503, and the client asks again.
+        Err(e) => {
+            warn!("authorization of {} {} {:?}: the store did not answer: {e}", ctx.user.username, attrs.verb, attrs.resource);
+            let body = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "metadata": {},
+                "status": "Failure", "message": format!("authorization could not be decided: {e}"),
+                "reason": "ServiceUnavailable", "code": 503
+            });
+            let mut r = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+            r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+            Err(r)
+        }
     }
 }
 
