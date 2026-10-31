@@ -9,7 +9,7 @@ use std::collections::HashMap;
 /// Nested kubernetes.io claim in JWT tokens (matches K8s pkg/serviceaccount/claims.go)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KubernetesClaims {
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub namespace: String,
     #[serde(rename = "serviceaccount")]
     pub svcacct: KubeRef,
@@ -22,9 +22,10 @@ pub struct KubernetesClaims {
 /// Name+UID reference used in kubernetes.io JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KubeRef {
-    #[serde(skip_serializing_if = "String::is_empty")]
+    // An empty field is left out when signing, so it must read back as empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uid: String,
 }
 
@@ -928,6 +929,15 @@ mod tests {
         let (k2, p2) = cluster_key_files(dir2.path());
         let other = TokenManager::from_key_files(&k2, &p2).unwrap();
         assert!(tm.validate_token(&other.generate_token(claims).unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_token_for_a_serviceaccount_without_a_uid_validates() {
+        // The controller manager's default ServiceAccounts carry no uid; the
+        // empty uid is left out of the token and must read back.
+        let tm = TokenManager::new_random();
+        let t = tm.generate_token(ServiceAccountClaims::new("default".into(), "default".into(), String::new(), 1)).unwrap();
+        assert_eq!(tm.validate_token(&t).unwrap().sub, "system:serviceaccount:default:default");
     }
 
     #[test]
