@@ -1,0 +1,695 @@
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use nix::mount::MsFlags;
+use nix::sys::stat::SFlag;
+use oci_spec::runtime::{LinuxDevice, LinuxDeviceBuilder, LinuxDeviceType, Mount};
+
+use super::mount::MountError;
+use crate::syscall::linux::{self, MountOption, MountRecursive};
+
+const IDMAP_FLAG: &str = "idmap";
+const RIDMAP_FLAG: &str = "ridmap";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountOptionConfig {
+    /// Mount Flags.
+    pub flags: MsFlags,
+
+    /// Mount data options applied to the mount (e.g. `lowerdir=...`).
+    pub data: Vec<String>,
+
+    /// RecAttr represents mount properties to be applied recursively.
+    pub rec_attr: Option<linux::MountAttr>,
+}
+
+pub fn default_devices() -> Vec<LinuxDevice> {
+    vec![
+        LinuxDeviceBuilder::default()
+            .path(PathBuf::from("/dev/null"))
+            .typ(LinuxDeviceType::C)
+            .major(1)
+            .minor(3)
+            .file_mode(0o0666u32)
+            .build()
+            .unwrap(),
+        LinuxDeviceBuilder::default()
+            .path(PathBuf::from("/dev/zero"))
+            .typ(LinuxDeviceType::C)
+            .major(1)
+            .minor(5)
+            .file_mode(0o0666u32)
+            .build()
+            .unwrap(),
+        LinuxDeviceBuilder::default()
+            .path(PathBuf::from("/dev/full"))
+            .typ(LinuxDeviceType::C)
+            .major(1)
+            .minor(7)
+            .file_mode(0o0666u32)
+            .build()
+            .unwrap(),
+        LinuxDeviceBuilder::default()
+            .path(PathBuf::from("/dev/tty"))
+            .typ(LinuxDeviceType::C)
+            .major(5)
+            .minor(0)
+            .file_mode(0o0666u32)
+            .build()
+            .unwrap(),
+        LinuxDeviceBuilder::default()
+            .path(PathBuf::from("/dev/urandom"))
+            .typ(LinuxDeviceType::C)
+            .major(1)
+            .minor(9)
+            .file_mode(0o0666u32)
+            .build()
+            .unwrap(),
+        LinuxDeviceBuilder::default()
+            .path(PathBuf::from("/dev/random"))
+            .typ(LinuxDeviceType::C)
+            .major(1)
+            .minor(8)
+            .file_mode(0o0666u32)
+            .build()
+            .unwrap(),
+    ]
+}
+
+pub fn to_sflag(dev_type: LinuxDeviceType) -> SFlag {
+    match dev_type {
+        LinuxDeviceType::A => SFlag::S_IFBLK | SFlag::S_IFCHR | SFlag::S_IFIFO,
+        LinuxDeviceType::B => SFlag::S_IFBLK,
+        LinuxDeviceType::C | LinuxDeviceType::U => SFlag::S_IFCHR,
+        LinuxDeviceType::P => SFlag::S_IFIFO,
+    }
+}
+
+pub fn parse_mount(m: &Mount) -> std::result::Result<MountOptionConfig, MountError> {
+    let mut flags = MsFlags::empty();
+    let mut data = Vec::new();
+    let mut mount_attr: Option<linux::MountAttr> = None;
+
+    if let Some(options) = &m.options() {
+        for option in options {
+            match option.as_str() {
+                IDMAP_FLAG => {
+                    continue;
+                }
+                RIDMAP_FLAG => {
+                    continue;
+                }
+                _ => {}
+            }
+
+            if let Ok(mount_attr_option) = linux::MountRecursive::from_str(option.as_str()) {
+                // Some options aren't corresponding to the mount flags.
+                // These options need `AT_RECURSIVE` options.
+                // ref: https://github.com/opencontainers/runtime-spec/blob/main/config.md#linux-mount-options
+                let (is_clear, flag) = match mount_attr_option {
+                    MountRecursive::Rdonly(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::Nosuid(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::Nodev(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::Noexec(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::Atime(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::Relatime(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::Noatime(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::StrictAtime(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::NoDiratime(is_clear, flag) => (is_clear, flag),
+                    MountRecursive::Nosymfollow(is_clear, flag) => (is_clear, flag),
+                };
+
+                if mount_attr.is_none() {
+                    mount_attr = Some(linux::MountAttr {
+                        attr_set: 0,
+                        attr_clr: 0,
+                        propagation: 0,
+                        userns_fd: 0,
+                    });
+                }
+
+                if let Some(mount_attr) = &mut mount_attr {
+                    if is_clear {
+                        mount_attr.attr_clr |= flag;
+                    } else {
+                        mount_attr.attr_set |= flag;
+                    }
+                    if flag & linux::MOUNT_ATTR__ATIME == flag {
+                        // https://man7.org/linux/man-pages/man2/mount_setattr.2.html
+                        // "cannot simply specify the access-time setting in attr_set, but must
+                        // also include MOUNT_ATTR__ATIME in the attr_clr field."
+                        mount_attr.attr_clr |= linux::MOUNT_ATTR__ATIME;
+                    }
+                }
+                continue;
+            }
+
+            if let Some((is_clear, flag)) = match MountOption::from_str(option.as_str()) {
+                Ok(v) => match v {
+                    MountOption::Defaults(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Ro(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Rw(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Suid(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Nosuid(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Dev(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Nodev(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Exec(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Noexec(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Sync(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Async(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Dirsync(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Remount(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Mand(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Nomand(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Atime(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Noatime(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Diratime(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Nodiratime(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Bind(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Rbind(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Unbindable(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Runbindable(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Private(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Rprivate(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Shared(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Rshared(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Slave(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Rslave(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Relatime(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Norelatime(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Strictatime(is_clear, flag) => Some((is_clear, flag)),
+                    MountOption::Nostrictatime(is_clear, flag) => Some((is_clear, flag)),
+                },
+                Err(_) => None,
+            } {
+                if is_clear {
+                    flags &= !flag;
+                } else {
+                    flags |= flag;
+                }
+                continue;
+            }
+
+            data.push(option.as_str());
+        }
+    }
+    Ok(MountOptionConfig {
+        flags,
+        data: data.into_iter().map(|s| s.to_string()).collect(),
+        rec_attr: mount_attr,
+    })
+}
+
+pub fn is_bind(m: &Mount) -> bool {
+    // The `type == "bind"` check is kept only for backward compatibility
+    // with existing configs (see issue #3603); it diverges from runc, which
+    // rejects `type: "bind"` alone, and may be removed in a future release
+    // once a deprecation path is agreed upon.
+    m.typ().as_deref() == Some("bind")
+        || m.options()
+            .as_deref()
+            .is_some_and(|opts| opts.iter().any(|o| o == "bind" || o == "rbind"))
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use oci_spec::runtime::MountBuilder;
+
+    use super::*;
+    use crate::syscall::linux::MountAttr;
+
+    #[test]
+    fn test_to_sflag() {
+        assert_eq!(
+            SFlag::S_IFBLK | SFlag::S_IFCHR | SFlag::S_IFIFO,
+            to_sflag(LinuxDeviceType::A)
+        );
+        assert_eq!(SFlag::S_IFBLK, to_sflag(LinuxDeviceType::B));
+        assert_eq!(SFlag::S_IFCHR, to_sflag(LinuxDeviceType::C));
+        assert_eq!(SFlag::S_IFCHR, to_sflag(LinuxDeviceType::U));
+        assert_eq!(SFlag::S_IFIFO, to_sflag(LinuxDeviceType::P));
+    }
+
+    #[test]
+    fn test_parse_mount() -> Result<()> {
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/proc"))
+                .typ("proc")
+                .source(PathBuf::from("proc"))
+                .build()?,
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::empty(),
+                data: vec![],
+                rec_attr: None,
+            },
+            mount_option_config
+        );
+
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/dev"))
+                .typ("tmpfs")
+                .source(PathBuf::from("tmpfs"))
+                .options(vec![
+                    "nosuid".to_string(),
+                    "strictatime".to_string(),
+                    "mode=755".to_string(),
+                    "size=65536k".to_string(),
+                ])
+                .build()?,
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::MS_NOSUID | MsFlags::MS_STRICTATIME,
+                data: vec!["mode=755".to_string(), "size=65536k".to_string()],
+                rec_attr: None,
+            },
+            mount_option_config
+        );
+
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/dev/pts"))
+                .typ("devpts")
+                .source(PathBuf::from("devpts"))
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "newinstance".to_string(),
+                    "ptmxmode=0666".to_string(),
+                    "mode=0620".to_string(),
+                    "gid=5".to_string(),
+                ])
+                .build()
+                .unwrap(),
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+                data: vec![
+                    "newinstance".to_string(),
+                    "ptmxmode=0666".to_string(),
+                    "mode=0620".to_string(),
+                    "gid=5".to_string()
+                ],
+                rec_attr: None,
+            },
+            mount_option_config
+        );
+
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/dev/shm"))
+                .typ("tmpfs")
+                .source(PathBuf::from("shm"))
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "mode=1777".to_string(),
+                    "size=65536k".to_string(),
+                ])
+                .build()?,
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+                data: vec!["mode=1777".to_string(), "size=65536k".to_string()],
+                rec_attr: None,
+            },
+            mount_option_config
+        );
+
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/dev/mqueue"))
+                .typ("mqueue")
+                .source(PathBuf::from("mqueue"))
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                ])
+                .build()
+                .unwrap(),
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+                data: vec![],
+                rec_attr: None,
+            },
+            mount_option_config
+        );
+
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/sys"))
+                .typ("sysfs")
+                .source(PathBuf::from("sysfs"))
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "ro".to_string(),
+                ])
+                .build()?,
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::MS_NOSUID
+                    | MsFlags::MS_NOEXEC
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_RDONLY,
+                data: vec![],
+                rec_attr: None,
+            },
+            mount_option_config
+        );
+
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/sys/fs/cgroup"))
+                .typ("cgroup")
+                .source(PathBuf::from("cgroup"))
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "relatime".to_string(),
+                    "ro".to_string(),
+                ])
+                .build()?,
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::MS_NOSUID
+                    | MsFlags::MS_NOEXEC
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_RDONLY
+                    | MsFlags::MS_RELATIME,
+                data: vec![],
+                rec_attr: None,
+            },
+            mount_option_config,
+        );
+
+        // this case is just for coverage purpose
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .options(vec![
+                    "defaults".to_string(),
+                    "ro".to_string(),
+                    "rw".to_string(),
+                    "suid".to_string(),
+                    "nosuid".to_string(),
+                    "dev".to_string(),
+                    "nodev".to_string(),
+                    "exec".to_string(),
+                    "noexec".to_string(),
+                    "sync".to_string(),
+                    "async".to_string(),
+                    "dirsync".to_string(),
+                    "remount".to_string(),
+                    "mand".to_string(),
+                    "nomand".to_string(),
+                    "atime".to_string(),
+                    "noatime".to_string(),
+                    "diratime".to_string(),
+                    "nodiratime".to_string(),
+                    "bind".to_string(),
+                    "rbind".to_string(),
+                    "unbindable".to_string(),
+                    "runbindable".to_string(),
+                    "private".to_string(),
+                    "rprivate".to_string(),
+                    "shared".to_string(),
+                    "rshared".to_string(),
+                    "slave".to_string(),
+                    "rslave".to_string(),
+                    "relatime".to_string(),
+                    "norelatime".to_string(),
+                    "strictatime".to_string(),
+                    "nostrictatime".to_string(),
+                ])
+                .build()?,
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::MS_NOSUID
+                    | MsFlags::MS_NODEV
+                    | MsFlags::MS_NOEXEC
+                    | MsFlags::MS_REMOUNT
+                    | MsFlags::MS_DIRSYNC
+                    | MsFlags::MS_NOATIME
+                    | MsFlags::MS_NODIRATIME
+                    | MsFlags::MS_BIND
+                    | MsFlags::MS_UNBINDABLE,
+                data: vec![],
+                rec_attr: None,
+            },
+            mount_option_config
+        );
+
+        // this case is just for coverage purpose
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .options(vec![
+                    "rro".to_string(),
+                    "rrw".to_string(),
+                    "rnosuid".to_string(),
+                    "rsuid".to_string(),
+                    "rnodev".to_string(),
+                    "rdev".to_string(),
+                    "rnoexec".to_string(),
+                    "rexec".to_string(),
+                    "rnodiratime".to_string(),
+                    "rdiratime".to_string(),
+                    "rrelatime".to_string(),
+                    "rnorelatime".to_string(),
+                    "rnoatime".to_string(),
+                    "ratime".to_string(),
+                    "rstrictatime".to_string(),
+                    "rnostrictatime".to_string(),
+                    "rnosymfollow".to_string(),
+                    "rsymfollow".to_string(),
+                ])
+                .build()?,
+        )?;
+        assert_eq!(
+            MountOptionConfig {
+                flags: MsFlags::empty(),
+                data: vec![],
+                rec_attr: Some(MountAttr::all()),
+            },
+            mount_option_config
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_mount_idmap_options() -> Result<()> {
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .options(vec!["idmap".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(mount_option_config.data, Vec::<String>::new());
+
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .options(vec!["ridmap".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(mount_option_config.data, Vec::<String>::new());
+
+        Ok(())
+    }
+
+    // Tests for recursive atime mount options:
+    // Whenever any atime-related flag (flag & MOUNT_ATTR__ATIME == flag) is specified,
+    // attr_clr must include the full MOUNT_ATTR__ATIME mask (0x70). The kernel rejects
+    // partial atime masks with EINVAL because the three atime modes
+    // (relatime/noatime/strictatime) are mutually exclusive and can only be changed
+    // atomically: clear all three bits, then set the desired one.
+    #[test]
+    fn test_parse_mount_ratime_uses_full_atime_mask() -> Result<()> {
+        // "ratime" clears MOUNT_ATTR_NOATIME (is_clear=true, flag=MOUNT_ATTR_NOATIME=0x10).
+        // attr_clr must be MOUNT_ATTR__ATIME (0x70), not MOUNT_ATTR_NOATIME (0x10).
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/mnt"))
+                .source(PathBuf::from("/tmp/mounts_recursive"))
+                .options(vec!["rbind".to_string(), "ratime".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(
+            mount_option_config.rec_attr,
+            Some(MountAttr {
+                attr_set: 0,
+                attr_clr: linux::MOUNT_ATTR__ATIME,
+                propagation: 0,
+                userns_fd: 0,
+            }),
+            "ratime should set attr_clr to the full MOUNT_ATTR__ATIME mask"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_mount_rnostrictatime_uses_full_atime_mask() -> Result<()> {
+        // "rnostrictatime" clears MOUNT_ATTR_STRICTATIME (is_clear=true, flag=MOUNT_ATTR_STRICTATIME=0x20).
+        // attr_clr must be MOUNT_ATTR__ATIME (0x70), not MOUNT_ATTR_STRICTATIME (0x20).
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/mnt"))
+                .source(PathBuf::from("/tmp/mounts_recursive"))
+                .options(vec!["rbind".to_string(), "rnostrictatime".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(
+            mount_option_config.rec_attr,
+            Some(MountAttr {
+                attr_set: 0,
+                attr_clr: linux::MOUNT_ATTR__ATIME,
+                propagation: 0,
+                userns_fd: 0,
+            }),
+            "rnostrictatime should set attr_clr to the full MOUNT_ATTR__ATIME mask"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_mount_rnorelatime_uses_full_atime_mask() -> Result<()> {
+        // "rnorelatime" clears MOUNT_ATTR_RELATIME (is_clear=true, flag=MOUNT_ATTR_RELATIME=0x00).
+        // Although relatime has no dedicated bit, it is still an atime mode, so attr_clr
+        // must include the full MOUNT_ATTR__ATIME mask (0x70) — matching runc's behavior.
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/mnt"))
+                .source(PathBuf::from("/tmp/mounts_recursive"))
+                .options(vec!["rbind".to_string(), "rnorelatime".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(
+            mount_option_config.rec_attr,
+            Some(MountAttr {
+                attr_set: 0,
+                attr_clr: linux::MOUNT_ATTR__ATIME,
+                propagation: 0,
+                userns_fd: 0,
+            }),
+            "rnorelatime should set attr_clr to the full MOUNT_ATTR__ATIME mask"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_mount_rnoatime_uses_full_atime_mask() -> Result<()> {
+        // "rnoatime" sets MOUNT_ATTR_NOATIME (is_clear=false, flag=MOUNT_ATTR_NOATIME=0x10).
+        // attr_set must include MOUNT_ATTR_NOATIME and attr_clr must include MOUNT_ATTR__ATIME (0x70).
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/mnt"))
+                .source(PathBuf::from("/tmp/mounts_recursive"))
+                .options(vec!["rnoatime".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(
+            mount_option_config.rec_attr,
+            Some(MountAttr {
+                attr_set: linux::MOUNT_ATTR_NOATIME,
+                attr_clr: linux::MOUNT_ATTR__ATIME,
+                propagation: 0,
+                userns_fd: 0,
+            }),
+            "rnoatime should set attr_set=MOUNT_ATTR_NOATIME and attr_clr=MOUNT_ATTR__ATIME"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_mount_rstrictatime_uses_full_atime_mask() -> Result<()> {
+        // "rstrictatime" sets MOUNT_ATTR_STRICTATIME (is_clear=false, flag=MOUNT_ATTR_STRICTATIME=0x20).
+        // attr_set must include MOUNT_ATTR_STRICTATIME and attr_clr must include MOUNT_ATTR__ATIME (0x70).
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/mnt"))
+                .source(PathBuf::from("/tmp/mounts_recursive"))
+                .options(vec!["rstrictatime".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(
+            mount_option_config.rec_attr,
+            Some(MountAttr {
+                attr_set: linux::MOUNT_ATTR_STRICTATIME,
+                attr_clr: linux::MOUNT_ATTR__ATIME,
+                propagation: 0,
+                userns_fd: 0,
+            }),
+            "rstrictatime should set attr_set=MOUNT_ATTR_STRICTATIME and attr_clr=MOUNT_ATTR__ATIME"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_mount_rrelatime_uses_full_atime_mask() -> Result<()> {
+        // "rrelatime" sets MOUNT_ATTR_RELATIME (is_clear=false, flag=MOUNT_ATTR_RELATIME=0x00).
+        // Although relatime has no dedicated bit, attr_clr must still include the full
+        // MOUNT_ATTR__ATIME mask (0x70) — matching runc's behavior.
+        let mount_option_config = parse_mount(
+            &MountBuilder::default()
+                .destination(PathBuf::from("/mnt"))
+                .source(PathBuf::from("/tmp/mounts_recursive"))
+                .options(vec!["rrelatime".to_string()])
+                .build()?,
+        )?;
+        assert_eq!(
+            mount_option_config.rec_attr,
+            Some(MountAttr {
+                attr_set: linux::MOUNT_ATTR_RELATIME,
+                attr_clr: linux::MOUNT_ATTR__ATIME,
+                propagation: 0,
+                userns_fd: 0,
+            }),
+            "rrelatime should set attr_set=MOUNT_ATTR_RELATIME and attr_clr=MOUNT_ATTR__ATIME"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_bind() {
+        // Legacy check
+        let m1 = MountBuilder::default().typ("bind").build().unwrap();
+        assert!(is_bind(&m1));
+
+        // Spec-compliant checks
+        let m2 = MountBuilder::default()
+            .options(vec!["bind".to_string()])
+            .build()
+            .unwrap();
+        assert!(is_bind(&m2));
+
+        let m3 = MountBuilder::default()
+            .options(vec!["rbind".to_string()])
+            .build()
+            .unwrap();
+        assert!(is_bind(&m3));
+
+        // Negative check
+        let m4 = MountBuilder::default().typ("tmpfs").build().unwrap();
+        assert!(!is_bind(&m4));
+    }
+}
