@@ -304,6 +304,34 @@ pub fn build(input: &SpecInput) -> Result<Value> {
     .flatten()
     .collect::<Vec<_>>());
     linux["cgroupsPath"] = json!(input.cgroups_path);
+    // securityContext.seccompProfile: the profile resolved for this
+    // container's capabilities, arch and kernel (Unconfined or unset: none).
+    match &hc.seccomp {
+        Some(crate::seccomp::Seccomp::RuntimeDefault) => {
+            linux["seccomp"] = crate::seccomp::to_oci(
+                crate::seccomp::RUNTIME_DEFAULT,
+                &caps,
+                &crate::seccomp::kernel_release(),
+            )?;
+        }
+        Some(crate::seccomp::Seccomp::Localhost { path, profile }) => {
+            linux["seccomp"] =
+                crate::seccomp::to_oci(profile, &caps, &crate::seccomp::kernel_release()).map_err(
+                    |e| {
+                        anyhow::anyhow!(
+                            "CreateContainerError: cannot load seccomp profile {:?}: {:#}",
+                            path.display().to_string(),
+                            e
+                        )
+                    },
+                )?;
+        }
+        Some(crate::seccomp::Seccomp::Unconfined) | None => {
+            if let Some(o) = linux.as_object_mut() {
+                o.remove("seccomp");
+            }
+        }
+    }
     if privileged {
         linux["maskedPaths"] = json!([]);
         linux["readonlyPaths"] = json!([]);
