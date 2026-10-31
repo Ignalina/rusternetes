@@ -70,18 +70,12 @@ async fn test_serviceaccount_creates_default_in_namespace() {
     assert_eq!(sa.metadata.name, "default");
     assert_eq!(sa.metadata.namespace.as_ref().unwrap(), "test-sa-namespace");
 
-    // Verify token secret was created
+    // No long-lived token Secret (pods get bound tokens through TokenRequest).
     let secret_key = build_key("secrets", Some("test-sa-namespace"), "default-token");
-    let secret: Secret = storage.get(&secret_key).await.unwrap();
-    assert_eq!(secret.metadata.name, "default-token");
-    assert_eq!(
-        secret.secret_type.as_ref().unwrap(),
-        "kubernetes.io/service-account-token"
-    );
+    assert!(storage.get::<Secret>(&secret_key).await.is_err());
 
     // Clean up
     storage.delete(&sa_key).await.unwrap();
-    storage.delete(&secret_key).await.unwrap();
     storage.delete(&ns_key).await.unwrap();
 }
 
@@ -202,21 +196,24 @@ async fn test_serviceaccount_token_contains_required_fields() {
     let ns_key = build_key("namespaces", None, "test-token-fields");
     storage.create(&ns_key, &namespace).await.unwrap();
 
-    // Reconcile
+    // Reconcile: the default ServiceAccount, no token Secret.
     controller.reconcile_all().await.unwrap();
+    assert!(storage.get::<Secret>(&build_key("secrets", Some("test-token-fields"), "default-token")).await.is_err());
 
-    // Get the token secret
-    let secret_key = build_key("secrets", Some("test-token-fields"), "default-token");
+    // A token Secret a user asks for is filled: token (signed with the
+    // cluster's key) and namespace.
+    let mut req = Secret::new("default-legacy", "test-token-fields").with_type("kubernetes.io/service-account-token");
+    req.metadata.annotations = Some(std::collections::HashMap::from([(
+        "kubernetes.io/service-account.name".to_string(),
+        "default".to_string(),
+    )]));
+    let secret_key = build_key("secrets", Some("test-token-fields"), "default-legacy");
+    storage.create(&secret_key, &req).await.unwrap();
+    controller.reconcile_serviceaccount("test-token-fields", "default").await.unwrap();
     let secret: Secret = storage.get(&secret_key).await.unwrap();
-
-    // Verify secret has required fields
-    assert!(secret.data.is_some());
     let data = secret.data.as_ref().unwrap();
-
-    // Should have token, namespace, and ca.crt
     assert!(data.contains_key("token"));
     assert!(data.contains_key("namespace"));
-    assert!(data.contains_key("ca.crt"));
 
     // The token is signed with the cluster's key.
     let token = data.get("token").unwrap();
