@@ -237,11 +237,17 @@ pub fn compile(seccomp: &LinuxSeccomp) -> Result<Vec<BpfProgram>> {
         }
     }
     let mut programs = Vec::with_capacity(groups.len() + 1);
-    if default != SeccompAction::Allow {
-        programs.push(to_filter(base, default, SeccompAction::Allow, arch)?);
-    }
+    // The other actions first, the allowlist LAST: each filter is installed
+    // with seccomp(2), which the filters already in place must allow — the
+    // per-action ones allow everything else, the allowlist may not name
+    // seccomp at all (tunnr lane layers: a measured profile without seccomp
+    // in it killed the process installing it). The kernel takes the strictest
+    // answer of the whole stack, so the order changes nothing else.
     for (action, chains) in groups {
         programs.push(to_filter(chains, SeccompAction::Allow, action, arch)?);
+    }
+    if default != SeccompAction::Allow {
+        programs.push(to_filter(base, default, SeccompAction::Allow, arch)?);
     }
     if programs.is_empty() {
         // Allow everything: still a filter, so the process reports one.
