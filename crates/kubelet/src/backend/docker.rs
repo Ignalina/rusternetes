@@ -66,6 +66,15 @@ impl ContainerBackend for DockerBackend {
     }
 
     async fn create_container(&self, name: &str, config: ContainerConfig) -> Result<String> {
+        if let Some(h) = config
+            .host_config
+            .as_ref()
+            .and_then(|h| h.runtime_handler.as_deref())
+        {
+            anyhow::bail!(
+                "CreateContainerError: runtime handler {h:?}: the Docker backend runs no RuntimeClass handlers (the youki backend does)"
+            );
+        }
         let options = bc::CreateContainerOptions {
             name: name.to_string(),
             ..Default::default()
