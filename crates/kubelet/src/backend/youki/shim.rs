@@ -399,7 +399,8 @@ mod tests {
   "defaultAction": "SCMP_ACT_KILL_PROCESS",
   "syscalls": [
     {"action": "SCMP_ACT_ALLOW", "names": ["exit_group", "exit", "wait4", "write", "rt_sigreturn"]},
-    {"action": "SCMP_ACT_ALLOW", "args": [{"index": 1, "op": "SCMP_CMP_MASKED_EQ", "value": 4294967295, "valueTwo": 2}], "names": ["fcntl"]}
+    {"action": "SCMP_ACT_ALLOW", "args": [{"index": 1, "op": "SCMP_CMP_MASKED_EQ", "value": 4294967295, "valueTwo": 2}], "names": ["fcntl"]},
+    {"action": "SCMP_ACT_ERRNO", "errnoRet": 38, "names": ["clone3"]}
   ]
 }"#;
 
@@ -413,7 +414,7 @@ mod tests {
     fn the_wait_profile_loads_from_the_nodes_oci_json() {
         let s = load_wait_profile(&write_profile("load")).unwrap();
         assert_eq!(s.default_action(), oci_spec::runtime::LinuxSeccompAction::ScmpActKillProcess);
-        assert_eq!(s.syscalls().as_ref().map(|v| v.len()), Some(2));
+        assert_eq!(s.syscalls().as_ref().map(|v| v.len()), Some(3));
         assert!(load_wait_profile(Path::new("/nonexistent/shim.json")).is_err());
     }
 
@@ -434,6 +435,28 @@ mod tests {
             pid => {
                 let st = waitpid(Pid::from_raw(pid), None).unwrap();
                 assert!(matches!(st, WaitStatus::Signaled(_, nix::sys::signal::Signal::SIGSYS, _)), "{st:?}");
+            }
+        }
+    }
+
+    /// The profile goes on as a STACK of filters (one per action), so a
+    /// profile that does not name `seccomp` must still install whole; the
+    /// shim then lives on under it (KVM 2026-11-01: every short pod ended
+    /// "exit status was not recorded" — the shim died installing its wait
+    /// profile, which the node's measured list had no `seccomp` in).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_wait_profile_without_seccomp_in_it_still_installs_whole() {
+        let p = write_profile("whole");
+        match unsafe { libc_fork() } {
+            0 => {
+                std::env::set_var(WAIT_PROFILE_ENV, &p);
+                tighten();
+                unsafe { nix::libc::_exit(7) }
+            }
+            pid => {
+                let st = waitpid(Pid::from_raw(pid), None).unwrap();
+                assert!(matches!(st, WaitStatus::Exited(_, 7)), "the shim must survive its own install: {st:?}");
             }
         }
     }
