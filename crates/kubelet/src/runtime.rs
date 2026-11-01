@@ -177,6 +177,11 @@ fn check_seccomp_profiles(pod: &Pod, root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// A RuntimeClass's handler: `None` for an empty one (the default runtime).
+fn runtime_handler_of(class: &rusternetes_common::resources::RuntimeClass) -> Option<String> {
+    Some(class.handler.trim().to_string()).filter(|h| !h.is_empty())
+}
+
 /// A container's `volumeDevices` as device mappings: each names a pod volume
 /// whose path is a device node (a raw block PersistentVolume, published by its
 /// CSI driver as a node bound onto `<volume dir>/block`).
@@ -4940,6 +4945,33 @@ impl ContainerRuntime {
             }
         }
 
+        // The pod's RuntimeClass names the runtime handler (upstream: the
+        // CRI's runtime handler). A class the kubelet cannot read refuses the
+        // container; no class or an empty handler is the default runtime.
+        let runtime_handler = match pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.runtime_class_name.as_deref())
+            .filter(|n| !n.is_empty())
+        {
+            None => None,
+            Some(rc) => {
+                let storage = self.storage.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "CreateContainerConfigError: RuntimeClass {:?}: this kubelet has no store to read it from",
+                        rc
+                    )
+                })?;
+                let class: rusternetes_common::resources::RuntimeClass = storage
+                    .get(&build_key("runtimeclasses", None, rc))
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("CreateContainerConfigError: RuntimeClass {:?}: {}", rc, e)
+                    })?;
+                runtime_handler_of(&class)
+            }
+        };
+
         // The container's seccomp profile; a missing Localhost profile
         // refuses the container (CreateContainerError).
         let seccomp_setting = crate::seccomp::resolve(
@@ -5135,6 +5167,8 @@ impl ContainerRuntime {
                     .and_then(|sc| sc.privileged),
                 // securityContext.seccompProfile (container over pod)
                 seccomp: seccomp_setting,
+                // The RuntimeClass's handler (None: the default runtime)
+                runtime_handler,
                 // Sysctls are set on the pause container (which owns the namespaces).
                 // App containers share namespaces via ipc_mode/pid_mode above.
                 ..Default::default()

@@ -134,6 +134,8 @@ pub struct HostConfig {
     /// The container's `seccompProfile` (resolved by the kubelet); `None`
     /// keeps the backend's own default.
     pub seccomp: Option<crate::seccomp::Seccomp>,
+    /// The pod's RuntimeClass handler; `None` is the backend's default runtime.
+    pub runtime_handler: Option<String>,
     /// Device nodes to create in the container and allow in its device cgroup.
     pub devices: Option<Vec<DeviceMapping>>,
 }
