@@ -416,10 +416,7 @@ impl ContainerRuntime {
 
         // Delete network namespace
         match crate::netns::del(&netns_name) {
-            Err(e) => warn!(
-                "Failed to delete network namespace {}: {}",
-                netns_name, e
-            ),
+            Err(e) => warn!("Failed to delete network namespace {}: {}", netns_name, e),
             Ok(()) => info!("Deleted network namespace: {}", netns_name),
         }
 

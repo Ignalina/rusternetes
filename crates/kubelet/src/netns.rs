@@ -40,26 +40,56 @@ fn share_run_dir() -> io::Result<()> {
     let flags = libc::MS_SHARED | libc::MS_REC;
     // SAFETY: every pointer is a NUL-terminated string that outlives the
     // call, or null where mount(2) allows it (a propagation change).
-    let shared = unsafe { libc::mount(c"none".as_ptr(), dir.as_ptr(), std::ptr::null(), flags, std::ptr::null()) };
+    let shared = unsafe {
+        libc::mount(
+            c"none".as_ptr(),
+            dir.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
     if shared == 0 {
         return Ok(());
     }
     // Not a mount point yet: bind it onto itself, then share it.
     // SAFETY: as above.
-    check(unsafe { libc::mount(dir.as_ptr(), dir.as_ptr(), c"none".as_ptr(), libc::MS_BIND | libc::MS_REC, std::ptr::null()) })?;
+    check(unsafe {
+        libc::mount(
+            dir.as_ptr(),
+            dir.as_ptr(),
+            c"none".as_ptr(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        )
+    })?;
     // SAFETY: as above.
-    check(unsafe { libc::mount(c"none".as_ptr(), dir.as_ptr(), std::ptr::null(), flags, std::ptr::null()) })
+    check(unsafe {
+        libc::mount(
+            c"none".as_ptr(),
+            dir.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    })
 }
 
 /// Create the named network namespace. An existing one is an
 /// [`io::ErrorKind::AlreadyExists`] error.
 pub fn add(name: &str) -> io::Result<()> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad netns name {name:?}")));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("bad netns name {name:?}"),
+        ));
     }
     share_run_dir()?;
     let target = path(name);
-    OpenOptions::new().write(true).create_new(true).open(&target)?;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)?;
     let t = target.clone();
     let made = std::thread::spawn(move || -> io::Result<()> {
         // SAFETY: unshare(2) only changes this thread's namespaces.
@@ -68,7 +98,15 @@ pub fn add(name: &str) -> io::Result<()> {
         let dst = cstr(&t)?;
         // SAFETY: NUL-terminated strings that outlive the call; a bind takes
         // no filesystem type or data.
-        check(unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), c"none".as_ptr(), libc::MS_BIND, std::ptr::null()) })
+        check(unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                c"none".as_ptr(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        })
     })
     .join()
     .unwrap_or_else(|_| Err(io::Error::other("netns thread panicked")));
