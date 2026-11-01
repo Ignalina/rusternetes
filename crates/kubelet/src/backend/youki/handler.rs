@@ -308,8 +308,16 @@ pub fn prepare(
     handlers: &Path,
     seccomp_root: &Path,
 ) -> Result<Option<Record>> {
-    let _ = (config, handlers, seccomp_root);
-    Ok(None) // RED: not applied yet
+    let Some(name) = config
+        .host_config
+        .as_ref()
+        .and_then(|h| h.runtime_handler.clone())
+        .filter(|h| !h.is_empty())
+    else {
+        return Ok(None);
+    };
+    let h = load(handlers, &name)?;
+    apply(&name, &h, config, seccomp_root).map(Some)
 }
 
 #[cfg(test)]

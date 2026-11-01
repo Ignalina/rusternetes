@@ -80,7 +80,45 @@ pub fn result_hook(
     started_unix: i64,
     finished_unix: i64,
 ) {
-    let _ = (bundle, log, id, exit_code, signal, started_unix, finished_unix); // RED: no hook yet
+    use super::handler::{Record, ResultRequest, RECORD_FILE};
+    let Ok(text) = std::fs::read(bundle.join(RECORD_FILE)) else {
+        return;
+    };
+    let answer = (|| -> anyhow::Result<String> {
+        let record: Record = serde_json::from_slice(&text)?;
+        let Some(sock) = record.result_socket.clone() else {
+            return Ok(String::new());
+        };
+        let req = ResultRequest {
+            container: id.to_string(),
+            record,
+            exit_code,
+            signal,
+            started_unix,
+            finished_unix,
+        };
+        let mut s = std::os::unix::net::UnixStream::connect(&sock)
+            .map_err(|e| anyhow::anyhow!("no result hook at {}: {e}", sock.display()))?;
+        s.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
+        s.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+        s.write_all(&serde_json::to_vec(&req)?)?;
+        s.shutdown(std::net::Shutdown::Write)?;
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut s, &mut out)?;
+        if out.is_empty() {
+            anyhow::bail!("the result hook at {} answered nothing", sock.display());
+        }
+        Ok(out)
+    })();
+    let line = match answer {
+        Ok(a) if a.is_empty() => return,
+        Ok(a) if a.ends_with('\n') => a,
+        Ok(a) => a + "\n",
+        Err(e) => format!("heimdall-refused: {e:#}\n"),
+    };
+    if let Ok(mut f) = append(log) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 fn devnull() -> std::io::Result<OwnedFd> {
