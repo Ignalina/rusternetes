@@ -253,7 +253,10 @@ async fn get_node_container_logs(
         .ok_or_else(|| anyhow::anyhow!("node {} has no InternalIP", node_name))?;
     let mut url = format!(
         "http://{}:10250/containerLogs/{}/{}/{}",
-        ip, pod.metadata.namespace.as_deref().unwrap_or("default"), pod.metadata.name, container_name
+        ip,
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name,
+        container_name
     );
     if let Some(t) = query.tail_lines {
         url.push_str(&format!("?tailLines={}", t));

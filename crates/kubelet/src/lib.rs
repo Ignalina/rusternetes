@@ -138,7 +138,11 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
 /// `pods/log` for pods on any node.
 async fn container_logs(
     backend: Arc<dyn backend::ContainerBackend>,
-    axum::extract::Path((_namespace, pod, container)): axum::extract::Path<(String, String, String)>,
+    axum::extract::Path((_namespace, pod, container)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> std::result::Result<String, (axum::http::StatusCode, String)> {
     use futures::StreamExt;
@@ -146,7 +150,10 @@ async fn container_logs(
     let opts = backend::LogsOptions {
         stdout: true,
         stderr: true,
-        tail: q.get("tailLines").cloned().unwrap_or_else(|| "all".to_string()),
+        tail: q
+            .get("tailLines")
+            .cloned()
+            .unwrap_or_else(|| "all".to_string()),
     };
     let mut out = String::new();
     let mut stream = backend.logs(&name, opts);
