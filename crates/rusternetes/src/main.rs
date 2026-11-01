@@ -192,8 +192,14 @@ async fn run() -> Result<()> {
     info!("Storage initialized, starting components...");
     let on = |c: &str| args.components.iter().any(|x| x == c);
     for c in &args.components {
-        if !["api-server", "scheduler", "controller-manager", "kubelet", "kube-proxy"]
-            .contains(&c.as_str())
+        if ![
+            "api-server",
+            "scheduler",
+            "controller-manager",
+            "kubelet",
+            "kube-proxy",
+        ]
+        .contains(&c.as_str())
         {
             anyhow::bail!("Unknown component: {}", c);
         }
