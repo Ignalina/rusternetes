@@ -238,6 +238,34 @@ impl StorageBackend {
         StorageBackend::Memory(Arc::new(MemoryStorage::new()))
     }
 
+    /// The same store under another encryption config (a second handle; the
+    /// etcd client and the redb store are shared).
+    pub fn clone_with_encryption(&self, t: Arc<EncryptionTransformer>) -> Result<Self> {
+        match self {
+            StorageBackend::Etcd(s) => Ok(StorageBackend::Etcd(s.with_encryption(t))),
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Ok(StorageBackend::Redb(s.with_encryption(t))),
+            _ => Err(rusternetes_common::Error::Storage(
+                "--encryption-provider-config needs the etcd or redb storage backend".into(),
+            )),
+        }
+    }
+
+    /// **Re-encrypt**: every value of the encrypted resources not stored by the
+    /// write provider (a key rotated out of first place, plaintext from before)
+    /// is written again under it, in place, only if nobody changed it meanwhile
+    /// (compare-and-swap on its revision). Idempotent: a pass that is cut short
+    /// (a restart) is resumed by the next one. Progress is logged every 100
+    /// values. Without encryption: an empty report.
+    pub async fn reencrypt(&self) -> Result<ReencryptReport> {
+        match self {
+            StorageBackend::Etcd(s) => s.reencrypt().await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => s.reencrypt().await,
+            _ => Ok(ReencryptReport::default()),
+        }
+    }
+
     /// Encrypt values at rest (`--encryption-provider-config`): written
     /// encrypted by the transformer's resources, read back through it. Only
     /// the etcd and redb backends store encrypted values; the others refuse
@@ -440,6 +468,46 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Redb(s) => AuthzStorage::list(s, namespace).await,
             StorageBackend::Memory(s) => AuthzStorage::list(s.as_ref(), namespace).await,
         }
+    }
+}
+
+/// The ConfigMap (kube-system) a re-encrypt pass leaves its census in.
+pub const CENSUS_CONFIGMAP: &str = "rusternetes-encryption-census";
+
+/// What one re-encrypt pass ([`StorageBackend::reencrypt`]) saw and did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReencryptReport {
+    /// What a write stores now (`aesgcm:<key>`).
+    pub write: String,
+    /// Values of the transformed resources scanned.
+    pub scanned: usize,
+    /// Rewritten under the write provider in this pass.
+    pub rewritten: usize,
+    /// Changed by someone else while this pass read them (the next pass sees them again).
+    pub conflicts: usize,
+    /// How every scanned value is stored after the pass (`aesgcm:k2` -> n, `plaintext` -> n).
+    pub census: std::collections::BTreeMap<String, usize>,
+}
+
+impl ReencryptReport {
+    /// `aesgcm:k2=11 plaintext=1`.
+    pub fn census_line(&self) -> String {
+        self.census.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The census as ConfigMap kube-system/[`CENSUS_CONFIGMAP`]: `write`, `census`, one
+    /// entry per label, `at` and `by` (the control plane that counted).
+    pub fn configmap(&self, by: &str, at: &str) -> serde_json::Value {
+        let mut data = serde_json::Map::new();
+        data.insert("write".into(), self.write.clone().into());
+        data.insert("census".into(), self.census_line().into());
+        for (k, n) in &self.census {
+            data.insert(k.replace(':', "."), n.to_string().into());
+        }
+        data.insert("at".into(), at.into());
+        data.insert("by".into(), by.into());
+        serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": CENSUS_CONFIGMAP, "namespace": "kube-system"}, "data": data})
     }
 }
 

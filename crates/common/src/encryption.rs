@@ -443,6 +443,39 @@ impl EncryptionTransformer {
         }
     }
 
+    /// The storage prefixes of the transformed resources (`/registry/secrets/`),
+    /// or `/registry/` when every resource is (`*.*`).
+    pub fn prefixes(&self) -> Vec<String> {
+        if self.all.is_some() {
+            return vec!["/registry/".into()];
+        }
+        let mut v: Vec<String> = self.resources.keys().map(|r| format!("/registry/{r}/")).collect();
+        v.sort();
+        v
+    }
+
+    /// How `stored` is stored: `aesgcm:<key>`, `plaintext`, or `unknown:<prefix>`.
+    pub fn label(stored: &[u8]) -> String {
+        if let Some(rest) = stored.strip_prefix(b"k8s:enc:aesgcm:v1:".as_slice()) {
+            let id = rest.split(|b| *b == b':').next().unwrap_or_default();
+            return format!("aesgcm:{}", String::from_utf8_lossy(id));
+        }
+        if stored.starts_with(ENCRYPTED_PREFIX) {
+            let end = stored.len().min(40);
+            return format!("unknown:{}", String::from_utf8_lossy(&stored[..end]));
+        }
+        "plaintext".into()
+    }
+
+    /// The label of what the write provider of `key` stores (`aesgcm:<key>`
+    /// or `plaintext`).
+    pub fn write_label(&self, key: &str) -> String {
+        match self.chain(key) {
+            Some(c) if !c.write().prefix().is_empty() => format!("aesgcm:{}", c.write().name()),
+            _ => "plaintext".into(),
+        }
+    }
+
     /// Was `stored` written by the provider that writes now (nothing to
     /// rewrite after a rotation)?
     pub fn is_current(&self, key: &str, stored: &[u8]) -> bool {
@@ -587,6 +620,19 @@ mod tests {
         let all = t(&format!("apiVersion: apiserver.config.k8s.io/v1\nkind: EncryptionConfiguration\nresources:\n- resources: ['*.*']\n  providers:\n  - aesgcm:\n      keys:\n      - name: a\n        secret: {k}\n  - identity: {{}}\n"));
         assert!(all.applies(S) && all.applies("/registry/pods/a/b"));
         assert!(!all.applies("/rusternetes/leader/control-plane"), "not a resource key");
+    }
+
+    #[test]
+    fn labels_prefixes_and_the_write_label() {
+        let (k1, k2) = (AesGcmProvider::generate_key(), AesGcmProvider::generate_key());
+        let tr = t(&cfg(&[("k2", k2), ("k1", k1)], true));
+        assert_eq!(tr.prefixes(), vec!["/registry/secrets/".to_string()]);
+        assert_eq!(tr.write_label(S), "aesgcm:k2");
+        assert_eq!(tr.write_label("/registry/pods/a/b"), "plaintext");
+        let v1 = t(&cfg(&[("k1", k1)], true)).encode(S, b"{}").unwrap();
+        assert_eq!(EncryptionTransformer::label(&v1), "aesgcm:k1");
+        assert_eq!(EncryptionTransformer::label(b"{}"), "plaintext");
+        assert!(EncryptionTransformer::label(b"k8s:enc:kms:v2:x:").starts_with("unknown:"));
     }
 
     #[test]

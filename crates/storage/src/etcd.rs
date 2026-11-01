@@ -79,6 +79,25 @@ impl EtcdStorage {
         })
     }
 
+    /// A second handle on the same client, under `t`.
+    pub fn with_encryption(&self, t: std::sync::Arc<crate::EncryptionTransformer>) -> Self {
+        Self {
+            client: self.client.clone(),
+            encryption: Some(t),
+        }
+    }
+
+    /// See [`crate::StorageBackend::reencrypt`].
+    pub async fn reencrypt(&self) -> Result<crate::ReencryptReport> {
+        let mut rep = crate::ReencryptReport::default();
+        let Some(t) = &self.encryption else {
+            return Ok(rep);
+        };
+        // RED: not implemented yet
+        let _ = t;
+        Ok(rep)
+    }
+
     /// Encrypt values at rest with `t` (`--encryption-provider-config`).
     pub fn set_encryption(&mut self, t: std::sync::Arc<crate::EncryptionTransformer>) {
         self.encryption = Some(t);
