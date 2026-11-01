@@ -45,15 +45,42 @@ pub fn write_exit(path: &Path, exit_code: i64, error: Option<String>) {
 }
 
 fn wait_exit_code(pid: Pid) -> i64 {
+    wait_outcome(pid).0
+}
+
+/// `(Docker exit code, exit code, signal)` of `pid`.
+fn wait_outcome(pid: Pid) -> (i64, Option<i64>, Option<i32>) {
     loop {
         match waitpid(pid, None) {
-            Ok(WaitStatus::Exited(_, code)) => return code as i64,
-            Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i64,
+            Ok(WaitStatus::Exited(_, code)) => return (code as i64, Some(code as i64), None),
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                return (128 + sig as i64, None, Some(sig as i32))
+            }
             Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => return 255,
+            Err(_) => return (255, None, None),
         }
     }
+}
+
+/// The RuntimeClass result hook: when the kubelet left a handler record
+/// naming a result socket in the bundle, send it the [`ResultRequest`]
+/// (one JSON object, then end of stream) and append its answer to the
+/// container's log, before the exit file is written (so a log read after the
+/// container is seen terminated has it). A hook that cannot be reached is
+/// named in the log (`heimdall-refused: ...`); the container's exit stands.
+///
+/// [`ResultRequest`]: super::handler::ResultRequest
+pub fn result_hook(
+    bundle: &Path,
+    log: &Path,
+    id: &str,
+    exit_code: Option<i64>,
+    signal: Option<i32>,
+    started_unix: i64,
+    finished_unix: i64,
+) {
+    let _ = (bundle, log, id, exit_code, signal, started_unix, finished_unix); // RED: no hook yet
 }
 
 fn devnull() -> std::io::Result<OwnedFd> {
@@ -95,6 +122,7 @@ fn create(state: PathBuf, id: &str, bundle: PathBuf, log: &Path, exit: &Path) ->
     let _ = nix::unistd::setsid();
     let built = (|| -> anyhow::Result<i32> {
         let log = append(log)?;
+        let bundle = bundle.clone();
         let container = ContainerBuilder::new(id.to_string(), SyscallType::default())
             .with_root_path(state)?
             .with_stdin(devnull()?)
@@ -121,7 +149,17 @@ fn create(state: PathBuf, id: &str, bundle: PathBuf, log: &Path, exit: &Path) ->
             return 1;
         }
     };
-    let code = wait_exit_code(Pid::from_raw(pid));
+    let started = chrono::Utc::now().timestamp();
+    let (code, exit_code, signal) = wait_outcome(Pid::from_raw(pid));
+    result_hook(
+        &bundle,
+        log,
+        id,
+        exit_code,
+        signal,
+        started,
+        chrono::Utc::now().timestamp(),
+    );
     write_exit(exit, code, None);
     0
 }
@@ -186,5 +224,89 @@ fn exec(state: PathBuf, id: &str, args: &Path, out: &Path, err: &Path, exit: &Pa
             write_exit(exit, code, Some(msg));
             code as i32
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::youki::handler::{Record, ResultRequest, RECORD_FILE};
+
+    fn record(sock: Option<PathBuf>) -> Record {
+        Record {
+            handler: "heimdall".into(),
+            result_socket: sock,
+            image: "busybox@sha256:00".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_result_hook_gets_the_request_and_its_answer_lands_in_the_log() {
+        let d = tempfile::tempdir().unwrap();
+        let sock = d.path().join("k8s.sock");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        l.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            // A hook that never calls must fail the test, not hang it.
+            let t0 = std::time::Instant::now();
+            let mut s = loop {
+                match l.accept() {
+                    Ok((s, _)) => break s,
+                    Err(_) if t0.elapsed() < std::time::Duration::from_secs(10) => {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    Err(e) => return Err(format!("the hook never called: {e}")),
+                }
+            };
+            s.set_nonblocking(false).unwrap();
+            let mut req = String::new();
+            std::io::Read::read_to_string(&mut s, &mut req).unwrap();
+            let req: ResultRequest = serde_json::from_str(&req).unwrap();
+            s.write_all(b"heimdall-features: {}\nheimdall-signed-result: AAAA\n").unwrap();
+            Ok(req)
+        });
+        std::fs::write(
+            d.path().join(RECORD_FILE),
+            serde_json::to_vec(&record(Some(sock))).unwrap(),
+        )
+        .unwrap();
+        let log = d.path().join("output.log");
+        std::fs::write(&log, "job output\n").unwrap();
+        result_hook(d.path(), &log, "c1", Some(0), None, 10, 12);
+        let req = server.join().unwrap().unwrap();
+        assert_eq!(req.container, "c1");
+        assert_eq!(req.record.handler, "heimdall");
+        assert_eq!((req.exit_code, req.signal), (Some(0), None));
+        assert_eq!((req.started_unix, req.finished_unix), (10, 12));
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "job output\nheimdall-features: {}\nheimdall-signed-result: AAAA\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_result_hook_is_named_in_the_log() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join(RECORD_FILE),
+            serde_json::to_vec(&record(Some(d.path().join("absent.sock")))).unwrap(),
+        )
+        .unwrap();
+        let log = d.path().join("output.log");
+        result_hook(d.path(), &log, "c1", None, Some(9), 1, 2);
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.starts_with("heimdall-refused: no result hook at "), "{text}");
+    }
+
+    #[test]
+    fn no_record_or_no_socket_writes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("output.log");
+        result_hook(d.path(), &log, "c1", Some(0), None, 1, 2);
+        assert!(!log.exists());
+        std::fs::write(d.path().join(RECORD_FILE), serde_json::to_vec(&record(None)).unwrap()).unwrap();
+        result_hook(d.path(), &log, "c1", Some(0), None, 1, 2);
+        assert!(!log.exists());
     }
 }

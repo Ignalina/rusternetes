@@ -20,6 +20,7 @@
 //! [`shim`]). Pods get their network from CNI: the kubelet creates the pod
 //! network namespace and containers join it, so no pause container is used.
 
+pub mod handler;
 pub mod image;
 pub mod shim;
 pub mod spec;
@@ -447,6 +448,15 @@ impl Inner {
                 existing.id
             );
         }
+        // The pod's RuntimeClass handler, applied before anything else reads
+        // the config (it can change the network, the mounts and the profile).
+        let mut config = config.clone();
+        let record = handler::prepare(
+            &mut config,
+            &handler::handlers_dir(),
+            &crate::seccomp::profile_root(),
+        )?;
+        let config = &config;
         let image_ref = config
             .image
             .clone()
@@ -477,6 +487,9 @@ impl Inner {
             };
             overlay.create()?;
             fs::create_dir_all(dir.join("exec"))?;
+            if let Some(r) = &record {
+                image::write_json(&dir.join(handler::RECORD_FILE), r)?;
+            }
             let opts = overlay.mount_data();
             nix::mount::mount(
                 Some("overlay"),
