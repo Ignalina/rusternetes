@@ -93,8 +93,63 @@ impl EtcdStorage {
         let Some(t) = &self.encryption else {
             return Ok(rep);
         };
-        // RED: not implemented yet
-        let _ = t;
+        let mut client = self.client.clone();
+        for prefix in t.prefixes() {
+            rep.write = t.write_label(&format!("{prefix}x/y"));
+            let mut end = prefix.as_bytes().to_vec();
+            if let Some(last) = end.last_mut() {
+                *last += 1;
+            }
+            let mut from = prefix.as_bytes().to_vec();
+            loop {
+                let resp = client
+                    .get(from.clone(), Some(GetOptions::new().with_range(end.clone()).with_limit(500)))
+                    .await
+                    .map_err(|e| Error::Storage(format!("re-encrypt: range {prefix}: {e}")))?;
+                for kv in resp.kvs() {
+                    let key = kv.key_str().map_err(|e| Error::Storage(format!("re-encrypt: key: {e}")))?.to_string();
+                    rep.scanned += 1;
+                    let stored = kv.value();
+                    if t.is_current(&key, stored) {
+                        *rep.census.entry(crate::EncryptionTransformer::label(stored)).or_default() += 1;
+                        continue;
+                    }
+                    let new = match t.decode(&key, stored).and_then(|p| t.encode(&key, &p)) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::warn!("re-encrypt: {key}: {e:#}");
+                            *rep.census.entry("unreadable".into()).or_default() += 1;
+                            continue;
+                        }
+                    };
+                    let txn = etcd_client::Txn::new()
+                        .when(vec![Compare::mod_revision(key.as_str(), CompareOp::Equal, kv.mod_revision())])
+                        .and_then(vec![TxnOp::put(key.as_str(), new.clone(), None)]);
+                    let ok = client
+                        .txn(txn)
+                        .await
+                        .map_err(|e| Error::Storage(format!("re-encrypt: {key}: {e}")))?
+                        .succeeded();
+                    if ok {
+                        rep.rewritten += 1;
+                        *rep.census.entry(crate::EncryptionTransformer::label(&new)).or_default() += 1;
+                        if rep.rewritten % 100 == 0 {
+                            info!("re-encrypt: {} rewritten under {} so far ({} scanned)", rep.rewritten, rep.write, rep.scanned);
+                        }
+                    } else {
+                        rep.conflicts += 1;
+                        *rep.census.entry(crate::EncryptionTransformer::label(stored)).or_default() += 1;
+                    }
+                }
+                match resp.kvs().last() {
+                    Some(last) if resp.more() => {
+                        from = last.key().to_vec();
+                        from.push(0);
+                    }
+                    _ => break,
+                }
+            }
+        }
         Ok(rep)
     }
 

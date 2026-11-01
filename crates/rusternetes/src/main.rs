@@ -576,8 +576,15 @@ async fn run() -> Result<()> {
         sync_interval: args.sync_interval,
     };
     let (run_sched, run_cm) = (on("scheduler"), on("controller-manager"));
+    let reenc = (encryption.is_some() && run_cm).then(|| (storage.clone(), args.node_name.clone()));
     let start_sched_cm = move || {
         let mut started: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
+        // With encryption at rest, the controller manager (one per cluster: the lease
+        // holder) keeps every value under the write provider: a re-encrypt pass now and
+        // every 30 s, its census in ConfigMap kube-system/rusternetes-encryption-census.
+        if let Some((st, node)) = reenc.clone() {
+            tokio::spawn(reencrypt_loop(st, node));
+        }
         if run_sched {
             started.push(("kube-scheduler", tokio::spawn(async move {
                 if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
@@ -740,6 +747,48 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The re-encrypt loop ([`StorageBackend::reencrypt`]): a pass every 30 s; the census
+/// ConfigMap is written when it changed, or every 10 minutes.
+async fn reencrypt_loop(storage: Arc<StorageBackend>, node: String) {
+    use rusternetes_storage::Storage as _;
+    let key = rusternetes_storage::build_key("configmaps", Some("kube-system"), rusternetes_storage::CENSUS_CONFIGMAP);
+    let mut last: Option<(String, String)> = None;
+    let mut written_at = std::time::Instant::now();
+    loop {
+        match storage.reencrypt().await {
+            Ok(r) => {
+                if r.rewritten > 0 || r.conflicts > 0 {
+                    info!(
+                        "re-encrypt: {} rewritten under {}, {} changed meanwhile (next pass), {} scanned; census {}",
+                        r.rewritten, r.write, r.conflicts, r.scanned, r.census_line()
+                    );
+                }
+                let now = (r.write.clone(), r.census_line());
+                if last.as_ref() != Some(&now) || written_at.elapsed() > std::time::Duration::from_secs(600) {
+                    let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                    let cm = r.configmap(&node, &at);
+                    let res = match storage.update_raw(&key, &cm).await {
+                        Err(rusternetes_common::Error::NotFound(_)) => storage.create(&key, &cm).await.map(|_: serde_json::Value| ()),
+                        other => other,
+                    };
+                    match res {
+                        Ok(()) => {
+                            if last.as_ref() != Some(&now) {
+                                info!("re-encrypt census: write {}; {}", now.0, now.1);
+                            }
+                            last = Some(now);
+                            written_at = std::time::Instant::now();
+                        }
+                        Err(e) => warn!("re-encrypt census: {e}"),
+                    }
+                }
+            }
+            Err(e) => warn!("re-encrypt pass: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
 }
 
 /// What a node certificate reads of the served store: values encrypted at

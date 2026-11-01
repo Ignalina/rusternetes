@@ -79,8 +79,40 @@ impl RedbStorage {
         let Some(t) = &self.encryption else {
             return Ok(rep);
         };
-        // RED: not implemented yet
-        let _ = t;
+        for prefix in t.prefixes() {
+            rep.write = t.write_label(&format!("{prefix}x/y"));
+            for (k, kv) in self.store.list(&prefix) {
+                let key = key_str(&k);
+                rep.scanned += 1;
+                if t.is_current(&key, &kv.value) {
+                    *rep.census.entry(crate::EncryptionTransformer::label(&kv.value)).or_default() += 1;
+                    continue;
+                }
+                let new = match t.decode(&key, &kv.value).and_then(|p| t.encode(&key, &p)) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("re-encrypt: {key}: {e:#}");
+                        *rep.census.entry("unreadable".into()).or_default() += 1;
+                        continue;
+                    }
+                };
+                let (kk, nn, rev) = (key.clone(), new.clone(), kv.mod_rev);
+                match self.blocking(move |s| s.update(&kk, &nn, Some(rev))).await {
+                    Ok(_) => {
+                        rep.rewritten += 1;
+                        *rep.census.entry(crate::EncryptionTransformer::label(&new)).or_default() += 1;
+                        if rep.rewritten % 100 == 0 {
+                            info!("re-encrypt: {} rewritten under {} so far ({} scanned)", rep.rewritten, rep.write, rep.scanned);
+                        }
+                    }
+                    Err(StoreError::Conflict { .. }) | Err(StoreError::NotFound(_)) => {
+                        rep.conflicts += 1;
+                        *rep.census.entry(crate::EncryptionTransformer::label(&kv.value)).or_default() += 1;
+                    }
+                    Err(e) => return Err(map_err(&key, e)),
+                }
+            }
+        }
         Ok(rep)
     }
 
