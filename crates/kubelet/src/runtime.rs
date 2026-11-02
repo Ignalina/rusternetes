@@ -95,7 +95,7 @@ pub struct ContainerRuntime {
     cluster_dns: String,
     cluster_domain: String,
     network: String,
-    cni: Option<CniRuntime>,
+    cni: Option<Arc<CniRuntime>>,
     use_cni: bool,
     /// Whether the daemon accepts `UtsMode: "container:<id>"`. Podman does;
     /// Docker rejects it outright. See [`Self::detect_uts_container_mode`].
@@ -363,7 +363,7 @@ impl ContainerRuntime {
             cluster_dns,
             cluster_domain,
             network,
-            cni,
+            cni: cni.map(Arc::new),
             use_cni,
             supports_uts_container_mode,
             kubernetes_service_host,
@@ -382,7 +382,7 @@ impl ContainerRuntime {
     /// Use this CNI runtime and these network namespaces (unit tests).
     #[cfg(test)]
     pub(crate) fn with_cni(mut self, cni: CniRuntime, netns: Arc<dyn NetnsOps>) -> Self {
-        self.cni = Some(cni);
+        self.cni = Some(Arc::new(cni));
         self.use_cni = true;
         self.netns = netns;
         self
@@ -567,7 +567,7 @@ impl ContainerRuntime {
                 "Stale sandbox network {} for pod {} (an earlier start or kubelet): CNI DEL and a fresh namespace before ADD",
                 netns_name, pod_name
             );
-            if let Err(e) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+            if let Err(e) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                 warn!("CNI DEL of the stale network of pod {}: {}", pod_name, e);
             }
             if let Err(e) = self.netns.del(&netns_name) {
@@ -581,7 +581,7 @@ impl ContainerRuntime {
             .with_context(|| format!("network namespace {netns_name}"))?;
 
         let args = cni_args(pod, pod_name);
-        match cni.setup_network_with_args(pod_name, &netns_path, "eth0", None, Some(&args)) {
+        match cni.setup_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None, Some(args)).await {
             Ok(result) => {
                 info!(
                     "CNI network setup successful for pod {}: IP={:?}",
@@ -591,7 +591,7 @@ impl ContainerRuntime {
             }
             Err(e) => {
                 warn!("CNI ADD failed for pod {}: {}; CNI DEL and the namespace removed", pod_name, e);
-                if let Err(d) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+                if let Err(d) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                     warn!("CNI DEL after the failed ADD of pod {}: {}", pod_name, d);
                 }
                 let _ = self.netns.del(&netns_name);
@@ -614,7 +614,7 @@ impl ContainerRuntime {
 
         // Teardown CNI networking
         if let Some(cni) = &self.cni {
-            if let Err(e) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+            if let Err(e) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                 warn!("Failed to teardown CNI network for pod {}: {}", pod_name, e);
                 // Continue with namespace deletion even if CNI teardown fails
             } else {
@@ -4964,22 +4964,9 @@ impl ContainerRuntime {
                     // Always use pause container's network namespace
                     Some(format!("container:{}_pause", pod_name))
                 },
-                // Share IPC and PID namespaces with pause container (K8s pod semantics)
-                ipc_mode: if !self.use_cni {
-                    Some(format!("container:{}_pause", pod_name))
-                } else {
-                    None
-                },
-                pid_mode: if pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.share_process_namespace)
-                    .unwrap_or(false)
-                {
-                    Some(format!("container:{}_pause", pod_name))
-                } else {
-                    None
-                },
+                // The IPC and PID namespaces: the host's, the pause container's, or its own.
+                ipc_mode: ipc_mode(pod, self.use_cni),
+                pid_mode: pid_mode(pod),
                 // Share UTS namespace with pause container so app containers
                 // inherit the pod hostname. Without this, containers get their
                 // container ID as hostname instead of the pod name.
@@ -8621,6 +8608,32 @@ impl Drop for StartInFlight {
 /// `spec.hostNetwork: true`.
 fn is_host_network(pod: &Pod) -> bool {
     pod.spec.as_ref().and_then(|s| s.host_network) == Some(true)
+}
+
+/// An app container's PID namespace: the node's for `spec.hostPID` (it
+/// used to be dropped: such a pod got its own namespace), the pause
+/// container's for `shareProcessNamespace`, else its own (None).
+fn pid_mode(pod: &Pod) -> Option<String> {
+    let spec = pod.spec.as_ref()?;
+    if spec.host_pid == Some(true) {
+        Some("host".to_string())
+    } else if spec.share_process_namespace == Some(true) {
+        Some(format!("container:{}_pause", pod.metadata.name))
+    } else {
+        None
+    }
+}
+
+/// An app container's IPC namespace: the node's for `spec.hostIPC`, else
+/// the pause container's where that container exists (no CNI), else its own.
+fn ipc_mode(pod: &Pod, use_cni: bool) -> Option<String> {
+    if pod.spec.as_ref().and_then(|s| s.host_ipc) == Some(true) {
+        Some("host".to_string())
+    } else if !use_cni {
+        Some(format!("container:{}_pause", pod.metadata.name))
+    } else {
+        None
+    }
 }
 
 /// The node's own IPv4 address, the pod IP of a host-network pod: the
@@ -12560,6 +12573,28 @@ mod csi_volume_tests {
 #[cfg(test)]
 mod host_network_and_cni_args_tests {
     use super::*;
+
+    fn pod_with(f: impl FnOnce(&mut rusternetes_common::resources::PodSpec)) -> Pod {
+        let mut pod = Pod::new("web", rusternetes_common::resources::PodSpec::default());
+        f(pod.spec.as_mut().unwrap());
+        pod
+    }
+
+    /// `spec.hostPID` and `spec.hostIPC` reach the runtime (they were dropped:
+    /// a hostPID pod got its own PID namespace and could not see the node's
+    /// processes); `shareProcessNamespace` joins the pause container.
+    #[test]
+    fn host_pid_and_host_ipc_reach_the_container_namespaces() {
+        assert_eq!(pid_mode(&pod_with(|s| s.host_pid = Some(true))).as_deref(), Some("host"));
+        assert_eq!(
+            pid_mode(&pod_with(|s| s.share_process_namespace = Some(true))).as_deref(),
+            Some("container:web_pause")
+        );
+        assert_eq!(pid_mode(&pod_with(|_| ())), None);
+        assert_eq!(ipc_mode(&pod_with(|s| s.host_ipc = Some(true)), true).as_deref(), Some("host"));
+        assert_eq!(ipc_mode(&pod_with(|_| ()), true), None);
+        assert_eq!(ipc_mode(&pod_with(|_| ()), false).as_deref(), Some("container:web_pause"));
+    }
 
     fn pod(json: serde_json::Value) -> Pod {
         serde_json::from_value(json).expect("pod")
