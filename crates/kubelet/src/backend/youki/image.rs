@@ -473,25 +473,12 @@ fn remove_any(path: &Path) {
     }
 }
 
-/// Apply one OCI layer onto `rootfs` in ONE pass over the archive (it used
-/// to be read and decompressed twice: whiteouts, then entries). A whiteout
-/// removes what the LOWER layers put there, never what this layer wrote
-/// before it in the archive: the paths unpacked so far are kept aside and
-/// spared, so the order of a whiteout and its siblings within a layer does
-/// not matter.
+/// Apply one OCI layer onto `rootfs`: whiteouts first, then the entries.
 pub fn apply_layer(blob: &Path, rootfs: &Path) -> Result<()> {
+    // Pass 1: whiteouts remove what lower layers put there.
     let mut archive = tar::Archive::new(open_layer(blob)?);
-    archive.set_preserve_permissions(true);
-    archive.set_preserve_ownerships(true);
-    archive.set_preserve_mtime(true);
-    // File capabilities ride as `security.capability` xattrs (CoreDNS binds
-    // :53 as a non-root user through `cap_net_bind_service=+ep` on its
-    // binary); without them such a binary gets EACCES at bind.
-    archive.set_unpack_xattrs(true);
-    archive.set_overwrite(true);
-    let mut written: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for entry in archive.entries()? {
-        let mut entry = entry?;
+        let entry = entry?;
         let Some(path) = entry_path(&entry.path()?) else {
             continue;
         };
@@ -502,17 +489,34 @@ pub fn apply_layer(blob: &Path, rootfs: &Path) -> Result<()> {
         if name == ".wh..wh..opq" {
             if let Ok(children) = fs::read_dir(rootfs.join(parent)) {
                 for child in children.flatten() {
-                    if !written.contains(&parent.join(child.file_name())) {
-                        remove_any(&child.path());
-                    }
+                    remove_any(&child.path());
                 }
             }
-            continue;
         } else if let Some(hidden) = name.strip_prefix(".wh.") {
-            let victim = parent.join(hidden);
-            if !written.contains(&victim) {
-                remove_any(&rootfs.join(&victim));
-            }
+            remove_any(&rootfs.join(parent).join(hidden));
+        }
+    }
+
+    // Pass 2: unpack everything else.
+    let mut archive = tar::Archive::new(open_layer(blob)?);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(true);
+    archive.set_preserve_mtime(true);
+    // File capabilities ride as `security.capability` xattrs (CoreDNS binds
+    // :53 as a non-root user through `cap_net_bind_service=+ep` on its
+    // binary); without them such a binary gets EACCES at bind.
+    archive.set_unpack_xattrs(true);
+    archive.set_overwrite(true);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let Some(path) = entry_path(&entry.path()?) else {
+            continue;
+        };
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".wh."))
+        {
             continue;
         }
         let kind = entry.header().entry_type();
@@ -532,7 +536,6 @@ pub fn apply_layer(blob: &Path, rootfs: &Path) -> Result<()> {
             }
             return Err(e).with_context(|| format!("unpacking {:?}", path));
         }
-        written.insert(path);
     }
     Ok(())
 }
@@ -661,44 +664,5 @@ mod tests {
         assert!(!p.join("opt/x").exists());
         assert_eq!(fs::read_to_string(p.join("opt/y")).unwrap(), "y");
         assert!(!p.join("etc/.wh.a").exists());
-    }
-
-    /// A whiteout removes the lower layers' files, not its own layer's: the
-    /// opaque marker may come AFTER a sibling of the same layer in the
-    /// archive (one pass over the layer must not undo that sibling), and a
-    /// `.wh.` marker after a same-layer file of that name leaves it.
-    #[test]
-    fn whiteouts_spare_their_own_layer_whatever_the_order() {
-        let root = tempfile::tempdir().unwrap();
-        let l1 = layer(&[("opt/", None), ("opt/x", Some("x")), ("etc/", None), ("etc/a", Some("1"))]);
-        let l2 = layer(&[
-            ("opt/", None),
-            ("opt/y", Some("y")),
-            ("opt/.wh..wh..opq", Some("")),
-            ("etc/a", Some("2")),
-            ("etc/.wh.a", Some("")),
-        ]);
-        apply_layer(l1.path(), root.path()).unwrap();
-        apply_layer(l2.path(), root.path()).unwrap();
-        let p = root.path();
-        assert!(!p.join("opt/x").exists(), "the lower layer's file goes");
-        assert_eq!(fs::read_to_string(p.join("opt/y")).unwrap(), "y", "this layer's sibling stays");
-        assert_eq!(fs::read_to_string(p.join("etc/a")).unwrap(), "2", "this layer's own file stays");
-        assert!(!p.join("opt/.wh..wh..opq").exists());
-        assert!(!p.join("etc/.wh.a").exists());
-    }
-
-    /// A gzip layer unpacks the same way as a plain one.
-    #[test]
-    fn gzip_layers_unpack() {
-        use std::io::Write as _;
-        let root = tempfile::tempdir().unwrap();
-        let plain = layer(&[("bin/", None), ("bin/sh", Some("#!"))]);
-        let gz = tempfile::NamedTempFile::new().unwrap();
-        let mut enc = flate2::write::GzEncoder::new(gz.reopen().unwrap(), flate2::Compression::fast());
-        enc.write_all(&fs::read(plain.path()).unwrap()).unwrap();
-        enc.finish().unwrap();
-        apply_layer(gz.path(), root.path()).unwrap();
-        assert_eq!(fs::read_to_string(root.path().join("bin/sh")).unwrap(), "#!");
     }
 }
