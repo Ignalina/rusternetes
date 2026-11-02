@@ -29,14 +29,46 @@ const DEFAULT_PERIOD_SECS: i32 = 10;
 /// `attempt` counts the fast re-checks done since the pod last had every
 /// probed container Ready (0 for the first). `fallback` is the worker's
 /// normal timer; the answer is never longer than it.
-pub fn readiness_wait(
-    pod: &Pod,
-    attempt: u32,
-    fallback: Duration,
-    now: DateTime<Utc>,
-) -> Duration {
-    let _ = (pod, attempt, now);
-    fallback
+pub fn readiness_wait(pod: &Pod, attempt: u32, fallback: Duration, now: DateTime<Utc>) -> Duration {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return fallback;
+    }
+    let Some(spec) = pod.spec.as_ref() else {
+        return fallback;
+    };
+    let statuses = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref());
+    let mut wait: Option<Duration> = None;
+    for c in &spec.containers {
+        let Some(probe) = c.readiness_probe.as_ref() else {
+            continue;
+        };
+        let status = statuses.and_then(|v| v.iter().find(|s| s.name == c.name));
+        if status.map(|s| s.ready).unwrap_or(false) {
+            continue;
+        }
+        let period =
+            Duration::from_secs(probe.period_seconds.unwrap_or(DEFAULT_PERIOD_SECS).max(1) as u64);
+        let fast = FIRST_WAIT
+            .checked_mul(1u32 << attempt.min(16))
+            .unwrap_or(period)
+            .min(period);
+        // Not before initialDelaySeconds since the container started.
+        let delay = probe.initial_delay_seconds.unwrap_or(0).max(0) as i64;
+        let started = status.and_then(|s| match &s.state {
+            Some(ContainerState::Running { started_at }) => *started_at,
+            _ => None,
+        });
+        let until_delay = started
+            .map(|t| t + chrono::Duration::seconds(delay) - now)
+            .and_then(|d| d.to_std().ok())
+            .unwrap_or(Duration::ZERO);
+        let this = fast.max(until_delay);
+        wait = Some(wait.map_or(this, |w| w.min(this)));
+    }
+    wait.map_or(fallback, |w| w.min(fallback))
 }
 
 #[cfg(test)]
@@ -79,13 +111,18 @@ mod tests {
             "spec": {"containers": []}
         }))
         .unwrap();
-        pod.spec = Some(PodSpec { containers: vec![container], ..pod.spec.unwrap() });
+        pod.spec = Some(PodSpec {
+            containers: vec![container],
+            ..pod.spec.unwrap()
+        });
         if let Some(r) = ready {
             let mut cs: ContainerStatus =
                 serde_json::from_value(serde_json::json!({"name": "nginx", "ready": r, "restartCount": 0, "image": "nginx", "imageID": ""}))
                     .unwrap();
             cs.ready = r;
-            cs.state = Some(ContainerState::Running { started_at: started });
+            cs.state = Some(ContainerState::Running {
+                started_at: started,
+            });
             let mut st: PodStatus = serde_json::from_value(serde_json::json!({})).unwrap();
             st.container_statuses = Some(vec![cs]);
             pod.status = Some(st);
@@ -114,7 +151,10 @@ mod tests {
             p = pod(Some(probe(1, None)), Some(false), Some(t0));
         }
         let took = (t - t0).to_std().unwrap();
-        assert!(took <= Duration::from_millis(300), "Ready {took:?} after start");
+        assert!(
+            took <= Duration::from_millis(300),
+            "Ready {took:?} after start"
+        );
     }
 
     #[test]
@@ -140,7 +180,18 @@ mod tests {
     #[test]
     fn ready_or_unprobed_pods_keep_the_normal_timer() {
         let now: DateTime<Utc> = "2026-11-02T14:00:00Z".parse().unwrap();
-        assert_eq!(readiness_wait(&pod(Some(probe(1, None)), Some(true), Some(now)), 0, FALLBACK, now), FALLBACK);
-        assert_eq!(readiness_wait(&pod(None, None, None), 0, FALLBACK, now), FALLBACK);
+        assert_eq!(
+            readiness_wait(
+                &pod(Some(probe(1, None)), Some(true), Some(now)),
+                0,
+                FALLBACK,
+                now
+            ),
+            FALLBACK
+        );
+        assert_eq!(
+            readiness_wait(&pod(None, None, None), 0, FALLBACK, now),
+            FALLBACK
+        );
     }
 }

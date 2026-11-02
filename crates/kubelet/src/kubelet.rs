@@ -1261,14 +1261,16 @@ impl Kubelet {
         let node_name = self.node_name.clone();
 
         tokio::spawn(async move {
+            // The periodic fallback re-sync. While a readiness probe still
+            // has to pass, the worker looks again sooner (readiness_timing),
+            // so Ready is set when the probe passes, not on the next tick.
+            const FALLBACK: Duration = Duration::from_secs(5);
+            let mut next_wait = FALLBACK;
+            let mut fast_attempt = 0u32;
             // Per-pod worker loop — stays alive for the lifetime of the pod
             loop {
                 // Wait for signal (or timeout for periodic re-check)
-                let signaled = tokio::time::timeout(
-                    Duration::from_secs(5), // periodic fallback re-sync
-                    rx.recv(),
-                )
-                .await;
+                let signaled = tokio::time::timeout(next_wait, rx.recv()).await;
 
                 // If channel closed, pod worker is being removed
                 if matches!(signaled, Ok(None)) {
@@ -1302,6 +1304,17 @@ impl Kubelet {
 
                 match pod {
                     Some(pod) => {
+                        next_wait = crate::readiness_timing::readiness_wait(
+                            &pod,
+                            fast_attempt,
+                            FALLBACK,
+                            chrono::Utc::now(),
+                        );
+                        fast_attempt = if next_wait < FALLBACK {
+                            fast_attempt + 1
+                        } else {
+                            0
+                        };
                         // Use a longer timeout for pods being deleted — preStop hooks
                         // plus container stop grace period can exceed 30s.
                         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
