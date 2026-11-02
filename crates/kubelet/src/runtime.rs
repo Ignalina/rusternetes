@@ -388,6 +388,27 @@ impl ContainerRuntime {
         self
     }
 
+    /// [`NetnsOps::add`] on the blocking pool: the node's `netns::add`
+    /// unshares on a thread and joins it, and `del` unmounts — neither may
+    /// hold a tokio worker (one on a 1-CPU node) — see the test
+    /// `a_slow_netns_does_not_stall_the_runtime`.
+    async fn netns_add(&self, name: &str) -> std::io::Result<()> {
+        let netns = Arc::clone(&self.netns);
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || netns.add(&name))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("netns add task: {e}"))))
+    }
+
+    /// [`NetnsOps::del`] on the blocking pool (see [`Self::netns_add`]).
+    async fn netns_del(&self, name: &str) -> std::io::Result<()> {
+        let netns = Arc::clone(&self.netns);
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || netns.del(&name))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("netns del task: {e}"))))
+    }
+
     /// Use this CSI manager instead of the default one.
     #[allow(dead_code)] // used by the library and tests, not by the binary
     pub fn with_csi(mut self, csi: Arc<crate::csi::CsiManager>) -> Self {
@@ -570,14 +591,14 @@ impl ContainerRuntime {
             if let Err(e) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                 warn!("CNI DEL of the stale network of pod {}: {}", pod_name, e);
             }
-            if let Err(e) = self.netns.del(&netns_name) {
+            if let Err(e) = self.netns_del(&netns_name).await {
                 warn!("Failed to delete stale network namespace {}: {}", netns_name, e);
             }
         }
 
         info!("Setting up CNI network for pod: {}", pod_name);
-        self.netns
-            .add(&netns_name)
+        self.netns_add(&netns_name)
+            .await
             .with_context(|| format!("network namespace {netns_name}"))?;
 
         let args = cni_args(pod, pod_name);
@@ -594,7 +615,7 @@ impl ContainerRuntime {
                 if let Err(d) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                     warn!("CNI DEL after the failed ADD of pod {}: {}", pod_name, d);
                 }
-                let _ = self.netns.del(&netns_name);
+                let _ = self.netns_del(&netns_name).await;
                 Err(anyhow::anyhow!("CNI ADD: {e}"))
             }
         }
@@ -623,7 +644,7 @@ impl ContainerRuntime {
         }
 
         // Delete network namespace
-        match self.netns.del(&netns_name) {
+        match self.netns_del(&netns_name).await {
             Err(e) => warn!("Failed to delete network namespace {}: {}", netns_name, e),
             Ok(()) => info!("Deleted network namespace: {}", netns_name),
         }
@@ -968,10 +989,14 @@ impl ContainerRuntime {
         // Docker Desktop uses virtiofs which may cache writes. Instead of a global
         // sync (which flushes ALL filesystems), we sync_data just the pod's volume dir.
         {
+            // An fsync: off the tokio workers.
             let pod_vol_dir = format!("{}/{}", self.volumes_base_path, pod_name);
-            if let Ok(dir) = std::fs::File::open(&pod_vol_dir) {
-                let _ = dir.sync_all();
-            }
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(dir) = std::fs::File::open(&pod_vol_dir) {
+                    let _ = dir.sync_all();
+                }
+            })
+            .await;
         }
 
         // Get pod IP. For CNI mode, IP is available right after network setup.
@@ -1951,9 +1976,11 @@ impl ContainerRuntime {
             use std::os::unix::fs::PermissionsExt;
             for path in volume_paths.values() {
                 // Recursively chown to fsGroup
-                let _ = std::process::Command::new("chown")
+                // A child process: waited on asynchronously, never on a worker.
+                let _ = tokio::process::Command::new("chown")
                     .args(["-R", &format!(":{}", fs_group), path])
-                    .output();
+                    .output()
+                    .await;
 
                 // Set group bits to mirror owner bits on each file/directory.
                 // This matches real K8s behavior: if owner=r--, group becomes r--
@@ -12693,7 +12720,28 @@ exit 0
         _volumes: tempfile::TempDir,
     }
 
+    /// [`DirNetns`] whose `add` takes a second (the real one unshares on a
+    /// thread and joins it; a slow kernel is a slow join).
+    struct SlowNetns(DirNetns);
+
+    impl NetnsOps for SlowNetns {
+        fn add(&self, name: &str) -> std::io::Result<()> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            self.0.add(name)
+        }
+        fn del(&self, name: &str) -> std::io::Result<()> {
+            self.0.del(name)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.path(name)
+        }
+    }
+
     async fn runtime(root: &Path, backend: Arc<FakeBackend>) -> (ContainerRuntime, tempfile::TempDir) {
+        runtime_with(root, backend, Arc::new(DirNetns(root.join("netns")))).await
+    }
+
+    async fn runtime_with(root: &Path, backend: Arc<FakeBackend>, netns: Arc<dyn NetnsOps>) -> (ContainerRuntime, tempfile::TempDir) {
         let volumes = tempfile::tempdir().unwrap();
         let cni = CniRuntime::new(vec![root.join("bin")], root.join("net.d")).unwrap();
         let runtime = ContainerRuntime::with_backend(
@@ -12707,8 +12755,46 @@ exit 0
         )
         .await
         .unwrap()
-        .with_cni(cni, Arc::new(DirNetns(root.join("netns"))));
+        .with_cni(cni, netns);
         (runtime, volumes)
+    }
+
+    /// The sandbox namespace is made and removed off the tokio workers too
+    /// (`netns::add` unshares on a thread and joins it): a slow one must not
+    /// stop the runtime's other tasks — on a one-CPU node that is the API
+    /// server.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_netns_does_not_stall_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for d in ["bin", "net.d", "netns"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let plugin = root.join("bin/fakecni");
+        std::fs::write(&plugin, PLUGIN).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            root.join("net.d/10-fake.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"rusternetes","plugins":[{"type":"fakecni"}]}"#,
+        )
+        .unwrap();
+        let backend = Arc::new(FakeBackend::new("fake"));
+        let (runtime, _volumes) = runtime_with(&root, backend, Arc::new(SlowNetns(DirNetns(root.join("netns"))))).await;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                t.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let path = runtime.setup_pod_network(&pod()).await.unwrap();
+        let n = ticks.load(Ordering::SeqCst);
+        ticker.abort();
+        assert!(n >= 5, "the runtime ticked {n} times while the namespace was made (stalled)");
+        assert!(Path::new(&path).exists());
     }
 
     async fn env() -> Env {

@@ -306,8 +306,11 @@ fn main() -> Result<()> {
     // Built by hand rather than with `#[tokio::main]` so the worker threads get
     // a stack large enough for the kubelet's pod sync path — see
     // `worker_stack_size`. Everything else matches what the macro expands to.
+    // At least two workers: on a one-CPU node the default (one) let any
+    // blocking call stop the whole process — the API server included.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(rusternetes_common::async_runtime::worker_threads())
         .thread_stack_size(rusternetes_common::async_runtime::worker_stack_size())
         .build()?
         .block_on(run())

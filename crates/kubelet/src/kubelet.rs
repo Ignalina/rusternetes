@@ -540,7 +540,14 @@ impl Kubelet {
     /// Detect the node's internal IP address.
     /// In Docker, resolves the container hostname to get the network IP.
     /// Falls back to 127.0.0.1 if detection fails.
+    /// The node's InternalIP, found once: the `hostname -i` fallback is a
+    /// fork+exec, and this ran on every heartbeat (10 s) and every sync.
     fn detect_internal_ip() -> String {
+        static IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        IP.get_or_init(Self::detect_internal_ip_uncached).clone()
+    }
+
+    fn detect_internal_ip_uncached() -> String {
         // Try to resolve our own hostname to get the Docker network IP
         if let Ok(hostname) = std::env::var("HOSTNAME") {
             if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 0u16))

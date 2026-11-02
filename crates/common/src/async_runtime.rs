@@ -83,3 +83,27 @@ mod tests {
         }
     }
 }
+
+/// How many tokio workers the all-in-one runs: the CPUs, but never fewer
+/// than two, so one task that blocks (a child process waited on, an fsync)
+/// never idles the whole process on a one-CPU node.
+pub fn worker_threads() -> usize {
+    resolve_worker_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+}
+
+/// Testable core of [`worker_threads`].
+pub fn resolve_worker_threads(cpus: usize) -> usize {
+    cpus.max(2)
+}
+
+#[cfg(test)]
+mod worker_threads_tests {
+    use super::resolve_worker_threads;
+
+    #[test]
+    fn at_least_two_workers_whatever_the_cpu_count() {
+        assert_eq!(resolve_worker_threads(1), 2);
+        assert_eq!(resolve_worker_threads(2), 2);
+        assert_eq!(resolve_worker_threads(12), 12);
+    }
+}
