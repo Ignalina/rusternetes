@@ -21,6 +21,8 @@
 //! | tokenreviews, subjectaccessreviews | create |
 //! | configmaps `kube-system/<prefix><node>` (with [`ClusterAuthorizer::with_node_configmaps`]) | get any node's; create, update, patch its own (a node publishes facts its peers read, e.g. a WireGuard public key) |
 //!
+//! | custom resources named with [`ClusterAuthorizer::with_node_resources`] | `<plural>.<group>` (`--node-named-resource`): get/list/watch; create, update, patch (incl. status), delete of those named `<node>.<…>`; `<plural>.<group>=<label>` (`--node-status-resource`): get/list/watch; update, patch of the status of an object whose stored label `<label>` is the node |
+//!
 //! Everything else goes to RBAC, where `system:nodes` has no binding: 403.
 
 use std::collections::HashSet;
@@ -45,6 +47,13 @@ pub struct ClusterAuthorizer {
     rbac: RBACAuthorizer<StorageBackend>,
     /// `kube-system/<prefix><node>` ConfigMaps nodes publish (`--node-configmap-prefix`).
     node_configmap_prefix: Option<String>,
+    /// Custom resources a node writes when named `<node>.<…>`
+    /// (`--node-named-resource <plural>.<group>`): (group, plural).
+    node_named: Vec<(String, String)>,
+    /// Custom resources whose status a node writes when labelled
+    /// `<key>=<node>` (`--node-status-resource <plural>.<group>=<key>`):
+    /// (group, plural, label key).
+    node_status: Vec<(String, String, String)>,
 }
 
 /// The namespace of the ConfigMaps nodes publish.
@@ -52,7 +61,66 @@ pub const NODE_CONFIGMAP_NAMESPACE: &str = "kube-system";
 
 impl ClusterAuthorizer {
     pub fn new(storage: Arc<StorageBackend>) -> Self {
-        Self { rbac: RBACAuthorizer::new(storage.clone()), storage, node_configmap_prefix: None }
+        Self { rbac: RBACAuthorizer::new(storage.clone()), storage, node_configmap_prefix: None, node_named: Vec::new(), node_status: Vec::new() }
+    }
+
+    /// Custom resources nodes write themselves (cluster-scoped views of what
+    /// a node sees, e.g. tunnr's `tunnrdisks.disks.tunnr.io`):
+    ///
+    /// * `named` (`<plural>.<group>`): every node may get, list and watch
+    ///   them; create, update, patch (incl. status) and delete only those
+    ///   named `<node>.<…>`;
+    /// * `status` (`<plural>.<group>=<label key>`): every node may get, list
+    ///   and watch them; update and patch only the status of an object whose
+    ///   STORED label `<label key>` is the node (the label is the control
+    ///   plane's: a status write cannot change it); never create or delete.
+    ///
+    /// A spec that does not parse is left out.
+    pub fn with_node_resources(mut self, named: &[String], status: &[String]) -> Self {
+        let split = |r: &str| -> Option<(String, String)> {
+            let (plural, group) = r.trim().split_once('.')?;
+            (!plural.is_empty() && !group.is_empty()).then(|| (group.to_string(), plural.to_string()))
+        };
+        self.node_named = named.iter().filter_map(|r| split(r)).collect();
+        self.node_status = status
+            .iter()
+            .filter_map(|r| {
+                let (res, label) = r.split_once('=')?;
+                let (g, p) = split(res)?;
+                (!label.is_empty()).then(|| (g, p, label.to_string()))
+            })
+            .collect();
+        self
+    }
+
+    /// The rules of [`Self::with_node_resources`]: `Some(allowed)` for a
+    /// configured resource, `None` for anything else.
+    async fn node_resource(&self, node: &str, a: &RequestAttributes) -> Option<bool> {
+        let v = a.verb.as_str();
+        let read = matches!(v, "get" | "list" | "watch");
+        let sub = a.subresource.as_deref();
+        if self.node_named.iter().any(|(g, p)| *g == a.api_group && *p == a.resource) {
+            let own = a.name.as_deref().is_some_and(|n| n.len() > node.len() + 1 && n.starts_with(node) && n.as_bytes()[node.len()] == b'.');
+            return Some(match sub {
+                None => read || (own && matches!(v, "create" | "update" | "patch" | "delete")),
+                Some("status") => (v == "get" && a.name.is_some()) || (own && matches!(v, "update" | "patch")),
+                _ => false,
+            });
+        }
+        let (g, p, label) = self.node_status.iter().find(|(g, p, _)| *g == a.api_group && *p == a.resource)?;
+        Some(match (sub, a.name.as_deref()) {
+            (None, _) => read,
+            (Some("status"), Some(_)) if v == "get" => true,
+            (Some("status"), Some(name)) if matches!(v, "update" | "patch") => {
+                let key = build_key(&format!("{}_{}", g.replace('.', "_"), p), a.namespace.as_deref(), name);
+                self.storage
+                    .get::<Value>(&key)
+                    .await
+                    .ok()
+                    .is_some_and(|o| o.pointer("/metadata/labels").and_then(|l| l.get(label.as_str())).and_then(Value::as_str) == Some(node))
+            }
+            _ => false,
+        })
     }
 
     /// Nodes publish ConfigMaps `kube-system/<prefix><node>`: each node may
@@ -108,6 +176,9 @@ impl ClusterAuthorizer {
 
     /// The Node authorizer's decision for `node` (true = allow).
     async fn node_allows(&self, node: &str, a: &RequestAttributes) -> Result<bool> {
+        if let Some(allowed) = self.node_resource(node, a).await {
+            return Ok(allowed);
+        }
         let v = a.verb.as_str();
         let read = matches!(v, "get" | "list" | "watch");
         let sub = a.subresource.as_deref();
@@ -381,6 +452,55 @@ mod tests {
         assert!(!allowed(&az, &w1, "get", "", "configmaps", ks, Some("tunnr-join-tokens"), None).await);
         assert!(!allowed(&az, &w1, "create", "", "configmaps", Some("default"), Some("tunnr-wg-w1"), None).await);
         assert!(!allowed(&az, &w1, "create", "", "configmaps", ks, None, None).await);
+    }
+
+    #[tokio::test]
+    async fn nodes_write_only_their_own_custom_resource_views() {
+        let st = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
+        let key = |n: &str| build_key("disks_tunnr_io_tunnrvolumes", None, n);
+        for (name, labels) in [("pvc-a", json!({"tunnr.io/node": "w1"})), ("pvc-b", json!({"tunnr.io/node": "w2"})), ("pvc-c", json!({}))] {
+            st.create(&key(name), &json!({"apiVersion": "disks.tunnr.io/v1alpha1", "kind": "TunnrVolume", "metadata": {"name": name, "labels": labels}})).await.unwrap();
+        }
+        let w1 = user("system:node:w1", &["system:nodes"]);
+        let g = "disks.tunnr.io";
+        let (td, tv) = ("tunnrdisks", "tunnrvolumes");
+        // Not configured: a node writes none of them.
+        let off = ClusterAuthorizer::new(st.clone());
+        assert!(!allowed(&off, &w1, "create", g, td, None, Some("w1.td-drv-a"), None).await);
+        assert!(!allowed(&off, &w1, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
+        let az = ClusterAuthorizer::new(st).with_node_resources(&["tunnrdisks.disks.tunnr.io".into(), "nonsense".into()], &["tunnrvolumes.disks.tunnr.io=tunnr.io/node".into(), "bad".into()]);
+        // TunnrDisks: its own, by name <node>.<drive>; every node's readable.
+        for v in ["create", "update", "patch", "delete"] {
+            assert!(allowed(&az, &w1, v, g, td, None, Some("w1.td-drv-a"), None).await, "{v} own");
+            assert!(!allowed(&az, &w1, v, g, td, None, Some("w2.td-drv-a"), None).await, "{v} another node's");
+            assert!(!allowed(&az, &w1, v, g, td, None, Some("w10.td-drv-a"), None).await, "{v} w10 is not w1");
+            assert!(!allowed(&az, &w1, v, g, td, None, Some("w1"), None).await, "{v} the bare node name");
+        }
+        assert!(allowed(&az, &w1, "patch", g, td, None, Some("w1.td-drv-a"), Some("status")).await);
+        assert!(allowed(&az, &w1, "update", g, td, None, Some("w1.td-drv-a"), Some("status")).await);
+        assert!(!allowed(&az, &w1, "patch", g, td, None, Some("w2.td-drv-a"), Some("status")).await);
+        assert!(!allowed(&az, &w1, "create", g, td, None, None, None).await, "a create without a name");
+        assert!(!allowed(&az, &w1, "deletecollection", g, td, None, None, None).await);
+        for v in ["get", "list", "watch"] {
+            assert!(allowed(&az, &w1, v, g, td, None, if v == "get" { Some("w2.td-drv-a") } else { None }, None).await, "{v}");
+            assert!(allowed(&az, &w1, v, g, tv, None, if v == "get" { Some("pvc-b") } else { None }, None).await, "{v}");
+        }
+        // TunnrVolumes: only the status of one labelled tunnr.io/node=w1.
+        assert!(allowed(&az, &w1, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
+        assert!(allowed(&az, &w1, "update", g, tv, None, Some("pvc-a"), Some("status")).await);
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-b"), Some("status")).await, "labelled w2");
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-c"), Some("status")).await, "no label");
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-z"), Some("status")).await, "not there");
+        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-a"), None).await, "the object itself (labels)");
+        assert!(!allowed(&az, &w1, "update", g, tv, None, Some("pvc-a"), None).await);
+        assert!(!allowed(&az, &w1, "create", g, tv, None, Some("pvc-a"), None).await);
+        assert!(!allowed(&az, &w1, "delete", g, tv, None, Some("pvc-a"), None).await);
+        // Another group of the same plural is not configured.
+        assert!(!allowed(&az, &w1, "create", "other.io", td, None, Some("w1.td-drv-a"), None).await);
+        // Without system:nodes the name is nothing.
+        let fake = user("system:node:w1", &[]);
+        assert!(!allowed(&az, &fake, "create", g, td, None, Some("w1.td-drv-a"), None).await);
+        assert!(!allowed(&az, &fake, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
     }
 
     #[tokio::test]

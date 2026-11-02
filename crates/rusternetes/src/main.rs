@@ -129,6 +129,18 @@ struct Args {
     #[arg(long)]
     node_configmap_prefix: Option<String>,
 
+    /// A cluster-scoped custom resource (`<plural>.<group>`) nodes write about
+    /// themselves: a node may create, update, patch and delete those named
+    /// `<node>.<…>` (the Node authorizer). Repeatable.
+    #[arg(long)]
+    node_named_resource: Vec<String>,
+
+    /// A custom resource whose status a node writes (`<plural>.<group>=<label
+    /// key>`): a node may update and patch the status of an object whose label
+    /// names it (the Node authorizer). Repeatable.
+    #[arg(long)]
+    node_status_resource: Vec<String>,
+
     /// By default, a pod's resolv.conf lists the node's own DNS server first
     /// so pods can resolve sibling container names under Docker Compose.
     /// Set this flag outside Compose so pods resolve cluster Service names.
@@ -294,8 +306,11 @@ fn main() -> Result<()> {
     // Built by hand rather than with `#[tokio::main]` so the worker threads get
     // a stack large enough for the kubelet's pod sync path — see
     // `worker_stack_size`. Everything else matches what the macro expands to.
+    // At least two workers: on a one-CPU node the default (one) let any
+    // blocking call stop the whole process — the API server included.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(rusternetes_common::async_runtime::worker_threads())
         .thread_stack_size(rusternetes_common::async_runtime::worker_stack_size())
         .build()?
         .block_on(run())
@@ -551,6 +566,8 @@ async fn run() -> Result<()> {
         client_ca_file: args.client_ca_file,
         kubelet_client_tls,
         node_configmap_prefix: args.node_configmap_prefix.clone(),
+        node_named_resources: args.node_named_resource.clone(),
+        node_status_resources: args.node_status_resource.clone(),
         ..Default::default()
     };
     let api_handle = if on("api-server") {

@@ -123,6 +123,35 @@ impl ApiClient {
             .map_err(|e| GetError::Other(anyhow::anyhow!("Failed to parse response: {}", e)))
     }
 
+    /// GET as a `meta.k8s.io/v1` Table (the server's printer columns), as
+    /// upstream kubectl asks for anything it has no printer of its own for.
+    pub async fn get_table(&self, path: &str) -> Result<serde_json::Value, GetError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut request = self
+            .client
+            .get(&url)
+            .header("Accept", "application/json;as=Table;v=v1;g=meta.k8s.io,application/json");
+        if let Some(ref token) = self.token {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| GetError::Other(anyhow::anyhow!("Failed to send GET request: {}", e)))?;
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(GetError::NotFound);
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(GetError::Other(anyhow::anyhow!("Request failed with status {}: {}", status, body)));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| GetError::Other(anyhow::anyhow!("Failed to parse response: {}", e)))
+    }
+
     /// Get a list of resources, automatically unwrapping the Kubernetes List wrapper
     pub async fn get_list<T: DeserializeOwned>(&self, path: &str) -> Result<Vec<T>, GetError> {
         let list: KubernetesList<T> = self.get(path).await?;

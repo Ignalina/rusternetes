@@ -174,6 +174,41 @@ impl CniRuntime {
         Ok(result)
     }
 
+    /// [`Self::setup_network_with_args`] for the async callers (the kubelet's
+    /// pod start): the plugin runs on the blocking pool. Waited on from a
+    /// worker thread it stopped every other task of the process — on a
+    /// one-CPU node (one worker) the API server too, which tunnr-cni was
+    /// waiting for: 10 s per pod. See `a_slow_plugin_does_not_stall_the_runtime`.
+    pub async fn setup_network_async(
+        self: &Arc<Self>,
+        container_id: String,
+        netns: String,
+        ifname: String,
+        network_name: Option<String>,
+        args: Option<String>,
+    ) -> Result<CniResult, CniError> {
+        let cni = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            cni.setup_network_with_args(&container_id, &netns, &ifname, network_name.as_deref(), args.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| Err(CniError::new(ErrorCode::IoFailure, format!("the CNI ADD task failed: {e}"))))
+    }
+
+    /// [`Self::teardown_network`] for the async callers.
+    pub async fn teardown_network_async(
+        self: &Arc<Self>,
+        container_id: String,
+        netns: String,
+        ifname: String,
+        network_name: Option<String>,
+    ) -> Result<(), CniError> {
+        let cni = Arc::clone(self);
+        tokio::task::spawn_blocking(move || cni.teardown_network(&container_id, &netns, &ifname, network_name.as_deref()))
+            .await
+            .unwrap_or_else(|e| Err(CniError::new(ErrorCode::IoFailure, format!("the CNI DEL task failed: {e}"))))
+    }
+
     /// Teardown network for a container (DEL operation)
     pub fn teardown_network(
         &self,
@@ -418,5 +453,67 @@ mod tests {
         // Test with empty netns
         let result = runtime.setup_network("container1", "", "eth0", None);
         assert!(result.is_err());
+    }
+
+    fn runtime_with_slow_plugin(dir: &std::path::Path, secs: u32) -> Arc<CniRuntime> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bin = dir.join("bin");
+        let conf = dir.join("net.d");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&conf).unwrap();
+        let plugin = bin.join("slow");
+        std::fs::write(
+            &plugin,
+            format!("#!/bin/sh\nsleep {secs}\necho '{{\"cniVersion\":\"1.0.0\",\"ips\":[{{\"address\":\"10.1.0.2/32\"}}]}}'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            conf.join("10-slow.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"slow","plugins":[{"type":"slow"}]}"#,
+        )
+        .unwrap();
+        Arc::new(CniRuntime::new(vec![bin], conf).unwrap())
+    }
+
+    /// A plugin that takes a second must not stop the other tasks of the
+    /// runtime: the all-in-one's API server shares it, and a one-CPU node
+    /// has one worker thread. With the plugin waited on from the worker, a
+    /// node took 10 s per pod (tunnr-cni waits for PID 1, which waits for
+    /// the stalled API server).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_plugin_does_not_stall_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = TempDir::new().unwrap();
+        let cni = runtime_with_slow_plugin(dir.path(), 1);
+        let netns = dir.path().join("ns");
+        std::fs::write(&netns, "").unwrap();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                t.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let r = cni
+            .setup_network_async(
+                "pod-a".into(),
+                netns.to_string_lossy().into_owned(),
+                "eth0".into(),
+                None,
+                Some("K8S_POD_NAMESPACE=default;K8S_POD_NAME=a".into()),
+            )
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        let n = ticks.load(Ordering::SeqCst);
+        ticker.abort();
+        assert!(n >= 5, "the runtime ticked {n} times during the plugin's second (stalled)");
+        assert_eq!(cni.get_container_ip("pod-a").as_deref(), Some("10.1.0.2"));
+        let r = cni
+            .teardown_network_async("pod-a".into(), netns.to_string_lossy().into_owned(), "eth0".into(), None)
+            .await;
+        assert!(r.is_ok(), "{r:?}");
+        assert!(cni.get_container_ip("pod-a").is_none());
     }
 }

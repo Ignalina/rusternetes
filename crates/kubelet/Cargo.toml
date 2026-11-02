@@ -24,7 +24,7 @@ sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
 redb = ["rusternetes-storage/redb"]
 # Daemonless container backend on youki's libcontainer (Linux, root, cgroup v2).
-youki = ["dep:libcontainer", "dep:oci-spec", "dep:nix", "dep:flate2", "dep:uuid"]
+youki = ["dep:libcontainer", "dep:oci-spec", "dep:nix", "dep:oci-image", "dep:uuid"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
@@ -63,8 +63,9 @@ libc = "0.2"
 libcontainer = { version = "0.7", default-features = false, features = ["v2", "seccomp-bpf"], optional = true }
 oci-spec = { version = "0.10", default-features = false, features = ["runtime"], optional = true }
 nix = { version = "0.29", features = ["mount", "sched", "signal", "process", "net", "fs"], optional = true }
-flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
 sha2 = "0.10"
+# The image store: references, digests, one-pass layer unpack (crates.io).
+oci-image = { version = "0.1.0", features = ["pull"], optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]

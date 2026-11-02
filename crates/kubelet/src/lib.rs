@@ -6,6 +6,7 @@ pub mod csi;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
+pub mod readiness_timing;
 pub mod netns;
 pub mod runtime;
 pub mod seccomp;

@@ -95,7 +95,7 @@ pub struct ContainerRuntime {
     cluster_dns: String,
     cluster_domain: String,
     network: String,
-    cni: Option<CniRuntime>,
+    cni: Option<Arc<CniRuntime>>,
     use_cni: bool,
     /// Whether the daemon accepts `UtsMode: "container:<id>"`. Podman does;
     /// Docker rejects it outright. See [`Self::detect_uts_container_mode`].
@@ -363,7 +363,7 @@ impl ContainerRuntime {
             cluster_dns,
             cluster_domain,
             network,
-            cni,
+            cni: cni.map(Arc::new),
             use_cni,
             supports_uts_container_mode,
             kubernetes_service_host,
@@ -382,10 +382,31 @@ impl ContainerRuntime {
     /// Use this CNI runtime and these network namespaces (unit tests).
     #[cfg(test)]
     pub(crate) fn with_cni(mut self, cni: CniRuntime, netns: Arc<dyn NetnsOps>) -> Self {
-        self.cni = Some(cni);
+        self.cni = Some(Arc::new(cni));
         self.use_cni = true;
         self.netns = netns;
         self
+    }
+
+    /// [`NetnsOps::add`] on the blocking pool: the node's `netns::add`
+    /// unshares on a thread and joins it, and `del` unmounts — neither may
+    /// hold a tokio worker (one on a 1-CPU node) — see the test
+    /// `a_slow_netns_does_not_stall_the_runtime`.
+    async fn netns_add(&self, name: &str) -> std::io::Result<()> {
+        let netns = Arc::clone(&self.netns);
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || netns.add(&name))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("netns add task: {e}"))))
+    }
+
+    /// [`NetnsOps::del`] on the blocking pool (see [`Self::netns_add`]).
+    async fn netns_del(&self, name: &str) -> std::io::Result<()> {
+        let netns = Arc::clone(&self.netns);
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || netns.del(&name))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(format!("netns del task: {e}"))))
     }
 
     /// Use this CSI manager instead of the default one.
@@ -567,21 +588,21 @@ impl ContainerRuntime {
                 "Stale sandbox network {} for pod {} (an earlier start or kubelet): CNI DEL and a fresh namespace before ADD",
                 netns_name, pod_name
             );
-            if let Err(e) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+            if let Err(e) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                 warn!("CNI DEL of the stale network of pod {}: {}", pod_name, e);
             }
-            if let Err(e) = self.netns.del(&netns_name) {
+            if let Err(e) = self.netns_del(&netns_name).await {
                 warn!("Failed to delete stale network namespace {}: {}", netns_name, e);
             }
         }
 
         info!("Setting up CNI network for pod: {}", pod_name);
-        self.netns
-            .add(&netns_name)
+        self.netns_add(&netns_name)
+            .await
             .with_context(|| format!("network namespace {netns_name}"))?;
 
         let args = cni_args(pod, pod_name);
-        match cni.setup_network_with_args(pod_name, &netns_path, "eth0", None, Some(&args)) {
+        match cni.setup_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None, Some(args)).await {
             Ok(result) => {
                 info!(
                     "CNI network setup successful for pod {}: IP={:?}",
@@ -591,10 +612,10 @@ impl ContainerRuntime {
             }
             Err(e) => {
                 warn!("CNI ADD failed for pod {}: {}; CNI DEL and the namespace removed", pod_name, e);
-                if let Err(d) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+                if let Err(d) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                     warn!("CNI DEL after the failed ADD of pod {}: {}", pod_name, d);
                 }
-                let _ = self.netns.del(&netns_name);
+                let _ = self.netns_del(&netns_name).await;
                 Err(anyhow::anyhow!("CNI ADD: {e}"))
             }
         }
@@ -614,7 +635,7 @@ impl ContainerRuntime {
 
         // Teardown CNI networking
         if let Some(cni) = &self.cni {
-            if let Err(e) = cni.teardown_network(pod_name, &netns_path, "eth0", None) {
+            if let Err(e) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
                 warn!("Failed to teardown CNI network for pod {}: {}", pod_name, e);
                 // Continue with namespace deletion even if CNI teardown fails
             } else {
@@ -623,7 +644,7 @@ impl ContainerRuntime {
         }
 
         // Delete network namespace
-        match self.netns.del(&netns_name) {
+        match self.netns_del(&netns_name).await {
             Err(e) => warn!("Failed to delete network namespace {}: {}", netns_name, e),
             Ok(()) => info!("Deleted network namespace: {}", netns_name),
         }
@@ -968,10 +989,14 @@ impl ContainerRuntime {
         // Docker Desktop uses virtiofs which may cache writes. Instead of a global
         // sync (which flushes ALL filesystems), we sync_data just the pod's volume dir.
         {
+            // An fsync: off the tokio workers.
             let pod_vol_dir = format!("{}/{}", self.volumes_base_path, pod_name);
-            if let Ok(dir) = std::fs::File::open(&pod_vol_dir) {
-                let _ = dir.sync_all();
-            }
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(dir) = std::fs::File::open(&pod_vol_dir) {
+                    let _ = dir.sync_all();
+                }
+            })
+            .await;
         }
 
         // Get pod IP. For CNI mode, IP is available right after network setup.
@@ -1951,9 +1976,11 @@ impl ContainerRuntime {
             use std::os::unix::fs::PermissionsExt;
             for path in volume_paths.values() {
                 // Recursively chown to fsGroup
-                let _ = std::process::Command::new("chown")
+                // A child process: waited on asynchronously, never on a worker.
+                let _ = tokio::process::Command::new("chown")
                     .args(["-R", &format!(":{}", fs_group), path])
-                    .output();
+                    .output()
+                    .await;
 
                 // Set group bits to mirror owner bits on each file/directory.
                 // This matches real K8s behavior: if owner=r--, group becomes r--
@@ -4964,22 +4991,9 @@ impl ContainerRuntime {
                     // Always use pause container's network namespace
                     Some(format!("container:{}_pause", pod_name))
                 },
-                // Share IPC and PID namespaces with pause container (K8s pod semantics)
-                ipc_mode: if !self.use_cni {
-                    Some(format!("container:{}_pause", pod_name))
-                } else {
-                    None
-                },
-                pid_mode: if pod
-                    .spec
-                    .as_ref()
-                    .and_then(|s| s.share_process_namespace)
-                    .unwrap_or(false)
-                {
-                    Some(format!("container:{}_pause", pod_name))
-                } else {
-                    None
-                },
+                // The IPC and PID namespaces: the host's, the pause container's, or its own.
+                ipc_mode: ipc_mode(pod, self.use_cni),
+                pid_mode: pid_mode(pod),
                 // Share UTS namespace with pause container so app containers
                 // inherit the pod hostname. Without this, containers get their
                 // container ID as hostname instead of the pod name.
@@ -8621,6 +8635,32 @@ impl Drop for StartInFlight {
 /// `spec.hostNetwork: true`.
 fn is_host_network(pod: &Pod) -> bool {
     pod.spec.as_ref().and_then(|s| s.host_network) == Some(true)
+}
+
+/// An app container's PID namespace: the node's for `spec.hostPID` (it
+/// used to be dropped: such a pod got its own namespace), the pause
+/// container's for `shareProcessNamespace`, else its own (None).
+fn pid_mode(pod: &Pod) -> Option<String> {
+    let spec = pod.spec.as_ref()?;
+    if spec.host_pid == Some(true) {
+        Some("host".to_string())
+    } else if spec.share_process_namespace == Some(true) {
+        Some(format!("container:{}_pause", pod.metadata.name))
+    } else {
+        None
+    }
+}
+
+/// An app container's IPC namespace: the node's for `spec.hostIPC`, else
+/// the pause container's where that container exists (no CNI), else its own.
+fn ipc_mode(pod: &Pod, use_cni: bool) -> Option<String> {
+    if pod.spec.as_ref().and_then(|s| s.host_ipc) == Some(true) {
+        Some("host".to_string())
+    } else if !use_cni {
+        Some(format!("container:{}_pause", pod.metadata.name))
+    } else {
+        None
+    }
 }
 
 /// The node's own IPv4 address, the pod IP of a host-network pod: the
@@ -12561,6 +12601,28 @@ mod csi_volume_tests {
 mod host_network_and_cni_args_tests {
     use super::*;
 
+    fn pod_with(f: impl FnOnce(&mut rusternetes_common::resources::PodSpec)) -> Pod {
+        let mut pod = Pod::new("web", rusternetes_common::resources::PodSpec::default());
+        f(pod.spec.as_mut().unwrap());
+        pod
+    }
+
+    /// `spec.hostPID` and `spec.hostIPC` reach the runtime (they were dropped:
+    /// a hostPID pod got its own PID namespace and could not see the node's
+    /// processes); `shareProcessNamespace` joins the pause container.
+    #[test]
+    fn host_pid_and_host_ipc_reach_the_container_namespaces() {
+        assert_eq!(pid_mode(&pod_with(|s| s.host_pid = Some(true))).as_deref(), Some("host"));
+        assert_eq!(
+            pid_mode(&pod_with(|s| s.share_process_namespace = Some(true))).as_deref(),
+            Some("container:web_pause")
+        );
+        assert_eq!(pid_mode(&pod_with(|_| ())), None);
+        assert_eq!(ipc_mode(&pod_with(|s| s.host_ipc = Some(true)), true).as_deref(), Some("host"));
+        assert_eq!(ipc_mode(&pod_with(|_| ()), true), None);
+        assert_eq!(ipc_mode(&pod_with(|_| ()), false).as_deref(), Some("container:web_pause"));
+    }
+
     fn pod(json: serde_json::Value) -> Pod {
         serde_json::from_value(json).expect("pod")
     }
@@ -12658,7 +12720,28 @@ exit 0
         _volumes: tempfile::TempDir,
     }
 
+    /// [`DirNetns`] whose `add` takes a second (the real one unshares on a
+    /// thread and joins it; a slow kernel is a slow join).
+    struct SlowNetns(DirNetns);
+
+    impl NetnsOps for SlowNetns {
+        fn add(&self, name: &str) -> std::io::Result<()> {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            self.0.add(name)
+        }
+        fn del(&self, name: &str) -> std::io::Result<()> {
+            self.0.del(name)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.path(name)
+        }
+    }
+
     async fn runtime(root: &Path, backend: Arc<FakeBackend>) -> (ContainerRuntime, tempfile::TempDir) {
+        runtime_with(root, backend, Arc::new(DirNetns(root.join("netns")))).await
+    }
+
+    async fn runtime_with(root: &Path, backend: Arc<FakeBackend>, netns: Arc<dyn NetnsOps>) -> (ContainerRuntime, tempfile::TempDir) {
         let volumes = tempfile::tempdir().unwrap();
         let cni = CniRuntime::new(vec![root.join("bin")], root.join("net.d")).unwrap();
         let runtime = ContainerRuntime::with_backend(
@@ -12672,8 +12755,46 @@ exit 0
         )
         .await
         .unwrap()
-        .with_cni(cni, Arc::new(DirNetns(root.join("netns"))));
+        .with_cni(cni, netns);
         (runtime, volumes)
+    }
+
+    /// The sandbox namespace is made and removed off the tokio workers too
+    /// (`netns::add` unshares on a thread and joins it): a slow one must not
+    /// stop the runtime's other tasks — on a one-CPU node that is the API
+    /// server.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_netns_does_not_stall_the_runtime() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        for d in ["bin", "net.d", "netns"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let plugin = root.join("bin/fakecni");
+        std::fs::write(&plugin, PLUGIN).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            root.join("net.d/10-fake.conflist"),
+            r#"{"cniVersion":"1.0.0","name":"rusternetes","plugins":[{"type":"fakecni"}]}"#,
+        )
+        .unwrap();
+        let backend = Arc::new(FakeBackend::new("fake"));
+        let (runtime, _volumes) = runtime_with(&root, backend, Arc::new(SlowNetns(DirNetns(root.join("netns"))))).await;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                t.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let path = runtime.setup_pod_network(&pod()).await.unwrap();
+        let n = ticks.load(Ordering::SeqCst);
+        ticker.abort();
+        assert!(n >= 5, "the runtime ticked {n} times while the namespace was made (stalled)");
+        assert!(Path::new(&path).exists());
     }
 
     async fn env() -> Env {
