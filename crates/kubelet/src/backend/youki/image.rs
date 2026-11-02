@@ -1,10 +1,10 @@
-//! Image references, pulls and the flattened image rootfs, on the
-//! `oci-image` crate.
+//! Image references and pulls on the `oci-image` crate.
 //!
-//! Layer blobs are pulled anonymously over the kubelet's existing reqwest
-//! client into a content-addressed store (every blob checked against its
-//! sha256 digest) and flattened, in one pass per layer, into one read-only
-//! rootfs per layer chain. Containers get an overlay on top of it.
+//! Layers are pulled anonymously over the kubelet's existing reqwest client
+//! into a content-addressed store (every blob checked against its sha256
+//! digest) and unpacked once each, in one pass, into `layers/<diff_id>/` in
+//! overlayfs format. A container's rootfs is an overlay of its image's layer
+//! directories; an updated image fetches and unpacks only its new layers.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub use oci_image::ImageRef;
-use oci_image::{LayerStore, UnpackOptions};
+use oci_image::{LayerStore, Layout, OverlayXattr, UnpackOptions};
 
 use crate::backend::ImageConfig;
 
@@ -80,8 +80,13 @@ impl ImageStore {
             .join(id.trim_start_matches("sha256:"))
     }
 
-    pub fn rootfs(&self, id: &str) -> PathBuf {
-        self.image_dir(id).join("rootfs")
+    fn layer_store(&self) -> Result<LayerStore> {
+        Ok(LayerStore::open(&self.root.join("layers"))?)
+    }
+
+    /// The layer directories of image `id`, bottom first.
+    pub fn layers(&self, id: &str) -> Result<Vec<PathBuf>> {
+        Ok(self.layer_store()?.image_layers(&id.parse()?)?)
     }
 
     /// Look an image up by reference (or by `sha256:` ID).
@@ -104,24 +109,29 @@ impl ImageStore {
         image: &str,
         progress: &mut (dyn FnMut(String) + Send),
     ) -> Result<StoredImage> {
-        let layers = LayerStore::open(&self.root.join("layers"))?;
+        let layers = self.layer_store()?;
         let pulled = oci_image::pull::pull(client, image, &layers, progress).await?;
         let r = pulled.reference.clone();
         let id = pulled.id.to_string();
         let dir = self.image_dir(&id);
 
+        let (image_id, image_layers) = (pulled.id.clone(), pulled.layers.clone());
+        tokio::task::spawn_blocking(move || {
+            let opts = UnpackOptions {
+                layout: Layout::Overlay(OverlayXattr::Trusted),
+                ..UnpackOptions::default()
+            };
+            layers.add_image(&image_id, &image_layers, &opts)?;
+            // The unpacked layers are what containers use; drop their blobs.
+            layers.prune_unpacked_blobs()
+        })
+        .await??;
         if !dir.join("image.json").exists() {
-            let chain = pulled.layers.clone();
-            let rootfs = tokio::task::spawn_blocking(move || {
-                layers.rootfs(&chain, &UnpackOptions::default())
-            })
-            .await??;
             let tmp = self
                 .root
                 .join("tmp")
                 .join(uuid::Uuid::new_v4().simple().to_string());
             fs::create_dir_all(&tmp)?;
-            std::os::unix::fs::symlink(&rootfs, tmp.join("rootfs"))?;
             let stored = StoredImage {
                 id: id.clone(),
                 reference: r.canonical(),
@@ -203,31 +213,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pulled_images_share_the_flattened_rootfs_store() {
-        let root = tempfile::tempdir().unwrap();
-        let store = ImageStore::new(root.path().to_path_buf());
-        // The rootfs of an image is where the layer store put its chain.
-        let layers = LayerStore::open(&root.path().join("layers")).unwrap();
-        let tar = {
-            let mut b = tar::Builder::new(Vec::new());
-            let mut h = tar::Header::new_gnu();
-            h.set_size(1);
-            h.set_mode(0o644);
-            b.append_data(&mut h, "a", &b"1"[..]).unwrap();
-            b.into_inner().unwrap()
-        };
-        let d = oci_image::Digest::of(&tar);
-        layers.put_blob(&d, &tar[..]).unwrap();
-        let rootfs = layers
-            .rootfs(std::slice::from_ref(&d), &UnpackOptions::default())
-            .unwrap();
-        let dir = store.image_dir("sha256:x");
-        fs::create_dir_all(&dir).unwrap();
-        std::os::unix::fs::symlink(&rootfs, dir.join("rootfs")).unwrap();
-        assert_eq!(fs::read(store.rootfs("sha256:x").join("a")).unwrap(), b"1");
-    }
-
     /// Network: `cargo test --features youki -- --ignored pulls_busybox`.
     #[tokio::test]
     #[ignore]
@@ -240,7 +225,8 @@ mod tests {
             .pull(&client, "busybox:1.36", &mut |l| lines.push(l))
             .await
             .unwrap();
-        assert!(store.rootfs(&img.id).join("bin/sh").exists());
+        let layers = store.layers(&img.id).unwrap();
+        assert!(layers.iter().any(|l| l.join("bin/sh").exists()));
         assert_eq!(store.get("busybox:1.36").unwrap().id, img.id);
         // A second pull finds every blob and the rootfs already there.
         let again = store
