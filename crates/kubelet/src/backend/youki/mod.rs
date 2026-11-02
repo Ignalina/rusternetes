@@ -102,6 +102,48 @@ struct Inner {
     cfg: YoukiConfig,
     images: ImageStore,
     http: reqwest::Client,
+    /// Every container's [`Meta`] by name: read from disk once (here), kept
+    /// current by create, start and remove. Lists and lookups never scan
+    /// the containers directory again.
+    index: std::sync::RwLock<std::collections::BTreeMap<String, Meta>>,
+}
+
+impl Inner {
+    /// The backend's directories made, the container index read from disk.
+    fn open(cfg: YoukiConfig) -> Result<Inner> {
+        for d in [
+            cfg.root.join("images"),
+            cfg.root.join("refs"),
+            cfg.root.join("containers"),
+            cfg.root.join("tmp"),
+            cfg.state_root.clone(),
+        ] {
+            fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
+        }
+        let index = fs::read_dir(cfg.root.join("containers"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| read_json::<Meta>(&e.path().join("meta.json")))
+            .map(|m| (m.name.clone(), m))
+            .collect();
+        Ok(Inner {
+            images: ImageStore::new(cfg.root.clone()),
+            cfg,
+            http: reqwest::Client::builder()
+                .user_agent("rusternetes-kubelet")
+                .build()?,
+            index: std::sync::RwLock::new(index),
+        })
+    }
+
+    fn index_put(&self, m: Meta) {
+        self.index.write().unwrap_or_else(|e| e.into_inner()).insert(m.name.clone(), m);
+    }
+
+    fn index_remove(&self, name: &str) {
+        self.index.write().unwrap_or_else(|e| e.into_inner()).remove(name);
+    }
 }
 
 /// [`ContainerBackend`] running containers with libcontainer, no daemon.
@@ -112,24 +154,7 @@ pub struct YoukiBackend {
 
 impl YoukiBackend {
     pub fn new(cfg: YoukiConfig) -> Result<Self> {
-        for d in [
-            cfg.root.join("images"),
-            cfg.root.join("refs"),
-            cfg.root.join("containers"),
-            cfg.root.join("tmp"),
-            cfg.state_root.clone(),
-        ] {
-            fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
-        }
-        Ok(Self {
-            inner: Arc::new(Inner {
-                images: ImageStore::new(cfg.root.clone()),
-                cfg,
-                http: reqwest::Client::builder()
-                    .user_agent("rusternetes-kubelet")
-                    .build()?,
-            }),
-        })
+        Ok(Self { inner: Arc::new(Inner::open(cfg)?) })
     }
 
     async fn blocking<T, F>(&self, f: F) -> Result<T>
@@ -297,26 +322,22 @@ impl Inner {
         self.cfg.root.join("containers").join(name)
     }
 
+    /// Every container, by name (from the index, not the disk).
     fn metas(&self) -> Vec<Meta> {
-        let mut out: Vec<Meta> = fs::read_dir(self.cfg.root.join("containers"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| read_json(&e.path().join("meta.json")))
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+        self.index.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
     }
 
-    /// Find a container by name, `/name` or ID.
+    /// Find a container by name, `/name` or ID (or an ID prefix of 12+).
     fn meta(&self, name_or_id: &str) -> Result<Meta> {
         let name = name_or_id.trim_start_matches('/');
-        if let Some(m) = read_json(&self.dir(name).join("meta.json")) {
-            return Ok(m);
+        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = index.get(name) {
+            return Ok(m.clone());
         }
-        self.metas()
-            .into_iter()
+        index
+            .values()
             .find(|m| m.id == name || (name.len() >= 12 && m.id.starts_with(name)))
+            .cloned()
             .ok_or_else(|| not_found(name_or_id))
     }
 
@@ -513,6 +534,7 @@ impl Inner {
                 cgroups_path,
             };
             image::write_json(&dir.join("meta.json"), &meta)?;
+            self.index_put(meta.clone());
             Ok(meta)
         })();
         match result {
@@ -562,6 +584,7 @@ impl Inner {
             c.delete(true)?;
         }
         self.cleanup_dir(&self.dir(&m.name));
+        self.index_remove(&m.name);
         Ok(())
     }
 
@@ -792,7 +815,9 @@ impl ContainerBackend for YoukiBackend {
             c.start()?;
             let mut m = m;
             m.started_at = Some(now_rfc3339());
-            image::write_json(&i.dir(&m.name).join("meta.json"), &m)
+            image::write_json(&i.dir(&m.name).join("meta.json"), &m)?;
+            i.index_put(m);
+            Ok(())
         })
         .await
     }
@@ -1114,6 +1139,55 @@ mod tests {
         assert!(name_matches("web_app", "^/web"));
         assert!(name_matches("web_app", "web_"));
         assert!(!name_matches("myweb_app", "^/web"));
+    }
+
+    fn meta_named(name: &str) -> Meta {
+        Meta {
+            id: format!("id-{name}-0123456789abcdef"),
+            name: name.to_string(),
+            image: "img".into(),
+            image_id: "sha256:abc".into(),
+            created: 1,
+            started_at: None,
+            network_mode: None,
+            config: StoredProcess::default(),
+            cgroups_path: format!("/rusternetes/{name}"),
+        }
+    }
+
+    /// The containers are read from disk ONCE (at start) and kept in memory:
+    /// every list/inspect used to read_dir the containers and parse every
+    /// meta.json (6-8 times per pod start). The index follows create, start
+    /// (started_at) and delete.
+    #[test]
+    fn the_container_index_is_read_from_disk_once_and_kept_in_memory() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = YoukiConfig { root: root.path().to_path_buf(), state_root: root.path().join("state"), shim: "shim".into() };
+        for n in ["a", "b"] {
+            let d = root.path().join("containers").join(n);
+            fs::create_dir_all(&d).unwrap();
+            image::write_json(&d.join("meta.json"), &meta_named(n)).unwrap();
+        }
+        let inner = Inner::open(cfg).unwrap();
+        let names = |i: &Inner| i.metas().into_iter().map(|m| m.name).collect::<Vec<_>>();
+        assert_eq!(names(&inner), vec!["a", "b"]);
+        // the disk is not consulted again
+        fs::remove_dir_all(root.path().join("containers/a")).unwrap();
+        assert_eq!(names(&inner), vec!["a", "b"]);
+        // by name, by id, by id prefix — from the index
+        assert_eq!(inner.meta("/b").unwrap().name, "b");
+        assert_eq!(inner.meta("id-a-0123456789abcdef").unwrap().name, "a");
+        assert_eq!(inner.meta("id-b-01234567").unwrap().name, "b");
+        assert!(inner.meta("nobody").is_err());
+        // create / start / delete keep it current
+        let mut c = meta_named("c");
+        inner.index_put(c.clone());
+        assert_eq!(names(&inner), vec!["a", "b", "c"]);
+        c.started_at = Some("now".into());
+        inner.index_put(c);
+        assert_eq!(inner.meta("c").unwrap().started_at.as_deref(), Some("now"));
+        inner.index_remove("a");
+        assert_eq!(names(&inner), vec!["b", "c"]);
     }
 
     #[test]
