@@ -453,15 +453,15 @@ impl Inner {
         fs::create_dir_all(&dir)?;
         let result = (|| -> Result<Meta> {
             let rootfs = dir.join("rootfs");
-            for d in ["rootfs", "upper", "work", "exec"] {
-                fs::create_dir_all(dir.join(d))?;
-            }
-            let opts = format!(
-                "lowerdir={},upperdir={},workdir={}",
-                self.images.rootfs(&image_id).display(),
-                dir.join("upper").display(),
-                dir.join("work").display()
-            );
+            let overlay = oci_image::Overlay {
+                lower: vec![self.images.rootfs(&image_id)],
+                upper: dir.join("upper"),
+                work: dir.join("work"),
+                merged: rootfs.clone(),
+            };
+            overlay.create()?;
+            fs::create_dir_all(dir.join("exec"))?;
+            let opts = overlay.mount_data();
             nix::mount::mount(
                 Some("overlay"),
                 &rootfs,
