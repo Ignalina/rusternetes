@@ -427,6 +427,11 @@ mod tests {
         match unsafe { libc_fork() } {
             0 => {
                 std::env::set_var(WAIT_PROFILE_ENV, &p);
+                // The shim runs as root on the node (CAP_SYS_ADMIN loads a filter); a test
+                // runs unprivileged (a rootless toolchain container), where seccomp(2)
+                // loads only under no_new_privs (else EACCES and nothing is installed).
+                // SAFETY: prctl with integer arguments only.
+                unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
                 tighten();
                 // SAFETY: a raw getppid, outside the profile.
                 unsafe { nix::libc::syscall(nix::libc::SYS_getppid) };
@@ -451,6 +456,11 @@ mod tests {
         match unsafe { libc_fork() } {
             0 => {
                 std::env::set_var(WAIT_PROFILE_ENV, &p);
+                // The shim runs as root on the node (CAP_SYS_ADMIN loads a filter); a test
+                // runs unprivileged (a rootless toolchain container), where seccomp(2)
+                // loads only under no_new_privs (else EACCES and nothing is installed).
+                // SAFETY: prctl with integer arguments only.
+                unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
                 tighten();
                 unsafe { nix::libc::_exit(7) }
             }
