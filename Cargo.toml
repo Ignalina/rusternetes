@@ -81,6 +81,11 @@ strip = "symbols"
 # sibling checkout until a release carries it.
 [patch.crates-io]
 tunnr-etcd = { path = "../tunnr-etcd/crates/tunnr-etcd" }
+# oci-image 0.1.1 (every gzip layer on all cores with lgz 0.3.17's streaming
+# decoder) from the sibling edda checkout; it reads lgz from the sibling
+# znippy-zoomies. Both drop out once lgz 0.3.17 and oci-image 0.1.1 are on
+# crates.io.
+oci-image = { path = "../edda/crates/oci-image" }
 # youki's libcontainer 0.7.0 plus a pure-Rust seccomp backend (feature
 # `seccomp-bpf`: seccompiler + syscalls, no libseccomp C library) and the
 # noNewPrivileges=false fix (node/rtclass; candidate upstream youki PRs).

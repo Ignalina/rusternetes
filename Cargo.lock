@@ -2580,9 +2580,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "lgz"
-version = "0.3.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ae2d3192d189621bdc4dca2404a4e433cf3acc4c565cddf631e9116272a3b4b"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "flate2",
@@ -2675,9 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "linflate"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89a486a8d73782befd48c263b41f8ad7b75f7d172b85550d542959768d18df2e"
+version = "0.1.14"
 
 [[package]]
 name = "linux-raw-sys"
@@ -3017,9 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "oci-image"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00eefe00f97aea360cd2379e369389073d78b8c4070af1072b11ed7ebde96e03"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "lgz",
@@ -4237,9 +4231,7 @@ dependencies = [
 
 [[package]]
 name = "rotaryengine"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6d63b8199d07d4956d5442b34bb5829b2f5ca2345dc01b878b5552bcd7d76de"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "bytes",
