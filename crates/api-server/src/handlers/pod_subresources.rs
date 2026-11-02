@@ -229,18 +229,19 @@ pub async fn get_logs(
             .unwrap());
     }
 
-    // Get logs from the container runtime
+    // The container's logs, from the runtime here or from the pod's node.
+    // Neither answering is an error: a made-up log (this used to return
+    // seven canned lines, "Application ready to serve traffic" for a pod
+    // that had failed) is worse than none.
     let logs = match get_container_logs(&pod, &container_name, &query).await {
         Ok(logs) => logs,
         Err(e) => match get_node_container_logs(&state, &pod, &container_name, &query).await {
             Ok(logs) => logs,
             Err(e2) => {
-                info!(
-                    "Failed to get real container logs ({}; from the node: {}), using fallback",
-                    e, e2
-                );
-                // Fallback to synthetic logs if container runtime is not available
-                generate_pod_logs(&pod, &container_name, &query)
+                return Err(Error::Internal(format!(
+                    "logs of {}/{} container {}: the container runtime: {}; the node: {}",
+                    namespace, name, container_name, e, e2
+                )));
             }
         },
     };
@@ -423,76 +424,6 @@ async fn get_container_logs(
     Ok(log_output)
 }
 
-/// Generate synthetic logs for a pod container
-fn generate_pod_logs(
-    pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
-) -> String {
-    use chrono::Utc;
-
-    let mut lines = vec![];
-
-    // Get pod status phase
-    let phase = pod
-        .status
-        .as_ref()
-        .map(|s| format!("{:?}", s.phase))
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    // Generate log entries
-    let base_time = pod.metadata.creation_timestamp.unwrap_or_else(Utc::now);
-
-    let mut log_lines = vec![
-        format!(
-            "Container {} starting in pod {}",
-            container_name, pod.metadata.name
-        ),
-        format!("Pod phase: {}", phase),
-        format!("Environment initialized"),
-        format!("Starting application process"),
-        format!("Application ready to serve traffic"),
-        format!("Health check passed"),
-        format!("Serving requests"),
-    ];
-
-    // Apply tail_lines if specified
-    if let Some(tail) = query.tail_lines {
-        let tail = tail as usize;
-        if tail < log_lines.len() {
-            log_lines = log_lines.drain(log_lines.len() - tail..).collect();
-        }
-    }
-
-    // Format log lines with timestamps if requested
-    for (i, line) in log_lines.iter().enumerate() {
-        let log_time = base_time + chrono::Duration::seconds(i as i64 * 5);
-
-        let formatted_line = if query.timestamps {
-            format!("{} {}", log_time.to_rfc3339(), line)
-        } else {
-            line.clone()
-        };
-
-        lines.push(formatted_line);
-    }
-
-    let result = if lines.is_empty() {
-        String::new()
-    } else {
-        lines.join("\n")
-    };
-
-    // Apply limit_bytes if specified
-    if let Some(limit) = query.limit_bytes {
-        let limit = limit as usize;
-        if result.len() > limit {
-            return result[..limit].to_string();
-        }
-    }
-
-    result
-}
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec
 /// Execute a command in a container (supports both SPDY and WebSocket)
