@@ -8370,8 +8370,10 @@ impl ContainerRuntime {
     /// Container garbage collector — removes dead containers to prevent buildup.
     /// Matches K8s kuberuntime_gc.go:
     /// - For deleted pods (not in existing_pods): removes ALL dead containers
-    /// - For existing pods: keeps at most 1 dead container per pod (for log access)
-    /// - Removes orphaned pause containers with no running app containers
+    /// - For existing pods: keeps at most 1 dead container per pod (for log access),
+    ///   also while nothing of the pod runs (a crash-looping or completed pod)
+    /// - Removes the pause container and volumes of a deleted pod with no running
+    ///   app containers
     /// - Removes stale "created" containers older than 5 minutes
     ///
     /// K8s ref: pkg/kubelet/kuberuntime/kuberuntime_gc.go — evictContainers
@@ -8388,7 +8390,8 @@ impl ContainerRuntime {
         let containers = self.backend.list_containers(options).await?;
 
         // Group exited containers by pod name, track which pods have running containers
-        let mut exited_by_pod: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+        // Per pod: (container id, created, is the pause container).
+        let mut exited_by_pod: HashMap<String, Vec<(String, i64, bool)>> = HashMap::new();
         let mut pods_with_running: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut stale_created: Vec<String> = Vec::new();
@@ -8425,10 +8428,11 @@ impl ContainerRuntime {
                     pods_with_running.insert(pod_name);
                 }
                 "exited" | "dead" | "stopped" => {
-                    exited_by_pod
-                        .entry(pod_name)
-                        .or_default()
-                        .push((container_id, created));
+                    exited_by_pod.entry(pod_name).or_default().push((
+                        container_id,
+                        created,
+                        name.ends_with("_pause"),
+                    ));
                 }
                 "created" => {
                     // Containers stuck in "created" for more than 5 minutes
@@ -8447,8 +8451,13 @@ impl ContainerRuntime {
         // K8s ref: evictContainers — for deleted pods (allSourcesReady), remove ALL.
         // For existing pods, keep at most MaxPerPodContainerCount (default 1).
         for (pod_name, mut exited) in exited_by_pod {
-            // Sort by created time descending — keep the newest
-            exited.sort_by(|a, b| b.1.cmp(&a.1));
+            // Sort by created time descending — keep the newest (an app
+            // container before a dead pause container: its log is the one
+            // `pods/log` reads)
+            exited.sort_by(|a, b| {
+                let pause = |c: &(String, i64, bool)| c.2;
+                pause(a).cmp(&pause(b)).then(b.1.cmp(&a.1))
+            });
 
             // For pods still in etcd, keep 1 dead container for log access.
             // For deleted pods, remove ALL dead containers.
@@ -8457,7 +8466,7 @@ impl ContainerRuntime {
             } else {
                 0
             };
-            for (container_id, _) in exited.iter().skip(keep_count) {
+            for (container_id, _, _) in exited.iter().skip(keep_count) {
                 let opts = RemoveContainerOptions { force: true };
                 if self
                     .backend
@@ -8469,10 +8478,16 @@ impl ContainerRuntime {
                 }
             }
 
-            // If the pod has no running containers, remove the last dead one too
-            // and clean up the pause container (orphaned sandbox)
-            if !pods_with_running.contains(&pod_name) {
-                for (container_id, _) in exited.iter().take(1) {
+            // A deleted pod with no running containers: its pause container
+            // (orphaned sandbox) and volumes go too. A pod that still exists
+            // keeps them, and its newest dead container, while nothing runs:
+            // its container crashed and waits for its restart, or it
+            // completed. With CNI there is no pause container, so "no running
+            // container" is exactly that state — removing the last one lost
+            // its log (`pods/log` 404) and its volumes (the restart had no
+            // ConfigMap).
+            if !existing_pods.contains(&pod_name) && !pods_with_running.contains(&pod_name) {
+                for (container_id, _, _) in exited.iter().take(1) {
                     let opts = RemoveContainerOptions { force: true };
                     if self
                         .backend
@@ -12386,12 +12401,8 @@ mod tests {
 pub(crate) fn gc_pod_names(
     pods: rusternetes_common::Result<Vec<rusternetes_common::resources::Pod>>,
 ) -> Option<std::collections::HashSet<String>> {
-    Some(
-        pods.unwrap_or_default()
-            .iter()
-            .map(|p| p.metadata.name.clone())
-            .collect(),
-    )
+    pods.ok()
+        .map(|pods| pods.iter().map(|p| p.metadata.name.clone()).collect())
 }
 
 /// `ContainerRuntime` logic against an in-memory backend: no daemon needed.

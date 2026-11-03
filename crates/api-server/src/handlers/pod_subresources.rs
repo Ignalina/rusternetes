@@ -192,7 +192,10 @@ pub async fn get_logs(
 
     // Followed logs of a pod whose runtime this API server cannot reach
     // stream from its node's kubelet until the container stops.
-    if query.follow && ws.is_none() && !streaming::local_runtime_reachable().await {
+    if query.follow
+        && ws.is_none()
+        && (!local_runtime_for_logs_here() || !streaming::local_runtime_reachable().await)
+    {
         let addr = streaming::node_kubelet_addr(&state, &pod)
             .await
             .map_err(|e| Error::Internal(format!("logs: {}", e)))?;
@@ -233,15 +236,20 @@ pub async fn get_logs(
     // Neither answering is an error: a made-up log (this used to return
     // seven canned lines, "Application ready to serve traffic" for a pod
     // that had failed) is worse than none.
-    let logs = match get_container_logs(&pod, &container_name, &query).await {
+    let local_err = if local_runtime_for_logs_here() {
+        match get_container_logs(&pod, &container_name, &query).await {
+            Ok(logs) => Ok(logs),
+            Err(e) => Err(Some(e.to_string())),
+        }
+    } else {
+        Err(None)
+    };
+    let logs = match local_err {
         Ok(logs) => logs,
-        Err(e) => match get_node_container_logs(&state, &pod, &container_name, &query).await {
+        Err(local) => match get_node_container_logs(&state, &pod, &container_name, &query).await {
             Ok(logs) => logs,
-            Err(e2) => {
-                return Err(Error::Internal(format!(
-                    "logs of {}/{} container {}: the container runtime: {}; the node: {}",
-                    namespace, name, container_name, e, e2
-                )));
+            Err(node) => {
+                return Err(logs_error(&namespace, &name, &container_name, local, node));
             }
         },
     };
@@ -287,8 +295,15 @@ impl std::fmt::Display for NodeLogsError {
 
 /// Is the container runtime of this API server's own host worth asking for
 /// a pod's logs (the Docker/Podman socket)?
-pub(crate) fn local_runtime_for_logs(_kubelet_backend: Option<&str>) -> bool {
-    true
+/// Not on a youki node (`KUBELET_CONTAINER_BACKEND=youki`, which the
+/// all-in-one binary's API server shares with its kubelet): there is no
+/// container daemon there, the node's kubelet serves the logs.
+pub(crate) fn local_runtime_for_logs(kubelet_backend: Option<&str>) -> bool {
+    kubelet_backend != Some("youki")
+}
+
+fn local_runtime_for_logs_here() -> bool {
+    local_runtime_for_logs(std::env::var("KUBELET_CONTAINER_BACKEND").ok().as_deref())
 }
 
 /// The error `pods/log` answers when neither the local runtime (if asked)
@@ -300,14 +315,34 @@ pub(crate) fn logs_error(
     local: Option<String>,
     node: NodeLogsError,
 ) -> Error {
-    Error::Internal(format!(
-        "logs of {}/{} container {}: the container runtime: {}; the node: {}",
-        namespace,
-        name,
-        container,
-        local.unwrap_or_default(),
-        node
-    ))
+    let local = local
+        .map(|e| format!("the container runtime: {}; ", e))
+        .unwrap_or_default();
+    match node {
+        // The node has no such container (not created yet, or removed):
+        // a 404 with the kubelet's own reason.
+        NodeLogsError::Answered(404, body) => Error::NotFound(format!(
+            "logs of {}/{} container {}: {}the node: {}",
+            namespace,
+            name,
+            container,
+            local,
+            body.trim()
+        )),
+        NodeLogsError::Answered(status, body) => Error::Internal(format!(
+            "logs of {}/{} container {}: {}the node answered {}: {}",
+            namespace,
+            name,
+            container,
+            local,
+            status,
+            body.trim()
+        )),
+        NodeLogsError::Other(e) => Error::Internal(format!(
+            "logs of {}/{} container {}: {}the node: {}",
+            namespace, name, container, local, e
+        )),
+    }
 }
 
 /// Logs from the kubelet of the pod's node (`GET http://<InternalIP>:10250/
@@ -317,23 +352,25 @@ async fn get_node_container_logs(
     pod: &rusternetes_common::resources::Pod,
     container_name: &str,
     query: &LogsQuery,
-) -> anyhow::Result<String> {
+) -> std::result::Result<String, NodeLogsError> {
+    let other = NodeLogsError::Other;
     let node_name = pod
         .spec
         .as_ref()
         .and_then(|s| s.node_name.clone())
-        .ok_or_else(|| anyhow::anyhow!("pod is not on a node"))?;
+        .ok_or_else(|| other(anyhow::anyhow!("pod is not on a node")))?;
     let node: rusternetes_common::resources::Node = state
         .storage
         .get(&rusternetes_storage::build_key("nodes", None, &node_name))
-        .await?;
+        .await
+        .map_err(|e| other(e.into()))?;
     let ip = node
         .status
         .as_ref()
         .and_then(|s| s.addresses.as_ref())
         .and_then(|a| a.iter().find(|a| a.address_type == "InternalIP"))
         .map(|a| a.address.clone())
-        .ok_or_else(|| anyhow::anyhow!("node {} has no InternalIP", node_name))?;
+        .ok_or_else(|| other(anyhow::anyhow!("node {} has no InternalIP", node_name)))?;
     let mut url = format!(
         "{}://{}:10250/containerLogs/{}/{}/{}",
         crate::kubelet_client::http_scheme(),
@@ -345,14 +382,24 @@ async fn get_node_container_logs(
     if let Some(t) = query.tail_lines {
         url.push_str(&format!("?tailLines={}", t));
     }
-    let resp = crate::kubelet_client::http_client(Some(std::time::Duration::from_secs(10)))?
+    let resp = crate::kubelet_client::http_client(Some(std::time::Duration::from_secs(10)))
+        .map_err(other)?
         .get(&url)
         .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("{} answered {}", url, resp.status());
+        .await
+        .map_err(|e| other(anyhow::anyhow!("{}: {}", url, e)))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| other(anyhow::anyhow!("{}: {}", url, e)))?;
+    if !status.is_success() {
+        return Err(NodeLogsError::Answered(
+            status.as_u16(),
+            format!("{} answered {}: {}", url, status, body.trim()),
+        ));
     }
-    Ok(resp.text().await?)
+    Ok(body)
 }
 
 /// Get real logs from the container runtime

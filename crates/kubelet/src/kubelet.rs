@@ -1198,7 +1198,8 @@ impl Kubelet {
     /// Matches K8s kuberuntime_gc.go behavior:
     /// 1. For deleted pods (not in etcd): remove ALL dead containers
     /// 2. For existing pods: keep at most 1 dead container per pod (for log access)
-    /// 3. Remove orphaned pause containers (sandboxes) with no running app containers
+    /// 3. Remove the pause containers (sandboxes) and volumes of deleted pods with no
+    ///    running app containers (an existing pod keeps them while nothing of it runs)
     /// 4. Remove stale "created" containers that were never started
     ///
     /// K8s ref: pkg/kubelet/kuberuntime/kuberuntime_gc.go — GarbageCollect
