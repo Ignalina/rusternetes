@@ -1205,7 +1205,10 @@ mod tests {
         let t = f.begin("busybox:1.37").expect("the first pull starts");
         assert!(f.begin("busybox:1.37").is_none(), "a second waits for it");
         assert!(f.busy("busybox:1.37"));
-        assert!(f.begin("postgres:18").is_some(), "another image pulls beside it");
+        assert!(
+            f.begin("postgres:18").is_some(),
+            "another image pulls beside it"
+        );
         drop(t);
         assert!(!f.busy("busybox:1.37"));
         assert!(f.begin("busybox:1.37").is_some());

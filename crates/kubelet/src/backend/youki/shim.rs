@@ -76,7 +76,8 @@ pub const WAIT_PROFILE_ENV: &str = "RUSTERNETES_SHIM_WAIT_SECCOMP";
 pub fn load_wait_profile(path: &Path) -> anyhow::Result<oci_spec::runtime::LinuxSeccomp> {
     use anyhow::Context as _;
     let bytes = std::fs::read(path).with_context(|| format!("{}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("{}: not an OCI linux.seccomp", path.display()))
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("{}: not an OCI linux.seccomp", path.display()))
 }
 
 /// Install the wait-phase profile [`WAIT_PROFILE_ENV`] names, if any; a
@@ -92,7 +93,10 @@ pub fn tighten() {
         Ok(())
     });
     if let Err(e) = installed {
-        eprintln!("rusternetes-youki-shim: the wait-phase filter {} was NOT installed: {e:#}", path.display());
+        eprintln!(
+            "rusternetes-youki-shim: the wait-phase filter {} was NOT installed: {e:#}",
+            path.display()
+        );
     }
 }
 
@@ -250,7 +254,10 @@ mod tests {
     #[test]
     fn the_wait_profile_loads_from_the_nodes_oci_json() {
         let s = load_wait_profile(&write_profile("load")).unwrap();
-        assert_eq!(s.default_action(), oci_spec::runtime::LinuxSeccompAction::ScmpActKillProcess);
+        assert_eq!(
+            s.default_action(),
+            oci_spec::runtime::LinuxSeccompAction::ScmpActKillProcess
+        );
         assert_eq!(s.syscalls().as_ref().map(|v| v.len()), Some(3));
         assert!(load_wait_profile(Path::new("/nonexistent/shim.json")).is_err());
     }
@@ -276,7 +283,13 @@ mod tests {
             }
             pid => {
                 let st = waitpid(Pid::from_raw(pid), None).unwrap();
-                assert!(matches!(st, WaitStatus::Signaled(_, nix::sys::signal::Signal::SIGSYS, _)), "{st:?}");
+                assert!(
+                    matches!(
+                        st,
+                        WaitStatus::Signaled(_, nix::sys::signal::Signal::SIGSYS, _)
+                    ),
+                    "{st:?}"
+                );
             }
         }
     }
@@ -303,7 +316,10 @@ mod tests {
             }
             pid => {
                 let st = waitpid(Pid::from_raw(pid), None).unwrap();
-                assert!(matches!(st, WaitStatus::Exited(_, 7)), "the shim must survive its own install: {st:?}");
+                assert!(
+                    matches!(st, WaitStatus::Exited(_, 7)),
+                    "the shim must survive its own install: {st:?}"
+                );
             }
         }
     }
