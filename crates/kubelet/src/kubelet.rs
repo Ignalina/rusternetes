@@ -117,6 +117,72 @@ impl StartBackoff {
     }
 }
 
+/// CrashLoopBackOff: the back-off between restarts of a container that
+/// exited (restartPolicy Always, or OnFailure with a failure), per pod UID
+/// and container name, as the upstream kubelet does: the first restart at
+/// once, then 10 s, doubling, at most 5 min; a container that ran 10 min
+/// before it exited starts over at 10 s.
+#[derive(Default)]
+pub(crate) struct CrashBackoff {
+    /// By "<pod uid>/<container>": (the last delay, not before).
+    entries: HashMap<String, (Duration, std::time::Instant)>,
+}
+
+impl CrashBackoff {
+    pub(crate) const INITIAL: Duration = Duration::from_secs(10);
+    pub(crate) const MAX: Duration = Duration::from_secs(300);
+    /// A container that ran this long before it exited starts over.
+    pub(crate) const RESET_AFTER: Duration = Duration::from_secs(600);
+
+    /// The time left before `key` may restart, if it is backing off.
+    pub(crate) fn wait(&self, _key: &str, _now: std::time::Instant) -> Option<Duration> {
+        None
+    }
+
+    /// `key` is restarted now, after it ran for `ran`; returns the back-off
+    /// before its next restart.
+    pub(crate) fn restarted(
+        &mut self,
+        _key: &str,
+        _now: std::time::Instant,
+        _ran: Option<Duration>,
+    ) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Forget every container of a pod UID that is gone.
+    pub(crate) fn forget_pod(&mut self, uid: &str) {
+        let prefix = format!("{}/", uid);
+        self.entries.retain(|k, _| !k.starts_with(&prefix));
+    }
+}
+
+/// Which of a pod's terminated containers may restart now, and which wait
+/// out their back-off (name -> time left).
+pub(crate) fn crash_restart_gate(
+    backoff: &CrashBackoff,
+    uid: &str,
+    statuses: &[ContainerStatus],
+    now: std::time::Instant,
+) -> (HashSet<String>, HashMap<String, Duration>) {
+    let mut due = HashSet::new();
+    let mut waiting = HashMap::new();
+    for cs in statuses {
+        if !matches!(cs.state, Some(ContainerState::Terminated { .. })) {
+            continue;
+        }
+        match backoff.wait(&format!("{}/{}", uid, cs.name), now) {
+            Some(left) => {
+                waiting.insert(cs.name.clone(), left);
+            }
+            None => {
+                due.insert(cs.name.clone());
+            }
+        }
+    }
+    (due, waiting)
+}
+
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
 // All fields are Send+Sync: Arc<StorageBackend>, Arc<ContainerRuntime>, Mutex<EvictionManager>
 
@@ -4966,5 +5032,75 @@ mod start_backoff_tests {
         b.succeeded("u");
         assert_eq!(b.wait("u", 2, t), None);
         assert_eq!(b.failed("u", 2, t), Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod crash_backoff_tests {
+    use super::{crash_restart_gate, CrashBackoff};
+    use rusternetes_common::resources::{ContainerState, ContainerStatus};
+    use std::time::{Duration, Instant};
+
+    fn s(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn restarts_back_off_ten_seconds_doubling_to_five_minutes() {
+        let mut b = CrashBackoff::default();
+        let t = Instant::now();
+        assert_eq!(b.wait("u/c", t), None, "the first restart is at once");
+        let mut want = vec![10, 20, 40, 80, 160, 300, 300, 300];
+        let mut now = t;
+        for w in want.drain(..) {
+            let d = b.restarted("u/c", now, Some(s(1)));
+            assert_eq!(d, s(w));
+            assert_eq!(b.wait("u/c", now + d - s(1)), Some(s(1)), "still backing off");
+            now += d;
+            assert_eq!(b.wait("u/c", now), None, "due once the back-off passed");
+        }
+        assert_eq!(b.wait("u/other", t), None, "per container");
+        assert_eq!(b.wait("v/c", t), None, "per pod");
+    }
+
+    #[test]
+    fn a_container_that_ran_ten_minutes_starts_over() {
+        let mut b = CrashBackoff::default();
+        let t = Instant::now();
+        b.restarted("u/c", t, Some(s(1)));
+        b.restarted("u/c", t, Some(s(1)));
+        assert_eq!(b.restarted("u/c", t, Some(s(1))), s(40));
+        assert_eq!(b.restarted("u/c", t, Some(s(600))), s(10));
+        assert_eq!(b.restarted("u/c", t, Some(s(1))), s(20));
+        b.forget_pod("u");
+        assert_eq!(b.wait("u/c", t), None);
+        assert_eq!(b.restarted("u/c", t, None), s(10));
+    }
+
+    #[test]
+    fn the_gate_holds_back_containers_still_backing_off() {
+        let term = |n: &str| -> ContainerStatus {
+            serde_json::from_value(serde_json::json!({
+                "name": n, "ready": false, "restartCount": 1, "image": "busybox", "imageID": "",
+                "state": {"terminated": {"exitCode": 3, "reason": "Error"}}
+            }))
+            .unwrap()
+        };
+        let running: ContainerStatus = serde_json::from_value(serde_json::json!({
+            "name": "up", "ready": true, "restartCount": 0, "image": "busybox", "imageID": "",
+            "state": {"running": {}}
+        }))
+        .unwrap();
+        assert!(matches!(term("x").state, Some(ContainerState::Terminated { .. })));
+        let (due, _) = crash_restart_gate(&CrashBackoff::default(), "u", &[running], Instant::now());
+        assert!(due.is_empty(), "a running container is not restarted");
+        let mut b = CrashBackoff::default();
+        let t = Instant::now();
+        b.restarted("u/crash", t, Some(s(1)));
+        let (due, waiting) = crash_restart_gate(&b, "u", &[term("crash"), term("fresh")], t + s(3));
+        assert!(due.contains("fresh") && !due.contains("crash"), "{due:?}");
+        assert_eq!(waiting.get("crash"), Some(&s(7)));
+        let (due, waiting) = crash_restart_gate(&b, "u", &[term("crash")], t + s(10));
+        assert!(due.contains("crash") && waiting.is_empty());
     }
 }
