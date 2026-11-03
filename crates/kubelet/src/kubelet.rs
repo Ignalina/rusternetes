@@ -172,7 +172,28 @@ impl CrashBackoff {
     /// A container this kubelet has no back-off for (it restarted, e.g. for
     /// a renewed node certificate): its back-off from its status, the
     /// restarts so far and when it last exited.
-    pub(crate) fn seed(&mut self, _key: &str, _cs: &ContainerStatus, _now: std::time::Instant) {}
+    pub(crate) fn seed(&mut self, key: &str, cs: &ContainerStatus, now: std::time::Instant) {
+        if self.entries.contains_key(key) || cs.restart_count == 0 {
+            return;
+        }
+        let Some(ContainerState::Terminated {
+            finished_at: Some(finished),
+            ..
+        }) = &cs.state
+        else {
+            return;
+        };
+        if ran_for(cs).is_some_and(|r| r >= Self::RESET_AFTER) {
+            return;
+        }
+        // After restart n the back-off is 10 s * 2^(n-1), at most 5 min.
+        let delay = Self::INITIAL
+            .saturating_mul(1u32 << (cs.restart_count - 1).min(16))
+            .min(Self::MAX);
+        let since = (chrono::Utc::now() - *finished).to_std().unwrap_or_default();
+        let until = (now + delay).checked_sub(since).unwrap_or(now);
+        self.entries.insert(key.to_string(), (delay, until));
+    }
 }
 
 /// Which of a pod's terminated containers may restart now, and which wait
