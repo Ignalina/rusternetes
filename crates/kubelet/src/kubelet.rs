@@ -699,7 +699,18 @@ impl Kubelet {
         }
 
         if needs_write {
-            self.storage.update(&key, &node).await?;
+            // Re-read just before the write and carry over only what the kubelet owns (its facts
+            // annotations, status): another writer (ovn-kubernetes' node-chassis-id,
+            // l3-gateway-config, …) may have annotated the Node since the read above, and writing
+            // the old copy back erased those annotations.
+            let mut fresh: Node = self
+                .storage
+                .get(&key)
+                .await
+                .unwrap_or_else(|_| node.clone());
+            merge_kubelet_owned(&mut fresh, &node, node_facts());
+            self.storage.update(&key, &fresh).await?;
+            node = fresh;
         }
         write_node_status_file(&node);
 
@@ -4194,6 +4205,19 @@ impl Kubelet {
 }
 
 /// The node's facts for its annotations: the JSON object (string values) in
+/// What the kubelet's node-status write carries onto a freshly read Node: its own facts
+/// annotations and the status it computed; every other annotation, label and the spec stay as
+/// the fresh copy has them.
+fn merge_kubelet_owned(fresh: &mut Node, mine: &Node, facts: Option<Vec<(String, String)>>) {
+    if let Some(facts) = facts {
+        let ann = fresh.metadata.annotations.get_or_insert_with(HashMap::new);
+        for (k, v) in facts {
+            ann.insert(k, v);
+        }
+    }
+    fresh.status = mine.status.clone();
+}
+
 /// the file `RUSTERNETES_NODE_ANNOTATIONS_FILE` names; `None` without one.
 fn node_facts() -> Option<Vec<(String, String)>> {
     let path = std::env::var("RUSTERNETES_NODE_ANNOTATIONS_FILE")
@@ -4967,5 +4991,37 @@ mod start_backoff_tests {
         b.succeeded("u");
         assert_eq!(b.wait("u", 2, t), None);
         assert_eq!(b.failed("u", 2, t), Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+mod merge_kubelet_owned_tests {
+    use super::*;
+
+    #[test]
+    fn a_node_status_write_keeps_annotations_another_writer_added() {
+        let mine: Node = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "worker", "annotations": {"tunnr.io/role": "worker"}},
+            "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+        }))
+        .unwrap();
+        let mut fresh: Node = serde_json::from_value(serde_json::json!({
+            "metadata": {"name": "worker", "annotations": {"tunnr.io/role": "worker", "k8s.ovn.org/node-chassis-id": "3f1a"}}
+        })).unwrap();
+        merge_kubelet_owned(
+            &mut fresh,
+            &mine,
+            Some(vec![("tunnr.io/net".to_string(), "ok".to_string())]),
+        );
+        let ann = fresh.metadata.annotations.clone().unwrap();
+        assert_eq!(
+            ann.get("k8s.ovn.org/node-chassis-id").map(String::as_str),
+            Some("3f1a")
+        );
+        assert_eq!(ann.get("tunnr.io/net").map(String::as_str), Some("ok"));
+        assert_eq!(
+            serde_json::to_value(&fresh.status).unwrap(),
+            serde_json::to_value(&mine.status).unwrap()
+        );
     }
 }
