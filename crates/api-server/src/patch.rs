@@ -671,7 +671,10 @@ mod tests {
             {"op": "remove", "path": "/metadata/annotations/a"}
         ]);
         let out = apply_json_patch(&original, &patch).unwrap();
-        assert_eq!(out, json!({"metadata": {"annotations": {"k8s.ovn.org/node-subnets": "{}", "x~y": "3"}}}));
+        assert_eq!(
+            out,
+            json!({"metadata": {"annotations": {"k8s.ovn.org/node-subnets": "{}", "x~y": "3"}}})
+        );
     }
 
     #[test]
