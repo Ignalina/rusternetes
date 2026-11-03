@@ -29,7 +29,13 @@ pub struct ServingTls {
 /// A client certificate's CN, if it parses.
 pub fn common_name(der: &[u8]) -> Option<String> {
     let (_, c) = x509_parser::parse_x509_certificate(der).ok()?;
-    let cn = c.subject().iter_common_name().next()?.as_str().ok()?.to_string();
+    let cn = c
+        .subject()
+        .iter_common_name()
+        .next()?
+        .as_str()
+        .ok()?
+        .to_string();
     Some(cn)
 }
 
@@ -59,7 +65,9 @@ impl ClientCertVerifier for ControlPlaneOnly {
             Some(cn) => Err(rustls::Error::General(format!(
                 "the node server takes control-plane certificates only, not {cn}"
             ))),
-            None => Err(rustls::Error::General("a client certificate without a CN".into())),
+            None => Err(rustls::Error::General(
+                "a client certificate without a CN".into(),
+            )),
         }
     }
 
@@ -104,9 +112,12 @@ impl ServingTls {
         for c in rustls_pemfile_certs(&read(&self.client_ca_file)?).context("the client CA")? {
             roots.add(c).context("the client CA")?;
         }
-        let inner = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
-            .build()
-            .context("the client verifier")?;
+        let inner = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .context("the client verifier")?;
         let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .with_client_cert_verifier(Arc::new(ControlPlaneOnly(inner)))

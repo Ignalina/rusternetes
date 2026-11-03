@@ -283,10 +283,7 @@ struct Args {
 }
 
 /// All three of a TLS file set, or none.
-fn all_or_none(
-    what: &str,
-    files: [(&str, &Option<String>); 3],
-) -> Result<Option<[String; 3]>> {
+fn all_or_none(what: &str, files: [(&str, &Option<String>); 3]) -> Result<Option<[String; 3]>> {
     let given = files.iter().filter(|(_, v)| v.is_some()).count();
     match given {
         0 => Ok(None),
@@ -342,31 +339,47 @@ async fn run() -> Result<()> {
             ("--kubelet-client-ca-file", &args.kubelet_client_ca_file),
         ],
     )?
-    .map(|[cert_file, key_file, client_ca_file]| rusternetes_kubelet::serving_tls::ServingTls {
-        cert_file,
-        key_file,
-        client_ca_file,
+    .map(|[cert_file, key_file, client_ca_file]| {
+        rusternetes_kubelet::serving_tls::ServingTls {
+            cert_file,
+            key_file,
+            client_ca_file,
+        }
     });
     let kubelet_client_tls = all_or_none(
         "API server to kubelet TLS",
         [
-            ("--kubelet-certificate-authority", &args.kubelet_certificate_authority),
-            ("--kubelet-client-certificate", &args.kubelet_client_certificate),
+            (
+                "--kubelet-certificate-authority",
+                &args.kubelet_certificate_authority,
+            ),
+            (
+                "--kubelet-client-certificate",
+                &args.kubelet_client_certificate,
+            ),
             ("--kubelet-client-key", &args.kubelet_client_key),
         ],
     )?
-    .map(|[ca_file, cert_file, key_file]| rusternetes_api_server::kubelet_client::KubeletClientTls {
-        ca_file,
-        cert_file,
-        key_file,
+    .map(|[ca_file, cert_file, key_file]| {
+        rusternetes_api_server::kubelet_client::KubeletClientTls {
+            ca_file,
+            cert_file,
+            key_file,
+        }
     });
-    #[cfg_attr(not(any(feature = "redb", feature = "store-raft")), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "redb", feature = "store-raft")),
+        allow(unused_variables)
+    )]
     let serve_etcd_tls = all_or_none(
         "--serve-etcd TLS",
         [
             ("--serve-etcd-cert-file", &args.serve_etcd_cert_file),
             ("--serve-etcd-key-file", &args.serve_etcd_key_file),
-            ("--serve-etcd-client-ca-file", &args.serve_etcd_client_ca_file),
+            (
+                "--serve-etcd-client-ca-file",
+                &args.serve_etcd_client_ca_file,
+            ),
         ],
     )?;
 
@@ -457,15 +470,24 @@ async fn run() -> Result<()> {
     let mut backend = StorageBackend::new(storage_config).await?;
     if let Some(t) = &encryption {
         backend = backend.with_encryption(t.clone())?;
-        info!("Encryption at rest on ({})", args.encryption_provider_config.as_deref().unwrap_or(""));
+        info!(
+            "Encryption at rest on ({})",
+            args.encryption_provider_config.as_deref().unwrap_or("")
+        );
     }
     let storage = Arc::new(backend);
 
     info!("Storage initialized, starting components...");
     let on = |c: &str| args.components.iter().any(|x| x == c);
     for c in &args.components {
-        if !["api-server", "scheduler", "controller-manager", "kubelet", "kube-proxy"]
-            .contains(&c.as_str())
+        if ![
+            "api-server",
+            "scheduler",
+            "controller-manager",
+            "kubelet",
+            "kube-proxy",
+        ]
+        .contains(&c.as_str())
         {
             anyhow::bail!("Unknown component: {}", c);
         }
@@ -482,7 +504,8 @@ async fn run() -> Result<()> {
             let tls = match serve_etcd_tls {
                 Some([cert, key, ca]) => {
                     let read = |p: &str| {
-                        std::fs::read(p).map_err(|e| anyhow::anyhow!("--serve-etcd TLS file {p}: {e}"))
+                        std::fs::read(p)
+                            .map_err(|e| anyhow::anyhow!("--serve-etcd TLS file {p}: {e}"))
                     };
                     Some(tunnr_etcd::server::ServeTls {
                         cert_pem: read(&cert)?,
@@ -494,7 +517,9 @@ async fn run() -> Result<()> {
             };
             #[cfg(not(feature = "etcd-tls"))]
             if tls.is_some() {
-                anyhow::bail!("--serve-etcd TLS needs the etcd-tls feature; refusing to serve plaintext");
+                anyhow::bail!(
+                    "--serve-etcd TLS needs the etcd-tls feature; refusing to serve plaintext"
+                );
             }
             let scheme = if tls.is_some() { "https" } else { "http" };
             let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -504,7 +529,10 @@ async fn run() -> Result<()> {
                     addr
                 );
             } else {
-                info!("Serving the embedded store as etcd v3 on {} (plaintext)", addr);
+                info!(
+                    "Serving the embedded store as etcd v3 on {} (plaintext)",
+                    addr
+                );
             }
             if args.serve_etcd_node_authz {
                 if tls.is_none() {
@@ -540,14 +568,19 @@ async fn run() -> Result<()> {
     // in this process (API server, kubelet, controller manager). A node
     // without it (a worker) signs none: its pods get their ServiceAccount's
     // token Secret, signed on a control plane.
-    match (&args.service_account_signing_key_file, &args.service_account_key_file) {
+    match (
+        &args.service_account_signing_key_file,
+        &args.service_account_key_file,
+    ) {
         (Some(private), Some(public)) => {
             let tm = rusternetes_common::auth::TokenManager::from_key_files(private, public)?;
             rusternetes_common::auth::install_cluster_token_manager(Arc::new(tm));
             info!("ServiceAccount key: {}", public);
         }
         (None, None) => {}
-        _ => anyhow::bail!("--service-account-signing-key-file and --service-account-key-file go together"),
+        _ => anyhow::bail!(
+            "--service-account-signing-key-file and --service-account-key-file go together"
+        ),
     }
     if !args.skip_auth && on("api-server") && args.service_account_signing_key_file.is_none() {
         warn!("--skip-auth=false without --service-account-signing-key-file: ServiceAccount tokens hold for this process only");
@@ -604,18 +637,25 @@ async fn run() -> Result<()> {
             tokio::spawn(reencrypt_loop(st, node));
         }
         if run_sched {
-            started.push(("kube-scheduler", tokio::spawn(async move {
-                if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
-                    error!("Scheduler error: {}", e);
-                }
-            })));
+            started.push((
+                "kube-scheduler",
+                tokio::spawn(async move {
+                    if let Err(e) = rusternetes_scheduler::run(sched_storage, sched_config).await {
+                        error!("Scheduler error: {}", e);
+                    }
+                }),
+            ));
         }
         if run_cm {
-            started.push(("kube-controller-manager", tokio::spawn(async move {
-                if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await {
-                    error!("Controller manager error: {}", e);
-                }
-            })));
+            started.push((
+                "kube-controller-manager",
+                tokio::spawn(async move {
+                    if let Err(e) = rusternetes_controller_manager::run(cm_storage, cm_config).await
+                    {
+                        error!("Controller manager error: {}", e);
+                    }
+                }),
+            ));
         }
         started
     };
@@ -637,10 +677,9 @@ async fn run() -> Result<()> {
             renew_interval: 5,
             retry_interval: 2,
         };
-        let el = Arc::new(rusternetes_common::leader_election::LeaderElector::with_client(
-            etcd.client(),
-            config,
-        ));
+        let el = Arc::new(
+            rusternetes_common::leader_election::LeaderElector::with_client(etcd.client(), config),
+        );
         let run = el.clone();
         tokio::spawn(async move {
             if let Err(e) = run.run().await {
@@ -673,19 +712,27 @@ async fn run() -> Result<()> {
                 }
             }
         }));
-        for (component, wanted) in [("kube-scheduler", run_sched), ("kube-controller-manager", run_cm)] {
+        for (component, wanted) in [
+            ("kube-scheduler", run_sched),
+            ("kube-controller-manager", run_cm),
+        ] {
             if !wanted {
                 continue;
             }
             let (waiter, running) = (waiter.clone(), running.clone());
-            beats.push((component, Arc::new(move || {
-                if waiter.is_finished() {
-                    return false;
-                }
-                let r = running.lock().unwrap_or_else(|e| e.into_inner());
-                // Standing by (not started here), or started and running.
-                r.iter().find(|(c, _)| *c == component).is_none_or(|(_, h)| !h.is_finished())
-            })));
+            beats.push((
+                component,
+                Arc::new(move || {
+                    if waiter.is_finished() {
+                        return false;
+                    }
+                    let r = running.lock().unwrap_or_else(|e| e.into_inner());
+                    // Standing by (not started here), or started and running.
+                    r.iter()
+                        .find(|(c, _)| *c == component)
+                        .is_none_or(|(_, h)| !h.is_finished())
+                }),
+            ));
         }
     } else {
         for (component, h) in start_sched_cm() {
@@ -694,7 +741,13 @@ async fn run() -> Result<()> {
         }
     }
     if !beats.is_empty() || on("api-server") {
-        heartbeat::spawn(storage.clone(), args.node_name.clone(), beats, on("api-server"), args.bind_address.clone());
+        heartbeat::spawn(
+            storage.clone(),
+            args.node_name.clone(),
+            beats,
+            on("api-server"),
+            args.bind_address.clone(),
+        );
     }
 
     // --- Kubelet ---
@@ -774,7 +827,11 @@ async fn run() -> Result<()> {
 /// ConfigMap is written when it changed, or every 10 minutes.
 async fn reencrypt_loop(storage: Arc<StorageBackend>, node: String) {
     use rusternetes_storage::Storage as _;
-    let key = rusternetes_storage::build_key("configmaps", Some("kube-system"), rusternetes_storage::CENSUS_CONFIGMAP);
+    let key = rusternetes_storage::build_key(
+        "configmaps",
+        Some("kube-system"),
+        rusternetes_storage::CENSUS_CONFIGMAP,
+    );
     let mut last: Option<(String, String)> = None;
     let mut written_at = std::time::Instant::now();
     loop {
@@ -787,11 +844,16 @@ async fn reencrypt_loop(storage: Arc<StorageBackend>, node: String) {
                     );
                 }
                 let now = (r.write.clone(), r.census_line());
-                if last.as_ref() != Some(&now) || written_at.elapsed() > std::time::Duration::from_secs(600) {
+                if last.as_ref() != Some(&now)
+                    || written_at.elapsed() > std::time::Duration::from_secs(600)
+                {
                     let at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
                     let cm = r.configmap(&node, &at);
                     let res = match storage.update_raw(&key, &cm).await {
-                        Err(rusternetes_common::Error::NotFound(_)) => storage.create(&key, &cm).await.map(|_: serde_json::Value| ()),
+                        Err(rusternetes_common::Error::NotFound(_)) => storage
+                            .create(&key, &cm)
+                            .await
+                            .map(|_: serde_json::Value| ()),
                         other => other,
                     };
                     match res {
@@ -820,10 +882,12 @@ fn node_view(
     encryption: &Option<Arc<rusternetes_storage::EncryptionTransformer>>,
 ) -> Option<tunnr_etcd::server::NodeView> {
     let t = encryption.clone()?;
-    Some(tunnr_etcd::server::NodeView::new(move |key: &[u8], value: &[u8]| {
-        let key = String::from_utf8_lossy(key);
-        t.decode_if(&key, value).map_err(|e| format!("{e:#}"))
-    }))
+    Some(tunnr_etcd::server::NodeView::new(
+        move |key: &[u8], value: &[u8]| {
+            let key = String::from_utf8_lossy(key);
+            t.decode_if(&key, value).map_err(|e| format!("{e:#}"))
+        },
+    ))
 }
 
 /// Start this process's replica of the store (Raft mode) and serve it as
@@ -841,7 +905,9 @@ async fn start_store_replica(
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--store-raft-id needs --serve-etcd <addr>"))?;
     if args.storage_backend != "etcd" {
-        anyhow::bail!("--store-raft-id needs --storage-backend etcd (the components use the replica as etcd)");
+        anyhow::bail!(
+            "--store-raft-id needs --storage-backend etcd (the components use the replica as etcd)"
+        );
     }
     let scheme = if tls.is_some() { "https" } else { "http" };
     let client_port: u16 = addr
@@ -860,13 +926,18 @@ async fn start_store_replica(
     let me = peers
         .get(&id)
         .ok_or_else(|| anyhow::anyhow!("--store-raft-id {id} is not in --store-raft-peers"))?;
-    let listen_port = me.raft_addr.rsplit_once(':').map(|(_, p)| p).unwrap_or("2380");
+    let listen_port = me
+        .raft_addr
+        .rsplit_once(':')
+        .map(|(_, p)| p)
+        .unwrap_or("2380");
     let listen_host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("0.0.0.0");
     let listen: std::net::SocketAddr = format!("{listen_host}:{listen_port}").parse()?;
     let mut cfg = RaftConfig::new(id, peers.clone(), listen, &args.store_raft_dir);
     cfg.leader_file = args.store_raft_leader_file.clone().map(Into::into);
     cfg.status_file = args.store_raft_status_file.clone().map(Into::into);
-    let read = |p: &str| std::fs::read(p).map_err(|e| anyhow::anyhow!("--serve-etcd TLS file {p}: {e}"));
+    let read =
+        |p: &str| std::fs::read(p).map_err(|e| anyhow::anyhow!("--serve-etcd TLS file {p}: {e}"));
     let serve_tls = match &tls {
         Some([cert, key, ca]) => {
             cfg.tls = Some(RaftTls {
@@ -892,8 +963,15 @@ async fn start_store_replica(
         id,
         peers.len(),
         addr,
-        if serve_tls.is_some() { "mutual TLS" } else { "plaintext" },
-        peers.values().map(|p| p.raft_addr.clone()).collect::<Vec<_>>()
+        if serve_tls.is_some() {
+            "mutual TLS"
+        } else {
+            "plaintext"
+        },
+        peers
+            .values()
+            .map(|p| p.raft_addr.clone())
+            .collect::<Vec<_>>()
     );
     if args.serve_etcd_node_authz {
         if serve_tls.is_none() {
@@ -902,18 +980,24 @@ async fn start_store_replica(
         #[cfg(not(feature = "etcd-authz"))]
         anyhow::bail!("--serve-etcd-node-authz needs the etcd-authz feature");
         #[cfg(feature = "etcd-authz")]
-        info!("Store replica: per-node limits on, checked against committed state on every replica");
+        info!(
+            "Store replica: per-node limits on, checked against committed state on every replica"
+        );
     }
     let opts = tunnr_etcd::server::ServeOptions {
         client_url: format!("{scheme}://{addr}"),
         tls: serve_tls,
-        node_authz: args.serve_etcd_node_authz.then(tunnr_etcd::server::NodeAuthz::default),
+        node_authz: args
+            .serve_etcd_node_authz
+            .then(tunnr_etcd::server::NodeAuthz::default),
         node_view,
         ..Default::default()
     };
     let served = node.clone();
     tokio::spawn(async move {
-        if let Err(e) = tunnr_etcd::server::serve_raft(served, listener, opts, std::future::pending()).await {
+        if let Err(e) =
+            tunnr_etcd::server::serve_raft(served, listener, opts, std::future::pending()).await
+        {
             error!("store replica server error: {}", e);
         }
     });
@@ -923,7 +1007,10 @@ async fn start_store_replica(
     }
     match node.leader() {
         Some(l) => info!("Store replica {}: leader is replica {}", id, l),
-        None => tracing::warn!("Store replica {}: no leader yet after two minutes; starting the components anyway", id),
+        None => tracing::warn!(
+            "Store replica {}: no leader yet after two minutes; starting the components anyway",
+            id
+        ),
     }
     Ok(())
 }

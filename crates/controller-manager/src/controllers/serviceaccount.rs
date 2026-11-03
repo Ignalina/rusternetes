@@ -349,11 +349,15 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
     /// A ServiceAccount token signed with the cluster's key (the API
     /// server's issuer and audience). `Err` without the key.
     fn generate_token(&self, namespace: &str, sa_name: &str, sa_uid: &str) -> Result<String> {
-        let tm = self
-            .tokens
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no service-account key: no token for {namespace}/{sa_name}"))?;
-        let claims = ServiceAccountClaims::new(sa_name.to_string(), namespace.to_string(), sa_uid.to_string(), 24 * 365);
+        let tm = self.tokens.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("no service-account key: no token for {namespace}/{sa_name}")
+        })?;
+        let claims = ServiceAccountClaims::new(
+            sa_name.to_string(),
+            namespace.to_string(),
+            sa_uid.to_string(),
+            24 * 365,
+        );
         Ok(tm.generate_token(claims)?)
     }
 
@@ -441,6 +445,8 @@ mod tests {
         let storage = Arc::new(MemoryStorage::new());
         let controller = ServiceAccountController::new(storage);
         // Never an unsigned placeholder token.
-        assert!(controller.generate_token("default", "default", "test-uid-123").is_err());
+        assert!(controller
+            .generate_token("default", "default", "test-uid-123")
+            .is_err());
     }
 }

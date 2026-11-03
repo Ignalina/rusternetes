@@ -27,8 +27,14 @@ async fn custom_resource_fallback(
 ) -> Result<Response, StatusCode> {
     let path = uri.path();
     debug!("Fallback handler called for path: {}", path);
-    let wants_table = handlers::table::wants_table(req.headers().get(axum::http::header::ACCEPT).and_then(|v| v.to_str().ok()));
-    let is_watch_query = uri.query().is_some_and(|q| q.split('&').any(|kv| kv == "watch=true" || kv == "watch=1"));
+    let wants_table = handlers::table::wants_table(
+        req.headers()
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let is_watch_query = uri
+        .query()
+        .is_some_and(|q| q.split('&').any(|kv| kv == "watch=true" || kv == "watch=1"));
 
     // Parse URI to extract custom resource information
     // Expected formats:
@@ -497,7 +503,11 @@ async fn custom_resource_fallback(
                 Ok(Json(mut list)) => {
                     let mut failed = None;
                     for cr in &list.items {
-                        let item_ns = cr.metadata.namespace.clone().or(namespace.map(|s| s.to_string()));
+                        let item_ns = cr
+                            .metadata
+                            .namespace
+                            .clone()
+                            .or(namespace.map(|s| s.to_string()));
                         if let Err(e) = handlers::custom_resource::delete_custom_resource(
                             State(state.clone()),
                             Extension(auth_ctx.clone()),
@@ -730,7 +740,10 @@ async fn custom_resource_fallback(
 
     // `kubectl get`: a Table from the CRD's printer columns.
     if method == Method::GET && subresource.is_none() && wants_table && !is_watch_query {
-        return Ok(handlers::custom_resource::table_response(&state, group, version, plural, response).await);
+        return Ok(handlers::custom_resource::table_response(
+            &state, group, version, plural, response,
+        )
+        .await);
     }
     Ok(response)
 }
@@ -2476,7 +2489,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     // Combine routes and add shared state.
     // K8s (Go) treats /path and /path/ identically. Axum doesn't, so we
     // normalize URIs by stripping trailing slashes before routing.
-    let mut app = Router::new().merge(health_routes).merge(public_routes).merge(protected_routes);
+    let mut app = Router::new()
+        .merge(health_routes)
+        .merge(public_routes)
+        .merge(protected_routes);
 
     // Serve the console SPA at /console/ when a console directory is configured.
     if let Some(dir) = console_dir {

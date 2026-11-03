@@ -492,7 +492,11 @@ pub struct ReencryptReport {
 impl ReencryptReport {
     /// `aesgcm:k2=11 plaintext=1`.
     pub fn census_line(&self) -> String {
-        self.census.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>().join(" ")
+        self.census
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// The census as ConfigMap kube-system/[`CENSUS_CONFIGMAP`]: `write`, `census`, one
@@ -545,8 +549,9 @@ pub(crate) fn open<'a>(enc: &Encryption, key: &str, stored: &'a [u8]) -> Result<
 /// [`open`] as UTF-8 text.
 pub(crate) fn open_str(enc: &Encryption, key: &str, stored: &[u8]) -> Result<String> {
     let v = open(enc, key, stored)?;
-    String::from_utf8(v.into_owned())
-        .map_err(|e| rusternetes_common::Error::Storage(format!("Invalid UTF-8 in value at {key}: {e}")))
+    String::from_utf8(v.into_owned()).map_err(|e| {
+        rusternetes_common::Error::Storage(format!("Invalid UTF-8 in value at {key}: {e}"))
+    })
 }
 
 /// Helper function to build resource keys

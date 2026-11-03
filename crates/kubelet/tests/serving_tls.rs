@@ -4,7 +4,9 @@
 
 use std::sync::Arc;
 
-use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, SanType,
+};
 use rusternetes_kubelet::serving_tls::ServingTls;
 
 struct Ca {
@@ -17,7 +19,10 @@ fn ca(name: &str) -> Ca {
     let mut p = CertificateParams::default();
     p.distinguished_name.push(DnType::CommonName, name);
     p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    Ca { cert: p.self_signed(&key).unwrap(), key }
+    Ca {
+        cert: p.self_signed(&key).unwrap(),
+        key,
+    }
 }
 
 fn leaf(ca: &Ca, cn: &str, server: bool) -> (String, String) {
@@ -25,10 +30,17 @@ fn leaf(ca: &Ca, cn: &str, server: bool) -> (String, String) {
     let mut p = CertificateParams::default();
     p.distinguished_name.push(DnType::CommonName, cn);
     if server {
-        p.subject_alt_names.push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
+        p.subject_alt_names
+            .push(SanType::IpAddress("127.0.0.1".parse().unwrap()));
     }
-    p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
-    (p.signed_by(&key, &ca.cert, &ca.key).unwrap().pem(), key.serialize_pem())
+    p.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    (
+        p.signed_by(&key, &ca.cert, &ca.key).unwrap().pem(),
+        key.serialize_pem(),
+    )
 }
 
 async fn serve(cluster: &Ca, dir: &std::path::Path) -> std::net::SocketAddr {
@@ -60,7 +72,9 @@ fn client(cluster: &Ca, id: Option<(String, String)>) -> reqwest::Client {
     let mut b = reqwest::Client::builder()
         .use_rustls_tls()
         .tls_built_in_root_certs(false)
-        .add_root_certificate(reqwest::Certificate::from_pem(cluster.cert.pem().as_bytes()).unwrap())
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(cluster.cert.pem().as_bytes()).unwrap(),
+        )
         .timeout(std::time::Duration::from_secs(3));
     if let Some((c, k)) = id {
         b = b.identity(reqwest::Identity::from_pem(format!("{c}{k}").as_bytes()).unwrap());
@@ -75,12 +89,41 @@ async fn only_a_control_plane_certificate_reaches_the_node_server() {
     let dir = tempfile::tempdir().unwrap();
     let addr = serve(&cluster, dir.path()).await;
     let url = format!("https://{addr}/healthz");
-    let api = client(&cluster, Some(leaf(&cluster, "rusternetes-apiserver", false)));
-    assert_eq!(api.get(&url).send().await.unwrap().text().await.unwrap(), "ok");
-    assert!(client(&cluster, None).get(&url).send().await.is_err(), "no certificate");
-    assert!(client(&cluster, Some(leaf(&cluster, "system:node:other", false))).get(&url).send().await.is_err(), "a node's certificate");
-    assert!(client(&cluster, Some(leaf(&other, "rusternetes-apiserver", false))).get(&url).send().await.is_err(), "another CA");
-    let plain = reqwest::Client::new().get(format!("http://{addr}/healthz")).send().await;
-    assert!(plain.map(|r| !r.status().is_success()).unwrap_or(true), "plaintext");
+    let api = client(
+        &cluster,
+        Some(leaf(&cluster, "rusternetes-apiserver", false)),
+    );
+    assert_eq!(
+        api.get(&url).send().await.unwrap().text().await.unwrap(),
+        "ok"
+    );
+    assert!(
+        client(&cluster, None).get(&url).send().await.is_err(),
+        "no certificate"
+    );
+    assert!(
+        client(&cluster, Some(leaf(&cluster, "system:node:other", false)))
+            .get(&url)
+            .send()
+            .await
+            .is_err(),
+        "a node's certificate"
+    );
+    assert!(
+        client(&cluster, Some(leaf(&other, "rusternetes-apiserver", false)))
+            .get(&url)
+            .send()
+            .await
+            .is_err(),
+        "another CA"
+    );
+    let plain = reqwest::Client::new()
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await;
+    assert!(
+        plain.map(|r| !r.status().is_success()).unwrap_or(true),
+        "plaintext"
+    );
     let _ = Arc::new(());
 }

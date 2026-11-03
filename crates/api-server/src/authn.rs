@@ -34,7 +34,13 @@ pub struct PeerIdentity(pub Option<Arc<UserInfo>>);
 pub fn user_from_cert_der(der: &[u8]) -> Option<UserInfo> {
     let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
     let subject = cert.subject();
-    let cn = subject.iter_common_name().next()?.as_str().ok()?.trim().to_string();
+    let cn = subject
+        .iter_common_name()
+        .next()?
+        .as_str()
+        .ok()?
+        .trim()
+        .to_string();
     if cn.is_empty() {
         return None;
     }
@@ -84,7 +90,9 @@ pub fn authenticate(
                 Err("Unauthorized: invalid bearer token")
             }
         }
-        None => Err("Unauthorized: a client certificate from the cluster CA or a bearer token is required"),
+        None => Err(
+            "Unauthorized: a client certificate from the cluster CA or a bearer token is required",
+        ),
     }
 }
 
@@ -156,14 +164,19 @@ pub struct PeerCertAcceptor<A> {
 
 impl<A, I, S> axum_server::accept::Accept<I, S> for PeerCertAcceptor<A>
 where
-    A: axum_server::accept::Accept<I, S, Stream = tokio_rustls::server::TlsStream<I>> + Clone + Send + Sync + 'static,
+    A: axum_server::accept::Accept<I, S, Stream = tokio_rustls::server::TlsStream<I>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     A::Future: Send + 'static,
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: Send + 'static,
 {
     type Stream = tokio_rustls::server::TlsStream<I>;
     type Service = WithPeer<A::Service>;
-    type Future = Pin<Box<dyn Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send>>;
+    type Future =
+        Pin<Box<dyn Future<Output = std::io::Result<(Self::Stream, Self::Service)>> + Send>>;
 
     fn accept(&self, stream: I, service: S) -> Self::Future {
         let fut = self.inner.accept(stream, service);
@@ -176,7 +189,13 @@ where
                 .and_then(|c| c.first())
                 .and_then(|c| user_from_cert_der(c.as_ref()))
                 .map(Arc::new);
-            Ok((stream, WithPeer { inner: service, peer: PeerIdentity(user) }))
+            Ok((
+                stream,
+                WithPeer {
+                    inner: service,
+                    peer: PeerIdentity(user),
+                },
+            ))
         })
     }
 }
@@ -221,19 +240,38 @@ mod tests {
     }
 
     fn anyone() -> UserInfo {
-        UserInfo { username: "u".into(), uid: String::new(), groups: vec![], extra: Default::default() }
+        UserInfo {
+            username: "u".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        }
     }
 
     #[test]
     fn a_certificate_names_its_user_and_groups() {
         use rcgen::DnType::*;
-        let admin = user_from_cert_der(&cert(&[(CommonName, "admin"), (OrganizationName, "system:masters")])).unwrap();
+        let admin = user_from_cert_der(&cert(&[
+            (CommonName, "admin"),
+            (OrganizationName, "system:masters"),
+        ]))
+        .unwrap();
         assert_eq!(admin.username, "admin");
         assert!(admin.groups.contains(&"system:masters".to_string()));
         assert!(admin.groups.contains(&"system:authenticated".to_string()));
-        let node = user_from_cert_der(&cert(&[(CommonName, "system:node:w1"), (OrganizationName, "system:nodes")])).unwrap();
+        let node = user_from_cert_der(&cert(&[
+            (CommonName, "system:node:w1"),
+            (OrganizationName, "system:nodes"),
+        ]))
+        .unwrap();
         assert_eq!(node.username, "system:node:w1");
-        assert_eq!(node.groups, vec!["system:nodes".to_string(), "system:authenticated".to_string()]);
+        assert_eq!(
+            node.groups,
+            vec![
+                "system:nodes".to_string(),
+                "system:authenticated".to_string()
+            ]
+        );
         // The control plane's serving certificate: a user in no group.
         let srv = user_from_cert_der(&cert(&[(CommonName, "rusternetes-apiserver")])).unwrap();
         assert_eq!(srv.groups, vec!["system:authenticated".to_string()]);
@@ -248,18 +286,33 @@ mod tests {
         assert!(authenticate(None, Some("Bearer nonsense"), &tm, &bt).is_err());
         assert!(authenticate(None, Some("Basic YTpi"), &tm, &bt).is_err());
         let forged = TokenManager::new(b"rusternetes-secret-change-in-production")
-            .generate_token(rusternetes_common::auth::ServiceAccountClaims::new("default".into(), "default".into(), "u".into(), 1))
+            .generate_token(rusternetes_common::auth::ServiceAccountClaims::new(
+                "default".into(),
+                "default".into(),
+                "u".into(),
+                1,
+            ))
             .unwrap();
         assert!(authenticate(None, Some(&format!("Bearer {forged}")), &tm, &bt).is_err());
         let good = tm
-            .generate_token(rusternetes_common::auth::ServiceAccountClaims::new("coredns".into(), "kube-system".into(), "u".into(), 1))
+            .generate_token(rusternetes_common::auth::ServiceAccountClaims::new(
+                "coredns".into(),
+                "kube-system".into(),
+                "u".into(),
+                1,
+            ))
             .unwrap();
         let u = authenticate(None, Some(&format!("Bearer {good}")), &tm, &bt).unwrap();
         assert_eq!(u.username, "system:serviceaccount:kube-system:coredns");
         // A certificate wins over a token.
         let mut admin = anyone();
         admin.username = "admin".into();
-        assert_eq!(authenticate(Some(&admin), Some("Bearer nonsense"), &tm, &bt).unwrap().username, "admin");
+        assert_eq!(
+            authenticate(Some(&admin), Some("Bearer nonsense"), &tm, &bt)
+                .unwrap()
+                .username,
+            "admin"
+        );
     }
 
     fn attrs(m: Method, uri: &str) -> RequestAttributes {
@@ -268,28 +321,88 @@ mod tests {
 
     #[test]
     fn the_url_says_what_is_asked() {
-        let a = attrs(Method::GET, "/api/v1/namespaces/kube-system/secrets/cilium-ca");
-        assert_eq!((a.verb.as_str(), a.resource.as_str(), a.namespace.as_deref(), a.name.as_deref(), a.api_group.as_str()), ("get", "secrets", Some("kube-system"), Some("cilium-ca"), ""));
-        let a = attrs(Method::GET, "/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3Dw1");
-        assert_eq!((a.verb.as_str(), a.resource.as_str(), a.namespace.as_deref()), ("watch", "pods", None));
+        let a = attrs(
+            Method::GET,
+            "/api/v1/namespaces/kube-system/secrets/cilium-ca",
+        );
+        assert_eq!(
+            (
+                a.verb.as_str(),
+                a.resource.as_str(),
+                a.namespace.as_deref(),
+                a.name.as_deref(),
+                a.api_group.as_str()
+            ),
+            ("get", "secrets", Some("kube-system"), Some("cilium-ca"), "")
+        );
+        let a = attrs(
+            Method::GET,
+            "/api/v1/pods?watch=true&fieldSelector=spec.nodeName%3Dw1",
+        );
+        assert_eq!(
+            (a.verb.as_str(), a.resource.as_str(), a.namespace.as_deref()),
+            ("watch", "pods", None)
+        );
         let a = attrs(Method::GET, "/api/v1/watch/namespaces/default/pods");
-        assert_eq!((a.verb.as_str(), a.namespace.as_deref()), ("watch", Some("default")));
+        assert_eq!(
+            (a.verb.as_str(), a.namespace.as_deref()),
+            ("watch", Some("default"))
+        );
         let a = attrs(Method::POST, "/apis/apps/v1/namespaces/default/deployments");
-        assert_eq!((a.verb.as_str(), a.resource.as_str(), a.api_group.as_str(), a.name.as_deref()), ("create", "deployments", "apps", None));
+        assert_eq!(
+            (
+                a.verb.as_str(),
+                a.resource.as_str(),
+                a.api_group.as_str(),
+                a.name.as_deref()
+            ),
+            ("create", "deployments", "apps", None)
+        );
         let a = attrs(Method::PUT, "/api/v1/nodes/w1/status");
-        assert_eq!((a.verb.as_str(), a.resource.as_str(), a.name.as_deref(), a.subresource.as_deref(), a.namespace.as_deref()), ("update", "nodes", Some("w1"), Some("status"), None));
+        assert_eq!(
+            (
+                a.verb.as_str(),
+                a.resource.as_str(),
+                a.name.as_deref(),
+                a.subresource.as_deref(),
+                a.namespace.as_deref()
+            ),
+            ("update", "nodes", Some("w1"), Some("status"), None)
+        );
         let a = attrs(Method::PATCH, "/api/v1/namespaces/default/pods/web/status");
-        assert_eq!((a.verb.as_str(), a.subresource.as_deref()), ("patch", Some("status")));
+        assert_eq!(
+            (a.verb.as_str(), a.subresource.as_deref()),
+            ("patch", Some("status"))
+        );
         let a = attrs(Method::DELETE, "/api/v1/namespaces/default/pods");
         assert_eq!(a.verb, "deletecollection");
         let a = attrs(Method::GET, "/api/v1/namespaces/default");
-        assert_eq!((a.verb.as_str(), a.resource.as_str(), a.name.as_deref()), ("get", "namespaces", Some("default")));
+        assert_eq!(
+            (a.verb.as_str(), a.resource.as_str(), a.name.as_deref()),
+            ("get", "namespaces", Some("default"))
+        );
         let a = attrs(Method::PUT, "/api/v1/namespaces/default/finalize");
-        assert_eq!((a.resource.as_str(), a.name.as_deref(), a.subresource.as_deref()), ("namespaces", Some("default"), Some("finalize")));
-        let a = attrs(Method::GET, "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/w1");
-        assert_eq!((a.api_group.as_str(), a.resource.as_str(), a.name.as_deref()), ("coordination.k8s.io", "leases", Some("w1")));
+        assert_eq!(
+            (
+                a.resource.as_str(),
+                a.name.as_deref(),
+                a.subresource.as_deref()
+            ),
+            ("namespaces", Some("default"), Some("finalize"))
+        );
+        let a = attrs(
+            Method::GET,
+            "/apis/coordination.k8s.io/v1/namespaces/kube-node-lease/leases/w1",
+        );
+        assert_eq!(
+            (a.api_group.as_str(), a.resource.as_str(), a.name.as_deref()),
+            ("coordination.k8s.io", "leases", Some("w1"))
+        );
         let a = attrs(Method::GET, "/apis/cilium.io/v2/ciliumnodes");
-        assert_eq!((a.api_group.as_str(), a.resource.as_str(), a.verb.as_str()), ("cilium.io", "ciliumnodes", "list"));
+        assert_eq!(
+            (a.api_group.as_str(), a.resource.as_str(), a.verb.as_str()),
+            ("cilium.io", "ciliumnodes", "list")
+        );
         assert!(request_attributes(&Method::GET, &"/healthz".parse().unwrap(), anyone()).is_none());
         assert!(request_attributes(&Method::GET, &"/apis".parse().unwrap(), anyone()).is_none());
     }

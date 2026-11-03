@@ -12,7 +12,10 @@ fn get_api_server_ip() -> Result<String> {
     // (the virtual IP that follows the store's Raft leader).
     if let Ok(ip) = std::env::var("RUSTERNETES_ADVERTISE_ADDRESS") {
         if !ip.trim().is_empty() {
-            debug!("API server IP from RUSTERNETES_ADVERTISE_ADDRESS: {}", ip.trim());
+            debug!(
+                "API server IP from RUSTERNETES_ADVERTISE_ADDRESS: {}",
+                ip.trim()
+            );
             return Ok(ip.trim().to_string());
         }
     }
@@ -48,7 +51,8 @@ fn get_api_server_ip() -> Result<String> {
 /// `system-namespaces` controller, `pkg/controlplane/controller/systemnamespaces`).
 /// Components such as CNI agents and operators look their namespace up at
 /// start and refuse to run when it is missing.
-pub const SYSTEM_NAMESPACES: [&str; 4] = ["default", "kube-system", "kube-public", "kube-node-lease"];
+pub const SYSTEM_NAMESPACES: [&str; 4] =
+    ["default", "kube-system", "kube-public", "kube-node-lease"];
 
 /// Create each of [`SYSTEM_NAMESPACES`] that the store does not hold yet.
 pub async fn bootstrap_system_namespaces(storage: Arc<StorageBackend>) -> Result<()> {
@@ -276,7 +280,10 @@ pub const KUBERNETES_SERVICE_IP: &str = "10.96.0.1";
 /// ClusterIP [`KUBERNETES_SERVICE_IP`], port 443 `https` to the API servers'
 /// port, no selector (its Endpoints are the advertised address above).
 /// Created when missing; an existing one is left as it is.
-pub async fn ensure_kubernetes_service(storage: &Arc<StorageBackend>, api_server_port: u16) -> Result<()> {
+pub async fn ensure_kubernetes_service(
+    storage: &Arc<StorageBackend>,
+    api_server_port: u16,
+) -> Result<()> {
     let key = rusternetes_storage::build_key("services", Some("default"), "kubernetes");
     if storage.get::<serde_json::Value>(&key).await.is_ok() {
         return Ok(());
@@ -289,7 +296,9 @@ pub async fn ensure_kubernetes_service(storage: &Arc<StorageBackend>, api_server
         }
         // Another API server of the same store was first.
         Err(rusternetes_common::Error::AlreadyExists(_)) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!("Failed to create the kubernetes Service: {e}")),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to create the kubernetes Service: {e}"
+        )),
     }
 }
 
@@ -379,7 +388,10 @@ mod kubernetes_service_tests {
         assert_eq!(v["spec"]["ports"][0]["name"], "https");
         assert_eq!(v["spec"]["ports"][0]["port"], 443);
         assert_eq!(v["spec"]["ports"][0]["targetPort"], 6443);
-        assert!(v["spec"].get("selector").is_none_or(|s| s.is_null()), "no selector: its Endpoints are the API servers'");
+        assert!(
+            v["spec"].get("selector").is_none_or(|s| s.is_null()),
+            "no selector: its Endpoints are the API servers'"
+        );
         assert!(!v["metadata"]["uid"].as_str().unwrap_or("").is_empty());
         assert!(v["metadata"]["creationTimestamp"].is_string());
     }

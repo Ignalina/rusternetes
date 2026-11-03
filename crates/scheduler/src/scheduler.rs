@@ -1221,12 +1221,23 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
     async fn check_volume_node_affinity(&self, node: &Node, pod: &Pod) -> Result<bool, String> {
         use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
         let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
-        let volumes = pod.spec.as_ref().and_then(|s| s.volumes.as_ref()).cloned().unwrap_or_default();
+        let volumes = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.volumes.as_ref())
+            .cloned()
+            .unwrap_or_default();
         for v in volumes {
-            let Some(src) = v.persistent_volume_claim else { continue };
+            let Some(src) = v.persistent_volume_claim else {
+                continue;
+            };
             let pvc: PersistentVolumeClaim = self
                 .storage
-                .get(&build_key("persistentvolumeclaims", Some(ns), &src.claim_name))
+                .get(&build_key(
+                    "persistentvolumeclaims",
+                    Some(ns),
+                    &src.claim_name,
+                ))
                 .await
                 .map_err(|_| format!("claim {ns}/{} does not exist", src.claim_name))?;
             let Some(pv_name) = pvc.spec.volume_name.clone() else {
@@ -1237,7 +1248,12 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
                 .get(&build_key("persistentvolumes", None, &pv_name))
                 .await
                 .map_err(|_| format!("PV {pv_name} does not exist"))?;
-            if let Some(req) = pv.spec.node_affinity.as_ref().and_then(|a| a.required.as_ref()) {
+            if let Some(req) = pv
+                .spec
+                .node_affinity
+                .as_ref()
+                .and_then(|a| a.required.as_ref())
+            {
                 // The PV's NodeSelector is its own type with the same shape.
                 let sel: rusternetes_common::resources::NodeSelector = serde_json::to_value(req)
                     .and_then(serde_json::from_value)

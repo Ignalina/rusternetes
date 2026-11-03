@@ -351,7 +351,9 @@ impl ContainerRuntime {
             std::env::var("JWT_SECRET")
                 .ok()
                 .filter(|s| !s.is_empty() && s != "rusternetes-secret-change-in-production")
-                .map(|s| std::sync::Arc::new(rusternetes_common::auth::TokenManager::new(s.as_bytes())))
+                .map(|s| {
+                    std::sync::Arc::new(rusternetes_common::auth::TokenManager::new(s.as_bytes()))
+                })
         });
 
         let supports_uts_container_mode = Self::detect_uts_container_mode(backend.as_ref()).await;
@@ -588,11 +590,22 @@ impl ContainerRuntime {
                 "Stale sandbox network {} for pod {} (an earlier start or kubelet): CNI DEL and a fresh namespace before ADD",
                 netns_name, pod_name
             );
-            if let Err(e) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
+            if let Err(e) = cni
+                .teardown_network_async(
+                    pod_name.to_string(),
+                    netns_path.clone(),
+                    "eth0".into(),
+                    None,
+                )
+                .await
+            {
                 warn!("CNI DEL of the stale network of pod {}: {}", pod_name, e);
             }
             if let Err(e) = self.netns_del(&netns_name).await {
-                warn!("Failed to delete stale network namespace {}: {}", netns_name, e);
+                warn!(
+                    "Failed to delete stale network namespace {}: {}",
+                    netns_name, e
+                );
             }
         }
 
@@ -602,7 +615,16 @@ impl ContainerRuntime {
             .with_context(|| format!("network namespace {netns_name}"))?;
 
         let args = cni_args(pod, pod_name);
-        match cni.setup_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None, Some(args)).await {
+        match cni
+            .setup_network_async(
+                pod_name.to_string(),
+                netns_path.clone(),
+                "eth0".into(),
+                None,
+                Some(args),
+            )
+            .await
+        {
             Ok(result) => {
                 info!(
                     "CNI network setup successful for pod {}: IP={:?}",
@@ -611,8 +633,19 @@ impl ContainerRuntime {
                 Ok(netns_path)
             }
             Err(e) => {
-                warn!("CNI ADD failed for pod {}: {}; CNI DEL and the namespace removed", pod_name, e);
-                if let Err(d) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
+                warn!(
+                    "CNI ADD failed for pod {}: {}; CNI DEL and the namespace removed",
+                    pod_name, e
+                );
+                if let Err(d) = cni
+                    .teardown_network_async(
+                        pod_name.to_string(),
+                        netns_path.clone(),
+                        "eth0".into(),
+                        None,
+                    )
+                    .await
+                {
                     warn!("CNI DEL after the failed ADD of pod {}: {}", pod_name, d);
                 }
                 let _ = self.netns_del(&netns_name).await;
@@ -635,7 +668,15 @@ impl ContainerRuntime {
 
         // Teardown CNI networking
         if let Some(cni) = &self.cni {
-            if let Err(e) = cni.teardown_network_async(pod_name.to_string(), netns_path.clone(), "eth0".into(), None).await {
+            if let Err(e) = cni
+                .teardown_network_async(
+                    pod_name.to_string(),
+                    netns_path.clone(),
+                    "eth0".into(),
+                    None,
+                )
+                .await
+            {
                 warn!("Failed to teardown CNI network for pod {}: {}", pod_name, e);
                 // Continue with namespace deletion even if CNI teardown fails
             } else {
@@ -900,7 +941,10 @@ impl ContainerRuntime {
         filters.insert("name".to_string(), vec![format!("^/{}_", pod_name)]);
         match self
             .backend
-            .list_containers(ListContainersOptions { all: false, filters })
+            .list_containers(ListContainersOptions {
+                all: false,
+                filters,
+            })
             .await
         {
             Ok(c) => !c.is_empty(),
@@ -2280,23 +2324,35 @@ impl ContainerRuntime {
                             if let Some(sa_token) = &source.service_account_token {
                                 let file_path = format!("{}/{}", volume_dir, sa_token.path);
                                 expected_files.insert(file_path.clone());
-                                let life = sa_token.expiration_seconds.unwrap_or(3600).max(600) as u64;
+                                let life =
+                                    sa_token.expiration_seconds.unwrap_or(3600).max(600) as u64;
                                 let age = std::fs::metadata(&file_path)
                                     .and_then(|m| m.modified())
                                     .ok()
                                     .and_then(|t| t.elapsed().ok())
                                     .map(|d| d.as_secs());
-                                let empty = std::fs::metadata(&file_path).map(|m| m.len() == 0).unwrap_or(true);
+                                let empty = std::fs::metadata(&file_path)
+                                    .map(|m| m.len() == 0)
+                                    .unwrap_or(true);
                                 if empty || age.is_none_or(|a| a * 5 >= life * 4) {
-                                    match self.projected_sa_token(pod, pod_name, namespace, sa_token).await {
+                                    match self
+                                        .projected_sa_token(pod, pod_name, namespace, sa_token)
+                                        .await
+                                    {
                                         Ok(token) => {
                                             let tmp = format!("{file_path}.new");
                                             if std::fs::write(&tmp, &token).is_ok() {
                                                 let _ = std::fs::rename(&tmp, &file_path);
-                                                info!("Renewed the ServiceAccount token of pod {}/{}", namespace, pod_name);
+                                                info!(
+                                                    "Renewed the ServiceAccount token of pod {}/{}",
+                                                    namespace, pod_name
+                                                );
                                             }
                                         }
-                                        Err(e) => warn!("ServiceAccount token of pod {}/{}: {}", namespace, pod_name, e),
+                                        Err(e) => warn!(
+                                            "ServiceAccount token of pod {}/{}: {}",
+                                            namespace, pod_name, e
+                                        ),
                                     }
                                 }
                             }
@@ -2732,7 +2788,9 @@ impl ContainerRuntime {
                     node_name,
                     node_uid,
                 };
-                self.token_manager.as_ref().and_then(|tm| tm.generate_token(claims).ok())
+                self.token_manager
+                    .as_ref()
+                    .and_then(|tm| tm.generate_token(claims).ok())
             } else {
                 None
             };
@@ -3350,7 +3408,10 @@ impl ContainerRuntime {
                         // Secret exists): an empty file, filled by refresh_volumes as
                         // soon as there is one; the pod starts either way (a failed
                         // start after the network is set up would leak it).
-                        let token = match self.projected_sa_token(pod, pod_name, namespace, sa_token).await {
+                        let token = match self
+                            .projected_sa_token(pod, pod_name, namespace, sa_token)
+                            .await
+                        {
                             Ok(t) => t,
                             Err(e) => {
                                 warn!("{e:#}; the token file stays empty until there is one");
@@ -3710,19 +3771,22 @@ impl ContainerRuntime {
                     name: pod_name.clone(),
                     uid: pod.metadata.uid.clone(),
                 }),
-                node: node_name.as_ref().map(|nn| {
-                    rusternetes_common::auth::KubeRef {
+                node: node_name
+                    .as_ref()
+                    .map(|nn| rusternetes_common::auth::KubeRef {
                         name: nn.clone(),
                         uid: node_uid.clone().unwrap_or_default(),
-                    }
-                }),
+                    }),
             }),
             pod_name: Some(pod_name.clone()),
             pod_uid: Some(pod.metadata.uid.clone()),
             node_name,
             node_uid,
         };
-        let signed = self.token_manager.as_ref().map(|tm| tm.generate_token(claims));
+        let signed = self
+            .token_manager
+            .as_ref()
+            .map(|tm| tm.generate_token(claims));
         let token = match signed {
             Some(Ok(t)) => t,
             other => {
@@ -3756,7 +3820,9 @@ impl ContainerRuntime {
             .and_then(|d| d.get("token"))
             .map(|v| String::from_utf8_lossy(v).to_string())
             .filter(|t| t.split('.').count() == 3)
-            .ok_or_else(|| anyhow::anyhow!("Secret {namespace}/{sa_name}-token holds no signed token"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("Secret {namespace}/{sa_name}-token holds no signed token")
+            })
     }
 
     async fn create_serviceaccount_token_volume(&self, pod: &Pod) -> Result<String> {
@@ -3868,11 +3934,18 @@ impl ContainerRuntime {
             node_uid,
         };
 
-        let token = match self.token_manager.as_ref().map(|tm| tm.generate_token(claims)) {
+        let token = match self
+            .token_manager
+            .as_ref()
+            .map(|tm| tm.generate_token(claims))
+        {
             Some(Ok(t)) => t,
             other => {
                 if let Some(Err(e)) = other {
-                    warn!("Failed to generate bound token, falling back to static: {}", e);
+                    warn!(
+                        "Failed to generate bound token, falling back to static: {}",
+                        e
+                    );
                 }
                 Self::sa_secret_token(storage.as_ref(), namespace, sa_name)
                     .await
@@ -10310,7 +10383,10 @@ mod tests {
         let e = super::check_seccomp_profiles(&pod("missing.json", "ok.json"), d.path())
             .unwrap_err()
             .to_string();
-        assert!(e.starts_with("CreateContainerError: cannot load seccomp profile"), "{e}");
+        assert!(
+            e.starts_with("CreateContainerError: cannot load seccomp profile"),
+            "{e}"
+        );
         assert!(e.contains("missing.json"), "{e}");
         assert!(super::check_seccomp_profiles(&pod("ok.json", "gone.json"), d.path()).is_err());
     }
@@ -12612,15 +12688,24 @@ mod host_network_and_cni_args_tests {
     /// processes); `shareProcessNamespace` joins the pause container.
     #[test]
     fn host_pid_and_host_ipc_reach_the_container_namespaces() {
-        assert_eq!(pid_mode(&pod_with(|s| s.host_pid = Some(true))).as_deref(), Some("host"));
+        assert_eq!(
+            pid_mode(&pod_with(|s| s.host_pid = Some(true))).as_deref(),
+            Some("host")
+        );
         assert_eq!(
             pid_mode(&pod_with(|s| s.share_process_namespace = Some(true))).as_deref(),
             Some("container:web_pause")
         );
         assert_eq!(pid_mode(&pod_with(|_| ())), None);
-        assert_eq!(ipc_mode(&pod_with(|s| s.host_ipc = Some(true)), true).as_deref(), Some("host"));
+        assert_eq!(
+            ipc_mode(&pod_with(|s| s.host_ipc = Some(true)), true).as_deref(),
+            Some("host")
+        );
         assert_eq!(ipc_mode(&pod_with(|_| ()), true), None);
-        assert_eq!(ipc_mode(&pod_with(|_| ()), false).as_deref(), Some("container:web_pause"));
+        assert_eq!(
+            ipc_mode(&pod_with(|_| ()), false).as_deref(),
+            Some("container:web_pause")
+        );
     }
 
     fn pod(json: serde_json::Value) -> Pod {
@@ -12737,11 +12822,18 @@ exit 0
         }
     }
 
-    async fn runtime(root: &Path, backend: Arc<FakeBackend>) -> (ContainerRuntime, tempfile::TempDir) {
+    async fn runtime(
+        root: &Path,
+        backend: Arc<FakeBackend>,
+    ) -> (ContainerRuntime, tempfile::TempDir) {
         runtime_with(root, backend, Arc::new(DirNetns(root.join("netns")))).await
     }
 
-    async fn runtime_with(root: &Path, backend: Arc<FakeBackend>, netns: Arc<dyn NetnsOps>) -> (ContainerRuntime, tempfile::TempDir) {
+    async fn runtime_with(
+        root: &Path,
+        backend: Arc<FakeBackend>,
+        netns: Arc<dyn NetnsOps>,
+    ) -> (ContainerRuntime, tempfile::TempDir) {
         let volumes = tempfile::tempdir().unwrap();
         let cni = CniRuntime::new(vec![root.join("bin")], root.join("net.d")).unwrap();
         let runtime = ContainerRuntime::with_backend(
@@ -12781,7 +12873,12 @@ exit 0
         )
         .unwrap();
         let backend = Arc::new(FakeBackend::new("fake"));
-        let (runtime, _volumes) = runtime_with(&root, backend, Arc::new(SlowNetns(DirNetns(root.join("netns"))))).await;
+        let (runtime, _volumes) = runtime_with(
+            &root,
+            backend,
+            Arc::new(SlowNetns(DirNetns(root.join("netns")))),
+        )
+        .await;
         let ticks = Arc::new(AtomicUsize::new(0));
         let t = ticks.clone();
         let ticker = tokio::spawn(async move {
@@ -12793,7 +12890,10 @@ exit 0
         let path = runtime.setup_pod_network(&pod()).await.unwrap();
         let n = ticks.load(Ordering::SeqCst);
         ticker.abort();
-        assert!(n >= 5, "the runtime ticked {n} times while the namespace was made (stalled)");
+        assert!(
+            n >= 5,
+            "the runtime ticked {n} times while the namespace was made (stalled)"
+        );
         assert!(Path::new(&path).exists());
     }
 
@@ -12814,7 +12914,13 @@ exit 0
         .unwrap();
         let backend = Arc::new(FakeBackend::new("fake"));
         let (runtime, volumes) = runtime(&root, backend.clone()).await;
-        Env { _dir: dir, root, backend, runtime, _volumes: volumes }
+        Env {
+            _dir: dir,
+            root,
+            backend,
+            runtime,
+            _volumes: volumes,
+        }
     }
 
     impl Env {
@@ -12832,7 +12938,11 @@ exit 0
         /// IPs reserved and endpoints present.
         fn held(&self) -> (usize, usize) {
             let names: Vec<String> = std::fs::read_dir(self.state())
-                .map(|r| r.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+                .map(|r| {
+                    r.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
                 .unwrap_or_default();
             (
                 names.iter().filter(|n| n.starts_with("ip-")).count(),
@@ -12863,7 +12973,11 @@ exit 0
         e.backend.fail_image("app:1", true);
 
         assert!(e.runtime.start_pod(&pod()).await.is_err());
-        assert_eq!(e.log(), vec!["ADD", "DEL"], "a failed start is followed by CNI DEL");
+        assert_eq!(
+            e.log(),
+            vec!["ADD", "DEL"],
+            "a failed start is followed by CNI DEL"
+        );
         assert_eq!(e.held(), (0, 0), "no IP or endpoint kept by a failed start");
         assert!(!e.netns_exists(), "no namespace (and no veth in it) kept");
 
@@ -12919,7 +13033,14 @@ exit 0
     async fn a_container_restart_keeps_the_live_sandbox_network() {
         let e = env().await;
         e.runtime.start_pod(&pod()).await.unwrap();
-        e.backend.state.lock().unwrap().containers.get_mut("web_app").unwrap().state = "exited";
+        e.backend
+            .state
+            .lock()
+            .unwrap()
+            .containers
+            .get_mut("web_app")
+            .unwrap()
+            .state = "exited";
 
         e.runtime.start_pod(&pod()).await.unwrap();
         assert_eq!(e.log(), vec!["ADD"]);

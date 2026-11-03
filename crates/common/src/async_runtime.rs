@@ -88,7 +88,11 @@ mod tests {
 /// than two, so one task that blocks (a child process waited on, an fsync)
 /// never idles the whole process on a one-CPU node.
 pub fn worker_threads() -> usize {
-    resolve_worker_threads(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+    resolve_worker_threads(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
 }
 
 /// Testable core of [`worker_threads`].

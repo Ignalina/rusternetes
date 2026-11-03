@@ -84,8 +84,7 @@ pub struct KeyConfig {
 impl EncryptionConfig {
     /// Parse YAML (or JSON, which is YAML).
     pub fn parse(text: &str) -> Result<Self> {
-        let c: EncryptionConfig =
-            serde_yaml::from_str(text).context("EncryptionConfiguration")?;
+        let c: EncryptionConfig = serde_yaml::from_str(text).context("EncryptionConfiguration")?;
         if c.kind != "EncryptionConfiguration" {
             bail!("kind {:?}: expected EncryptionConfiguration", c.kind);
         }
@@ -171,9 +170,12 @@ pub struct AesGcmProvider {
 
 impl AesGcmProvider {
     pub fn new(key: &[u8], key_name: String) -> Result<Self> {
-        let key_array: [u8; 32] = key
-            .try_into()
-            .map_err(|_| anyhow!("aesgcm key {key_name:?}: {} bytes, expected 32 (AES-256)", key.len()))?;
+        let key_array: [u8; 32] = key.try_into().map_err(|_| {
+            anyhow!(
+                "aesgcm key {key_name:?}: {} bytes, expected 32 (AES-256)",
+                key.len()
+            )
+        })?;
         if key_name.is_empty() || key_name.contains(':') {
             bail!("aesgcm key name {key_name:?}: must be non-empty and without ':'");
         }
@@ -307,7 +309,9 @@ impl Chain {
             self.providers
                 .iter()
                 .find(|p| p.prefix().is_empty())
-                .ok_or_else(|| anyhow!("{key}: stored unencrypted, and identity is not among the providers"))
+                .ok_or_else(|| {
+                    anyhow!("{key}: stored unencrypted, and identity is not among the providers")
+                })
         }
     }
 }
@@ -393,7 +397,11 @@ impl EncryptionTransformer {
         info!(
             "Encryption at rest: {} resource(s){}: {}",
             t.resources.len(),
-            if t.all.is_some() { " + every other" } else { "" },
+            if t.all.is_some() {
+                " + every other"
+            } else {
+                ""
+            },
             t.resources
                 .iter()
                 .map(|(r, c)| format!("{r} writes with {}", c.write().name()))
@@ -405,7 +413,10 @@ impl EncryptionTransformer {
 
     /// The resource of a storage key: `/registry/secrets/ns/name` -> `secrets`.
     pub fn resource_of_key(key: &str) -> Option<&str> {
-        key.strip_prefix("/registry/")?.split('/').next().filter(|r| !r.is_empty())
+        key.strip_prefix("/registry/")?
+            .split('/')
+            .next()
+            .filter(|r| !r.is_empty())
     }
 
     fn chain(&self, key: &str) -> Option<&Arc<Chain>> {
@@ -449,7 +460,11 @@ impl EncryptionTransformer {
         if self.all.is_some() {
             return vec!["/registry/".into()];
         }
-        let mut v: Vec<String> = self.resources.keys().map(|r| format!("/registry/{r}/")).collect();
+        let mut v: Vec<String> = self
+            .resources
+            .keys()
+            .map(|r| format!("/registry/{r}/"))
+            .collect();
         v.sort();
         v
     }
@@ -524,15 +539,28 @@ mod tests {
         let tr = t(&cfg(&[("k1", k1)], true));
         let plain = br#"{"kind":"Secret","data":{"password":"aHVudGVyMg=="}}"#;
         let stored = tr.encode(S, plain).unwrap();
-        assert!(stored.starts_with(b"k8s:enc:aesgcm:v1:k1:"), "{:?}", String::from_utf8_lossy(&stored));
-        assert!(!stored.windows(8).any(|w| w == b"aHVudGVy"), "the plaintext shows");
-        assert_eq!(stored.len(), b"k8s:enc:aesgcm:v1:k1:".len() + 12 + plain.len() + 16);
+        assert!(
+            stored.starts_with(b"k8s:enc:aesgcm:v1:k1:"),
+            "{:?}",
+            String::from_utf8_lossy(&stored)
+        );
+        assert!(
+            !stored.windows(8).any(|w| w == b"aHVudGVy"),
+            "the plaintext shows"
+        );
+        assert_eq!(
+            stored.len(),
+            b"k8s:enc:aesgcm:v1:k1:".len() + 12 + plain.len() + 16
+        );
         assert_eq!(tr.decode(S, &stored).unwrap(), plain);
         // A fresh nonce per write.
         assert_ne!(tr.encode(S, plain).unwrap(), stored);
         // Other resources pass through.
         assert_eq!(tr.encode("/registry/pods/default/p", b"{}").unwrap(), b"{}");
-        assert_eq!(tr.decode("/registry/configmaps/default/c", b"{}").unwrap(), b"{}");
+        assert_eq!(
+            tr.decode("/registry/configmaps/default/c", b"{}").unwrap(),
+            b"{}"
+        );
         assert!(tr.applies(S) && !tr.applies("/registry/pods/default/p"));
     }
 
@@ -540,7 +568,9 @@ mod tests {
     fn the_value_is_bound_to_its_key() {
         let tr = t(&cfg(&[("k1", AesGcmProvider::generate_key())], true));
         let stored = tr.encode(S, b"{}").unwrap();
-        let e = tr.decode("/registry/secrets/default/other", &stored).unwrap_err();
+        let e = tr
+            .decode("/registry/secrets/default/other", &stored)
+            .unwrap_err();
         assert!(e.to_string().contains("does not open"), "{e}");
         let mut flipped = stored.clone();
         *flipped.last_mut().unwrap() ^= 1;
@@ -552,7 +582,10 @@ mod tests {
         let k1 = AesGcmProvider::generate_key();
         let with = t(&cfg(&[("k1", k1)], true));
         assert_eq!(with.decode(S, br#"{"old":1}"#).unwrap(), br#"{"old":1}"#);
-        assert!(!with.is_current(S, br#"{"old":1}"#), "plaintext is to be rewritten");
+        assert!(
+            !with.is_current(S, br#"{"old":1}"#),
+            "plaintext is to be rewritten"
+        );
         let without = t(&cfg(&[("k1", k1)], false));
         let e = without.decode(S, br#"{"old":1}"#).unwrap_err();
         assert!(e.to_string().contains("identity"), "{e}");
@@ -560,12 +593,18 @@ mod tests {
 
     #[test]
     fn rotation_new_key_second_then_first_then_old_dropped() {
-        let (k1, k2) = (AesGcmProvider::generate_key(), AesGcmProvider::generate_key());
+        let (k1, k2) = (
+            AesGcmProvider::generate_key(),
+            AesGcmProvider::generate_key(),
+        );
         let old = t(&cfg(&[("k1", k1)], true));
         let v1 = old.encode(S, b"{\"v\":1}").unwrap();
         // 1. k2 added second: still writes k1, reads both.
         let step1 = t(&cfg(&[("k1", k1), ("k2", k2)], true));
-        assert!(step1.encode(S, b"{}").unwrap().starts_with(b"k8s:enc:aesgcm:v1:k1:"));
+        assert!(step1
+            .encode(S, b"{}")
+            .unwrap()
+            .starts_with(b"k8s:enc:aesgcm:v1:k1:"));
         // 2. k2 first: writes k2, reads k1's values; k1's are not current.
         let step2 = t(&cfg(&[("k2", k2), ("k1", k1)], true));
         assert_eq!(step2.decode(S, &v1).unwrap(), b"{\"v\":1}");
@@ -605,9 +644,14 @@ mod tests {
             "  - aesgcm:\n      keys: []\n",
         ] {
             let c = EncryptionConfig::parse(&format!("{head}{p}")).unwrap();
-            assert!(EncryptionTransformer::from_config(c).is_err(), "accepted: {p}");
+            assert!(
+                EncryptionTransformer::from_config(c).is_err(),
+                "accepted: {p}"
+            );
         }
-        assert!(EncryptionConfig::parse("apiVersion: v1\nkind: ConfigMap\nresources: []\n").is_err());
+        assert!(
+            EncryptionConfig::parse("apiVersion: v1\nkind: ConfigMap\nresources: []\n").is_err()
+        );
     }
 
     #[test]
@@ -619,12 +663,18 @@ mod tests {
         assert!(!tr.applies(S));
         let all = t(&format!("apiVersion: apiserver.config.k8s.io/v1\nkind: EncryptionConfiguration\nresources:\n- resources: ['*.*']\n  providers:\n  - aesgcm:\n      keys:\n      - name: a\n        secret: {k}\n  - identity: {{}}\n"));
         assert!(all.applies(S) && all.applies("/registry/pods/a/b"));
-        assert!(!all.applies("/rusternetes/leader/control-plane"), "not a resource key");
+        assert!(
+            !all.applies("/rusternetes/leader/control-plane"),
+            "not a resource key"
+        );
     }
 
     #[test]
     fn labels_prefixes_and_the_write_label() {
-        let (k1, k2) = (AesGcmProvider::generate_key(), AesGcmProvider::generate_key());
+        let (k1, k2) = (
+            AesGcmProvider::generate_key(),
+            AesGcmProvider::generate_key(),
+        );
         let tr = t(&cfg(&[("k2", k2), ("k1", k1)], true));
         assert_eq!(tr.prefixes(), vec!["/registry/secrets/".to_string()]);
         assert_eq!(tr.write_label(S), "aesgcm:k2");
@@ -642,6 +692,9 @@ mod tests {
         let y = serde_yaml::to_string(&c).unwrap();
         assert!(y.contains("aesgcm:") && y.contains("identity: {}"), "{y}");
         let tr = EncryptionTransformer::from_config(EncryptionConfig::parse(&y).unwrap()).unwrap();
-        assert!(tr.encode(S, b"{}").unwrap().starts_with(b"k8s:enc:aesgcm:v1:k1:"));
+        assert!(tr
+            .encode(S, b"{}")
+            .unwrap()
+            .starts_with(b"k8s:enc:aesgcm:v1:k1:"));
     }
 }

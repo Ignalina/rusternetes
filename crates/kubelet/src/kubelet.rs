@@ -85,7 +85,9 @@ impl StartBackoff {
     pub(crate) fn spec_hash(pod: &Pod) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        serde_json::to_string(&pod.spec).unwrap_or_default().hash(&mut h);
+        serde_json::to_string(&pod.spec)
+            .unwrap_or_default()
+            .hash(&mut h);
         h.finish()
     }
 
@@ -4194,7 +4196,9 @@ impl Kubelet {
 /// The node's facts for its annotations: the JSON object (string values) in
 /// the file `RUSTERNETES_NODE_ANNOTATIONS_FILE` names; `None` without one.
 fn node_facts() -> Option<Vec<(String, String)>> {
-    let path = std::env::var("RUSTERNETES_NODE_ANNOTATIONS_FILE").ok().filter(|p| !p.is_empty())?;
+    let path = std::env::var("RUSTERNETES_NODE_ANNOTATIONS_FILE")
+        .ok()
+        .filter(|p| !p.is_empty())?;
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     Some(
@@ -4209,7 +4213,9 @@ fn node_facts() -> Option<Vec<(String, String)>> {
 /// status>`, `unschedulable=<bool>` and `at=<unix seconds>` into the file
 /// `RUSTERNETES_NODE_STATUS_FILE` names (the node's console reads it).
 fn write_node_status_file(node: &Node) {
-    let Ok(path) = std::env::var("RUSTERNETES_NODE_STATUS_FILE") else { return };
+    let Ok(path) = std::env::var("RUSTERNETES_NODE_STATUS_FILE") else {
+        return;
+    };
     if path.is_empty() {
         return;
     }
@@ -4219,8 +4225,15 @@ fn write_node_status_file(node: &Node) {
         .and_then(|s| s.conditions.as_ref())
         .and_then(|c| c.iter().find(|c| c.condition_type == "Ready"))
         .map_or("Unknown", |c| c.status.as_str());
-    let unsched = node.spec.as_ref().and_then(|s| s.unschedulable).unwrap_or(false);
-    let text = format!("ready={ready}\nunschedulable={unsched}\nat={}\n", chrono::Utc::now().timestamp());
+    let unsched = node
+        .spec
+        .as_ref()
+        .and_then(|s| s.unschedulable)
+        .unwrap_or(false);
+    let text = format!(
+        "ready={ready}\nunschedulable={unsched}\nat={}\n",
+        chrono::Utc::now().timestamp()
+    );
     let tmp = format!("{path}.tmp");
     if std::fs::write(&tmp, text).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
@@ -4263,8 +4276,10 @@ pub fn node_system_info(node_name: &str) -> rusternetes_common::resources::NodeS
     };
     rusternetes_common::resources::NodeSystemInfo {
         machine_id: read("/etc/machine-id").unwrap_or_else(|| format!("rusternetes-{node_name}")),
-        system_uuid: read("/sys/class/dmi/id/product_uuid").unwrap_or_else(|| format!("rusternetes-{node_name}")),
-        boot_id: read("/proc/sys/kernel/random/boot_id").unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        system_uuid: read("/sys/class/dmi/id/product_uuid")
+            .unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        boot_id: read("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_else(|| format!("rusternetes-{node_name}")),
         kernel_version: read("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".to_string()),
         os_image,
         container_runtime_version: runtime,
@@ -4877,7 +4892,9 @@ mod tests {
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
         assert_eq!(i.kernel_version, release.trim(), "uname -r");
         assert_ne!(i.kernel_version, "6.1.0-rusternetes");
-        assert!(!i.container_runtime_version.starts_with("containerd://1.7.0"));
+        assert!(!i
+            .container_runtime_version
+            .starts_with("containerd://1.7.0"));
         assert!(!env!("RUSTERNETES_YOUKI_VERSION").is_empty());
         assert_eq!(i.operating_system, "linux");
     }
@@ -4921,7 +4938,10 @@ mod start_backoff_tests {
         let t = Instant::now();
         assert_eq!(b.wait("u", 1, t), None, "a new pod starts at once");
         assert_eq!(b.failed("u", 1, t), Duration::from_secs(5));
-        assert_eq!(b.wait("u", 1, t + Duration::from_secs(4)), Some(Duration::from_secs(1)));
+        assert_eq!(
+            b.wait("u", 1, t + Duration::from_secs(4)),
+            Some(Duration::from_secs(1))
+        );
         assert_eq!(b.wait("u", 1, t + Duration::from_secs(5)), None);
         assert_eq!(b.failed("u", 1, t), Duration::from_secs(10));
         assert_eq!(b.failed("u", 1, t), Duration::from_secs(20));
@@ -4938,7 +4958,11 @@ mod start_backoff_tests {
         let t = Instant::now();
         b.failed("u", 1, t);
         b.failed("u", 1, t);
-        assert_eq!(b.wait("u", 2, t), None, "the cause fixed in the spec: try now");
+        assert_eq!(
+            b.wait("u", 2, t),
+            None,
+            "the cause fixed in the spec: try now"
+        );
         assert_eq!(b.failed("u", 2, t), Duration::from_secs(5));
         b.succeeded("u");
         assert_eq!(b.wait("u", 2, t), None);

@@ -1368,7 +1368,10 @@ pub async fn execute(
 
 /// The CRD serving `rtype` (its plural, singular, kind, a short name, or
 /// `<plural>.<group>`), from a list of CRDs as JSON.
-pub(crate) fn find_crd<'a>(crds: &'a [serde_json::Value], rtype: &str) -> Option<&'a serde_json::Value> {
+pub(crate) fn find_crd<'a>(
+    crds: &'a [serde_json::Value],
+    rtype: &str,
+) -> Option<&'a serde_json::Value> {
     let r = rtype.to_ascii_lowercase();
     crds.iter().find(|c| {
         let n = &c["spec"]["names"];
@@ -1379,14 +1382,19 @@ pub(crate) fn find_crd<'a>(crds: &'a [serde_json::Value], rtype: &str) -> Option
             || r == s(&n["singular"])
             || r == s(&n["kind"])
             || r == format!("{plural}.{group}")
-            || n["shortNames"].as_array().is_some_and(|a| a.iter().any(|x| s(x) == r))
+            || n["shortNames"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| s(x) == r))
     })
 }
 
 /// A server Table as kubectl prints it: upper-case headers, priority > 0
 /// columns only with `-o wide`, an empty cell `<none>`.
 pub(crate) fn table_from_server(t: &serde_json::Value, wide: bool) -> printers::Table {
-    let defs = t["columnDefinitions"].as_array().cloned().unwrap_or_default();
+    let defs = t["columnDefinitions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let keep: Vec<usize> = defs
         .iter()
         .enumerate()
@@ -1433,13 +1441,20 @@ async fn custom_resources(
         .map_err(map_get_error)?;
     let crds = list["items"].as_array().cloned().unwrap_or_default();
     let Some(crd) = find_crd(&crds, rtype) else {
-        anyhow::bail!("error: the server doesn't have a resource type \"{}\"", rtype);
+        anyhow::bail!(
+            "error: the server doesn't have a resource type \"{}\"",
+            rtype
+        );
     };
     let group = crd["spec"]["group"].as_str().unwrap_or("");
     let plural = crd["spec"]["names"]["plural"].as_str().unwrap_or("");
     let version = crd["spec"]["versions"]
         .as_array()
-        .and_then(|v| v.iter().find(|x| x["storage"] == true).or_else(|| v.first()))
+        .and_then(|v| {
+            v.iter()
+                .find(|x| x["storage"] == true)
+                .or_else(|| v.first())
+        })
         .and_then(|v| v["name"].as_str())
         .unwrap_or("v1");
     let namespaced = crd["spec"]["scope"] == "Namespaced";
@@ -1451,7 +1466,9 @@ async fn custom_resources(
     if let Some(n) = name {
         path.push_str(&format!("/{n}"));
     }
-    let not_found = |n: &str| anyhow::anyhow!("Error from server (NotFound): {plural}.{group} \"{n}\" not found");
+    let not_found = |n: &str| {
+        anyhow::anyhow!("Error from server (NotFound): {plural}.{group} \"{n}\" not found")
+    };
     match format {
         OutputFormat::Table | OutputFormat::Wide => {
             let t = match client.get_table(&path).await {
@@ -1460,13 +1477,22 @@ async fn custom_resources(
             };
             if t["rows"].as_array().is_none_or(|r| r.is_empty()) {
                 if namespaced {
-                    eprintln!("No resources found in {} namespace.", namespace.unwrap_or("default"));
+                    eprintln!(
+                        "No resources found in {} namespace.",
+                        namespace.unwrap_or("default")
+                    );
                 } else {
                     eprintln!("No resources found");
                 }
                 return Ok(());
             }
-            print!("{}", printers::render(&table_from_server(&t, *format == OutputFormat::Wide), no_headers));
+            print!(
+                "{}",
+                printers::render(
+                    &table_from_server(&t, *format == OutputFormat::Wide),
+                    no_headers
+                )
+            );
         }
         _ => {
             let v: serde_json::Value = match client.get(&path).await {
@@ -1475,10 +1501,19 @@ async fn custom_resources(
             };
             match format {
                 OutputFormat::Name => {
-                    let kind = crd["spec"]["names"]["kind"].as_str().unwrap_or("").to_ascii_lowercase();
-                    let items = v["items"].as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
+                    let kind = crd["spec"]["names"]["kind"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let items = v["items"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| vec![v.clone()]);
                     for o in items {
-                        println!("{kind}.{group}/{}", o["metadata"]["name"].as_str().unwrap_or(""));
+                        println!(
+                            "{kind}.{group}/{}",
+                            o["metadata"]["name"].as_str().unwrap_or("")
+                        );
                     }
                 }
                 f => format_output(&v, f)?,
@@ -1808,9 +1843,17 @@ mod tests {
 
     #[test]
     fn custom_resources_are_found_by_any_name_and_printed_from_the_servers_table() {
-        let crds = vec![serde_json::json!({"spec": {"group": "disks.tunnr.io", "scope": "Cluster",
-            "names": {"plural": "tunnrdisks", "singular": "tunnrdisk", "kind": "TunnrDisk", "shortNames": ["td"]}}})];
-        for n in ["tunnrdisks", "tunnrdisk", "TunnrDisk", "td", "tunnrdisks.disks.tunnr.io"] {
+        let crds = vec![
+            serde_json::json!({"spec": {"group": "disks.tunnr.io", "scope": "Cluster",
+            "names": {"plural": "tunnrdisks", "singular": "tunnrdisk", "kind": "TunnrDisk", "shortNames": ["td"]}}}),
+        ];
+        for n in [
+            "tunnrdisks",
+            "tunnrdisk",
+            "TunnrDisk",
+            "td",
+            "tunnrdisks.disks.tunnr.io",
+        ] {
             assert!(find_crd(&crds, n).is_some(), "{n}");
         }
         assert!(find_crd(&crds, "pods").is_none());
@@ -1820,8 +1863,14 @@ mod tests {
             "rows": [{"cells": ["w1.td-drv-a", "w1", "in-use", 1, "QEMU NVMe Ctrl", ""]},
                      {"cells": ["w3.td-foreign", "w3", "refused", 0, null, "foreign-cluster"]}]});
         let narrow = table_from_server(&t, false);
-        assert_eq!(narrow.headers, ["NAME", "NODE", "STATE", "VOLUMES", "REASON"]);
-        assert_eq!(narrow.rows[0], ["w1.td-drv-a", "w1", "in-use", "1", "<none>"]);
+        assert_eq!(
+            narrow.headers,
+            ["NAME", "NODE", "STATE", "VOLUMES", "REASON"]
+        );
+        assert_eq!(
+            narrow.rows[0],
+            ["w1.td-drv-a", "w1", "in-use", "1", "<none>"]
+        );
         assert_eq!(narrow.rows[1][4], "foreign-cluster");
         let wide = table_from_server(&t, true);
         assert_eq!(wide.headers.len(), 6);

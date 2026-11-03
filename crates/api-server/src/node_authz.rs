@@ -61,7 +61,13 @@ pub const NODE_CONFIGMAP_NAMESPACE: &str = "kube-system";
 
 impl ClusterAuthorizer {
     pub fn new(storage: Arc<StorageBackend>) -> Self {
-        Self { rbac: RBACAuthorizer::new(storage.clone()), storage, node_configmap_prefix: None, node_named: Vec::new(), node_status: Vec::new() }
+        Self {
+            rbac: RBACAuthorizer::new(storage.clone()),
+            storage,
+            node_configmap_prefix: None,
+            node_named: Vec::new(),
+            node_status: Vec::new(),
+        }
     }
 
     /// Custom resources nodes write themselves (cluster-scoped views of what
@@ -79,7 +85,8 @@ impl ClusterAuthorizer {
     pub fn with_node_resources(mut self, named: &[String], status: &[String]) -> Self {
         let split = |r: &str| -> Option<(String, String)> {
             let (plural, group) = r.trim().split_once('.')?;
-            (!plural.is_empty() && !group.is_empty()).then(|| (group.to_string(), plural.to_string()))
+            (!plural.is_empty() && !group.is_empty())
+                .then(|| (group.to_string(), plural.to_string()))
         };
         self.node_named = named.iter().filter_map(|r| split(r)).collect();
         self.node_status = status
@@ -99,25 +106,41 @@ impl ClusterAuthorizer {
         let v = a.verb.as_str();
         let read = matches!(v, "get" | "list" | "watch");
         let sub = a.subresource.as_deref();
-        if self.node_named.iter().any(|(g, p)| *g == a.api_group && *p == a.resource) {
-            let own = a.name.as_deref().is_some_and(|n| n.len() > node.len() + 1 && n.starts_with(node) && n.as_bytes()[node.len()] == b'.');
+        if self
+            .node_named
+            .iter()
+            .any(|(g, p)| *g == a.api_group && *p == a.resource)
+        {
+            let own = a.name.as_deref().is_some_and(|n| {
+                n.len() > node.len() + 1 && n.starts_with(node) && n.as_bytes()[node.len()] == b'.'
+            });
             return Some(match sub {
                 None => read || (own && matches!(v, "create" | "update" | "patch" | "delete")),
-                Some("status") => (v == "get" && a.name.is_some()) || (own && matches!(v, "update" | "patch")),
+                Some("status") => {
+                    (v == "get" && a.name.is_some()) || (own && matches!(v, "update" | "patch"))
+                }
                 _ => false,
             });
         }
-        let (g, p, label) = self.node_status.iter().find(|(g, p, _)| *g == a.api_group && *p == a.resource)?;
+        let (g, p, label) = self
+            .node_status
+            .iter()
+            .find(|(g, p, _)| *g == a.api_group && *p == a.resource)?;
         Some(match (sub, a.name.as_deref()) {
             (None, _) => read,
             (Some("status"), Some(_)) if v == "get" => true,
             (Some("status"), Some(name)) if matches!(v, "update" | "patch") => {
-                let key = build_key(&format!("{}_{}", g.replace('.', "_"), p), a.namespace.as_deref(), name);
-                self.storage
-                    .get::<Value>(&key)
-                    .await
-                    .ok()
-                    .is_some_and(|o| o.pointer("/metadata/labels").and_then(|l| l.get(label.as_str())).and_then(Value::as_str) == Some(node))
+                let key = build_key(
+                    &format!("{}_{}", g.replace('.', "_"), p),
+                    a.namespace.as_deref(),
+                    name,
+                );
+                self.storage.get::<Value>(&key).await.ok().is_some_and(|o| {
+                    o.pointer("/metadata/labels")
+                        .and_then(|l| l.get(label.as_str()))
+                        .and_then(Value::as_str)
+                        == Some(node)
+                })
             }
             _ => false,
         })
@@ -141,7 +164,13 @@ impl ClusterAuthorizer {
     }
 
     /// Does a pod bound to `node` in `namespace` refer to `resource`/`name`?
-    async fn referenced(&self, node: &str, namespace: &str, resource: &str, name: &str) -> Result<bool> {
+    async fn referenced(
+        &self,
+        node: &str,
+        namespace: &str,
+        resource: &str,
+        name: &str,
+    ) -> Result<bool> {
         for pod in self.bound_pods(node, Some(namespace)).await? {
             if pod_refs(&pod, resource).contains(name) {
                 return Ok(true);
@@ -153,9 +182,17 @@ impl ClusterAuthorizer {
     /// Is PersistentVolume `name` bound to a claim a pod bound to `node` uses?
     async fn pv_referenced(&self, node: &str, name: &str) -> Result<bool> {
         for pod in self.bound_pods(node, None).await? {
-            let ns = pod.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or("default").to_string();
+            let ns = pod
+                .pointer("/metadata/namespace")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_string();
             for claim in pod_refs(&pod, "persistentvolumeclaims") {
-                if let Ok(pvc) = self.storage.get::<Value>(&build_key("persistentvolumeclaims", Some(&ns), &claim)).await {
+                if let Ok(pvc) = self
+                    .storage
+                    .get::<Value>(&build_key("persistentvolumeclaims", Some(&ns), &claim))
+                    .await
+                {
                     if pvc.pointer("/spec/volumeName").and_then(Value::as_str) == Some(name) {
                         return Ok(true);
                     }
@@ -196,12 +233,16 @@ impl ClusterAuthorizer {
             ("storage.k8s.io", "csinodes") => sub.is_none() && (read || write_own),
             ("", "pods") => match (sub, a.namespace.as_deref(), a.name.as_deref()) {
                 (None, _, _) if read => true,
-                (None | Some("status"), Some(ns), Some(name)) if matches!(v, "update" | "patch" | "delete") => {
+                (None | Some("status"), Some(ns), Some(name))
+                    if matches!(v, "update" | "patch" | "delete") =>
+                {
                     self.pod_bound(node, ns, name).await
                 }
                 _ => false,
             },
-            ("", "events") | ("events.k8s.io", "events") => matches!(v, "create" | "update" | "patch"),
+            ("", "events") | ("events.k8s.io", "events") => {
+                matches!(v, "create" | "update" | "patch")
+            }
             ("", "services")
             | ("", "endpoints")
             | ("discovery.k8s.io", "endpointslices")
@@ -216,14 +257,18 @@ impl ClusterAuthorizer {
                     a.namespace.as_deref() == Some(NODE_CONFIGMAP_NAMESPACE)
                         && sub.is_none()
                         && a.name.as_deref().is_some_and(|n| n.starts_with(p))
-                        && (v == "get" || (matches!(v, "create" | "update" | "patch") && a.name.as_deref() == Some(&format!("{p}{node}"))))
+                        && (v == "get"
+                            || (matches!(v, "create" | "update" | "patch")
+                                && a.name.as_deref() == Some(&format!("{p}{node}"))))
                 }) =>
             {
                 true
             }
             ("", r @ ("secrets" | "configmaps" | "persistentvolumeclaims" | "serviceaccounts")) => {
                 match (v, sub, a.namespace.as_deref(), a.name.as_deref()) {
-                    ("get", None, Some(ns), Some(name)) => self.referenced(node, ns, r, name).await?,
+                    ("get", None, Some(ns), Some(name)) => {
+                        self.referenced(node, ns, r, name).await?
+                    }
                     _ => false,
                 }
             }
@@ -231,7 +276,8 @@ impl ClusterAuthorizer {
                 ("get", None, Some(name)) => self.pv_referenced(node, name).await?,
                 _ => false,
             },
-            ("authentication.k8s.io", "tokenreviews") | ("authorization.k8s.io", "subjectaccessreviews") => v == "create",
+            ("authentication.k8s.io", "tokenreviews")
+            | ("authorization.k8s.io", "subjectaccessreviews") => v == "create",
             _ => false,
         })
     }
@@ -318,8 +364,16 @@ impl Authorizer for ClusterAuthorizer {
                     "node {node} may not {} {}{}{} (Node authorizer)",
                     attrs.verb,
                     attrs.resource,
-                    attrs.subresource.as_deref().map(|s| format!("/{s}")).unwrap_or_default(),
-                    attrs.namespace.as_deref().map(|n| format!(" in namespace {n}")).unwrap_or_default(),
+                    attrs
+                        .subresource
+                        .as_deref()
+                        .map(|s| format!("/{s}"))
+                        .unwrap_or_default(),
+                    attrs
+                        .namespace
+                        .as_deref()
+                        .map(|n| format!(" in namespace {n}"))
+                        .unwrap_or_default(),
                 )),
             });
         }
@@ -348,7 +402,11 @@ mod tests {
         UserInfo {
             username: name.into(),
             uid: String::new(),
-            groups: groups.iter().map(|g| g.to_string()).chain(["system:authenticated".to_string()]).collect(),
+            groups: groups
+                .iter()
+                .map(|g| g.to_string())
+                .chain(["system:authenticated".to_string()])
+                .collect(),
             extra: Default::default(),
         }
     }
@@ -362,8 +420,18 @@ mod tests {
                             "volumes": [{"name": "v", "configMap": {"name": cm}}, {"name": "d", "persistentVolumeClaim": {"claimName": claim}},
                                         {"name": "kube-api-access", "projected": {"sources": [{"configMap": {"name": "kube-root-ca.crt"}}]}}]}})
         };
-        st.create(&build_key("pods", Some("default"), "a"), &pod("a", "w1", "s-a", "cm-a", "pvc-a")).await.unwrap();
-        st.create(&build_key("pods", Some("default"), "b"), &pod("b", "w2", "s-b", "cm-b", "pvc-b")).await.unwrap();
+        st.create(
+            &build_key("pods", Some("default"), "a"),
+            &pod("a", "w1", "s-a", "cm-a", "pvc-a"),
+        )
+        .await
+        .unwrap();
+        st.create(
+            &build_key("pods", Some("default"), "b"),
+            &pod("b", "w2", "s-b", "cm-b", "pvc-b"),
+        )
+        .await
+        .unwrap();
         for (claim, vol) in [("pvc-a", "pv-a"), ("pvc-b", "pv-b")] {
             st.create(&build_key("persistentvolumeclaims", Some("default"), claim),
                       &json!({"metadata": {"name": claim, "namespace": "default"}, "spec": {"volumeName": vol}})).await.unwrap();
@@ -372,11 +440,26 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn allowed(az: &ClusterAuthorizer, u: &UserInfo, verb: &str, group: &str, res: &str, ns: Option<&str>, name: Option<&str>, sub: Option<&str>) -> bool {
+    async fn allowed(
+        az: &ClusterAuthorizer,
+        u: &UserInfo,
+        verb: &str,
+        group: &str,
+        res: &str,
+        ns: Option<&str>,
+        name: Option<&str>,
+        sub: Option<&str>,
+    ) -> bool {
         let mut a = RequestAttributes::new(u.clone(), verb, res).with_api_group(group);
-        if let Some(n) = ns { a = a.with_namespace(n); }
-        if let Some(n) = name { a = a.with_name(n); }
-        if let Some(s) = sub { a = a.with_subresource(s); }
+        if let Some(n) = ns {
+            a = a.with_namespace(n);
+        }
+        if let Some(n) = name {
+            a = a.with_name(n);
+        }
+        if let Some(s) = sub {
+            a = a.with_subresource(s);
+        }
         az.authorize(&a).await.unwrap() == Decision::Allow
     }
 
@@ -386,18 +469,102 @@ mod tests {
         let w1 = user("system:node:w1", &["system:nodes"]);
         let d = Some("default");
         // Its own Node, Lease, CSINode; reads of every Node.
-        assert!(allowed(&az, &w1, "update", "", "nodes", None, Some("w1"), Some("status")).await);
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "update",
+                "",
+                "nodes",
+                None,
+                Some("w1"),
+                Some("status")
+            )
+            .await
+        );
         assert!(allowed(&az, &w1, "create", "", "nodes", None, Some("w1"), None).await);
         assert!(allowed(&az, &w1, "get", "", "nodes", None, Some("w2"), None).await);
-        assert!(!allowed(&az, &w1, "update", "", "nodes", None, Some("w2"), Some("status")).await);
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "update",
+                "",
+                "nodes",
+                None,
+                Some("w2"),
+                Some("status")
+            )
+            .await
+        );
         assert!(!allowed(&az, &w1, "patch", "", "nodes", None, Some("w2"), None).await);
         assert!(!allowed(&az, &w1, "delete", "", "nodes", None, Some("w2"), None).await);
         assert!(!allowed(&az, &w1, "create", "", "nodes", None, None, None).await);
-        assert!(allowed(&az, &w1, "update", "coordination.k8s.io", "leases", Some("kube-node-lease"), Some("w1"), None).await);
-        assert!(!allowed(&az, &w1, "update", "coordination.k8s.io", "leases", Some("kube-node-lease"), Some("w2"), None).await);
-        assert!(!allowed(&az, &w1, "update", "coordination.k8s.io", "leases", Some("kube-system"), Some("w1"), None).await);
-        assert!(allowed(&az, &w1, "create", "storage.k8s.io", "csinodes", None, Some("w1"), None).await);
-        assert!(!allowed(&az, &w1, "create", "storage.k8s.io", "csinodes", None, Some("w2"), None).await);
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "update",
+                "coordination.k8s.io",
+                "leases",
+                Some("kube-node-lease"),
+                Some("w1"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "update",
+                "coordination.k8s.io",
+                "leases",
+                Some("kube-node-lease"),
+                Some("w2"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "update",
+                "coordination.k8s.io",
+                "leases",
+                Some("kube-system"),
+                Some("w1"),
+                None
+            )
+            .await
+        );
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "create",
+                "storage.k8s.io",
+                "csinodes",
+                None,
+                Some("w1"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "storage.k8s.io",
+                "csinodes",
+                None,
+                Some("w2"),
+                None
+            )
+            .await
+        );
         // Pods: read all, write only its own.
         assert!(allowed(&az, &w1, "list", "", "pods", None, None, None).await);
         assert!(allowed(&az, &w1, "patch", "", "pods", d, Some("a"), Some("status")).await);
@@ -411,25 +578,157 @@ mod tests {
         assert!(!allowed(&az, &w1, "list", "", "secrets", d, None, None).await);
         assert!(!allowed(&az, &w1, "watch", "", "secrets", None, None, None).await);
         assert!(allowed(&az, &w1, "get", "", "configmaps", d, Some("cm-a"), None).await);
-        assert!(allowed(&az, &w1, "get", "", "configmaps", d, Some("kube-root-ca.crt"), None).await);
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "configmaps",
+                d,
+                Some("kube-root-ca.crt"),
+                None
+            )
+            .await
+        );
         assert!(!allowed(&az, &w1, "get", "", "configmaps", d, Some("cm-b"), None).await);
         assert!(!allowed(&az, &w1, "update", "", "configmaps", d, Some("cm-a"), None).await);
-        assert!(allowed(&az, &w1, "get", "", "persistentvolumeclaims", d, Some("pvc-a"), None).await);
-        assert!(!allowed(&az, &w1, "get", "", "persistentvolumeclaims", d, Some("pvc-b"), None).await);
-        assert!(allowed(&az, &w1, "get", "", "persistentvolumes", None, Some("pv-a"), None).await);
-        assert!(!allowed(&az, &w1, "get", "", "persistentvolumes", None, Some("pv-b"), None).await);
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "persistentvolumeclaims",
+                d,
+                Some("pvc-a"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "persistentvolumeclaims",
+                d,
+                Some("pvc-b"),
+                None
+            )
+            .await
+        );
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "persistentvolumes",
+                None,
+                Some("pv-a"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "persistentvolumes",
+                None,
+                Some("pv-b"),
+                None
+            )
+            .await
+        );
         // Workloads, RBAC, cluster-scoped writes, other namespaces' objects: refused.
         assert!(!allowed(&az, &w1, "create", "apps", "deployments", d, None, None).await);
-        assert!(!allowed(&az, &w1, "create", "rbac.authorization.k8s.io", "clusterrolebindings", None, None, None).await);
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "rbac.authorization.k8s.io",
+                "clusterrolebindings",
+                None,
+                None,
+                None
+            )
+            .await
+        );
         assert!(!allowed(&az, &w1, "create", "", "namespaces", None, None, None).await);
-        assert!(!allowed(&az, &w1, "delete", "", "namespaces", None, Some("default"), None).await);
-        assert!(!allowed(&az, &w1, "create", "apiextensions.k8s.io", "customresourcedefinitions", None, None, None).await);
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "delete",
+                "",
+                "namespaces",
+                None,
+                Some("default"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "apiextensions.k8s.io",
+                "customresourcedefinitions",
+                None,
+                None,
+                None
+            )
+            .await
+        );
         assert!(!allowed(&az, &w1, "get", "", "pods", d, Some("a"), Some("exec")).await);
         assert!(allowed(&az, &w1, "create", "", "events", d, None, None).await);
         assert!(allowed(&az, &w1, "list", "", "namespaces", None, None, None).await);
-        assert!(allowed(&az, &w1, "list", "networking.k8s.io", "networkpolicies", None, None, None).await);
-        assert!(!allowed(&az, &w1, "create", "networking.k8s.io", "networkpolicies", d, Some("allow-all"), None).await);
-        assert!(!allowed(&az, &w1, "update", "", "namespaces", None, Some("default"), None).await);
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "list",
+                "networking.k8s.io",
+                "networkpolicies",
+                None,
+                None,
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "networking.k8s.io",
+                "networkpolicies",
+                d,
+                Some("allow-all"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "update",
+                "",
+                "namespaces",
+                None,
+                Some("default"),
+                None
+            )
+            .await
+        );
         assert!(allowed(&az, &w1, "list", "", "services", None, None, None).await);
         // The name alone is not a node: system:nodes is needed.
         let fake = user("system:node:w1", &[]);
@@ -442,16 +741,112 @@ mod tests {
         let w1 = user("system:node:w1", &["system:nodes"]);
         let ks = Some("kube-system");
         let off = ClusterAuthorizer::new(st.clone());
-        assert!(!allowed(&off, &w1, "create", "", "configmaps", ks, Some("tunnr-wg-w1"), None).await);
+        assert!(
+            !allowed(
+                &off,
+                &w1,
+                "create",
+                "",
+                "configmaps",
+                ks,
+                Some("tunnr-wg-w1"),
+                None
+            )
+            .await
+        );
         let az = ClusterAuthorizer::new(st).with_node_configmaps(Some("tunnr-wg-".into()));
-        assert!(allowed(&az, &w1, "create", "", "configmaps", ks, Some("tunnr-wg-w1"), None).await);
-        assert!(allowed(&az, &w1, "update", "", "configmaps", ks, Some("tunnr-wg-w1"), None).await);
-        assert!(allowed(&az, &w1, "get", "", "configmaps", ks, Some("tunnr-wg-w2"), None).await);
-        assert!(!allowed(&az, &w1, "update", "", "configmaps", ks, Some("tunnr-wg-w2"), None).await);
-        assert!(!allowed(&az, &w1, "delete", "", "configmaps", ks, Some("tunnr-wg-w2"), None).await);
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "create",
+                "",
+                "configmaps",
+                ks,
+                Some("tunnr-wg-w1"),
+                None
+            )
+            .await
+        );
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "update",
+                "",
+                "configmaps",
+                ks,
+                Some("tunnr-wg-w1"),
+                None
+            )
+            .await
+        );
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "configmaps",
+                ks,
+                Some("tunnr-wg-w2"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "update",
+                "",
+                "configmaps",
+                ks,
+                Some("tunnr-wg-w2"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "delete",
+                "",
+                "configmaps",
+                ks,
+                Some("tunnr-wg-w2"),
+                None
+            )
+            .await
+        );
         assert!(!allowed(&az, &w1, "list", "", "configmaps", ks, None, None).await);
-        assert!(!allowed(&az, &w1, "get", "", "configmaps", ks, Some("tunnr-join-tokens"), None).await);
-        assert!(!allowed(&az, &w1, "create", "", "configmaps", Some("default"), Some("tunnr-wg-w1"), None).await);
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "get",
+                "",
+                "configmaps",
+                ks,
+                Some("tunnr-join-tokens"),
+                None
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "",
+                "configmaps",
+                Some("default"),
+                Some("tunnr-wg-w1"),
+                None
+            )
+            .await
+        );
         assert!(!allowed(&az, &w1, "create", "", "configmaps", ks, None, None).await);
     }
 
@@ -459,7 +854,11 @@ mod tests {
     async fn nodes_write_only_their_own_custom_resource_views() {
         let st = Arc::new(StorageBackend::Memory(Arc::new(MemoryStorage::new())));
         let key = |n: &str| build_key("disks_tunnr_io_tunnrvolumes", None, n);
-        for (name, labels) in [("pvc-a", json!({"tunnr.io/node": "w1"})), ("pvc-b", json!({"tunnr.io/node": "w2"})), ("pvc-c", json!({}))] {
+        for (name, labels) in [
+            ("pvc-a", json!({"tunnr.io/node": "w1"})),
+            ("pvc-b", json!({"tunnr.io/node": "w2"})),
+            ("pvc-c", json!({})),
+        ] {
             st.create(&key(name), &json!({"apiVersion": "disks.tunnr.io/v1alpha1", "kind": "TunnrVolume", "metadata": {"name": name, "labels": labels}})).await.unwrap();
         }
         let w1 = user("system:node:w1", &["system:nodes"]);
@@ -468,49 +867,265 @@ mod tests {
         // Not configured: a node writes none of them.
         let off = ClusterAuthorizer::new(st.clone());
         assert!(!allowed(&off, &w1, "create", g, td, None, Some("w1.td-drv-a"), None).await);
-        assert!(!allowed(&off, &w1, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
-        let az = ClusterAuthorizer::new(st).with_node_resources(&["tunnrdisks.disks.tunnr.io".into(), "nonsense".into()], &["tunnrvolumes.disks.tunnr.io=tunnr.io/node".into(), "bad".into()]);
+        assert!(
+            !allowed(
+                &off,
+                &w1,
+                "patch",
+                g,
+                tv,
+                None,
+                Some("pvc-a"),
+                Some("status")
+            )
+            .await
+        );
+        let az = ClusterAuthorizer::new(st).with_node_resources(
+            &["tunnrdisks.disks.tunnr.io".into(), "nonsense".into()],
+            &[
+                "tunnrvolumes.disks.tunnr.io=tunnr.io/node".into(),
+                "bad".into(),
+            ],
+        );
         // TunnrDisks: its own, by name <node>.<drive>; every node's readable.
         for v in ["create", "update", "patch", "delete"] {
-            assert!(allowed(&az, &w1, v, g, td, None, Some("w1.td-drv-a"), None).await, "{v} own");
-            assert!(!allowed(&az, &w1, v, g, td, None, Some("w2.td-drv-a"), None).await, "{v} another node's");
-            assert!(!allowed(&az, &w1, v, g, td, None, Some("w10.td-drv-a"), None).await, "{v} w10 is not w1");
-            assert!(!allowed(&az, &w1, v, g, td, None, Some("w1"), None).await, "{v} the bare node name");
+            assert!(
+                allowed(&az, &w1, v, g, td, None, Some("w1.td-drv-a"), None).await,
+                "{v} own"
+            );
+            assert!(
+                !allowed(&az, &w1, v, g, td, None, Some("w2.td-drv-a"), None).await,
+                "{v} another node's"
+            );
+            assert!(
+                !allowed(&az, &w1, v, g, td, None, Some("w10.td-drv-a"), None).await,
+                "{v} w10 is not w1"
+            );
+            assert!(
+                !allowed(&az, &w1, v, g, td, None, Some("w1"), None).await,
+                "{v} the bare node name"
+            );
         }
-        assert!(allowed(&az, &w1, "patch", g, td, None, Some("w1.td-drv-a"), Some("status")).await);
-        assert!(allowed(&az, &w1, "update", g, td, None, Some("w1.td-drv-a"), Some("status")).await);
-        assert!(!allowed(&az, &w1, "patch", g, td, None, Some("w2.td-drv-a"), Some("status")).await);
-        assert!(!allowed(&az, &w1, "create", g, td, None, None, None).await, "a create without a name");
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "patch",
+                g,
+                td,
+                None,
+                Some("w1.td-drv-a"),
+                Some("status")
+            )
+            .await
+        );
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "update",
+                g,
+                td,
+                None,
+                Some("w1.td-drv-a"),
+                Some("status")
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "patch",
+                g,
+                td,
+                None,
+                Some("w2.td-drv-a"),
+                Some("status")
+            )
+            .await
+        );
+        assert!(
+            !allowed(&az, &w1, "create", g, td, None, None, None).await,
+            "a create without a name"
+        );
         assert!(!allowed(&az, &w1, "deletecollection", g, td, None, None, None).await);
         for v in ["get", "list", "watch"] {
-            assert!(allowed(&az, &w1, v, g, td, None, if v == "get" { Some("w2.td-drv-a") } else { None }, None).await, "{v}");
-            assert!(allowed(&az, &w1, v, g, tv, None, if v == "get" { Some("pvc-b") } else { None }, None).await, "{v}");
+            assert!(
+                allowed(
+                    &az,
+                    &w1,
+                    v,
+                    g,
+                    td,
+                    None,
+                    if v == "get" {
+                        Some("w2.td-drv-a")
+                    } else {
+                        None
+                    },
+                    None
+                )
+                .await,
+                "{v}"
+            );
+            assert!(
+                allowed(
+                    &az,
+                    &w1,
+                    v,
+                    g,
+                    tv,
+                    None,
+                    if v == "get" { Some("pvc-b") } else { None },
+                    None
+                )
+                .await,
+                "{v}"
+            );
         }
         // TunnrVolumes: only the status of one labelled tunnr.io/node=w1.
-        assert!(allowed(&az, &w1, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
-        assert!(allowed(&az, &w1, "update", g, tv, None, Some("pvc-a"), Some("status")).await);
-        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-b"), Some("status")).await, "labelled w2");
-        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-c"), Some("status")).await, "no label");
-        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-z"), Some("status")).await, "not there");
-        assert!(!allowed(&az, &w1, "patch", g, tv, None, Some("pvc-a"), None).await, "the object itself (labels)");
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "patch",
+                g,
+                tv,
+                None,
+                Some("pvc-a"),
+                Some("status")
+            )
+            .await
+        );
+        assert!(
+            allowed(
+                &az,
+                &w1,
+                "update",
+                g,
+                tv,
+                None,
+                Some("pvc-a"),
+                Some("status")
+            )
+            .await
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "patch",
+                g,
+                tv,
+                None,
+                Some("pvc-b"),
+                Some("status")
+            )
+            .await,
+            "labelled w2"
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "patch",
+                g,
+                tv,
+                None,
+                Some("pvc-c"),
+                Some("status")
+            )
+            .await,
+            "no label"
+        );
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "patch",
+                g,
+                tv,
+                None,
+                Some("pvc-z"),
+                Some("status")
+            )
+            .await,
+            "not there"
+        );
+        assert!(
+            !allowed(&az, &w1, "patch", g, tv, None, Some("pvc-a"), None).await,
+            "the object itself (labels)"
+        );
         assert!(!allowed(&az, &w1, "update", g, tv, None, Some("pvc-a"), None).await);
         assert!(!allowed(&az, &w1, "create", g, tv, None, Some("pvc-a"), None).await);
         assert!(!allowed(&az, &w1, "delete", g, tv, None, Some("pvc-a"), None).await);
         // Another group of the same plural is not configured.
-        assert!(!allowed(&az, &w1, "create", "other.io", td, None, Some("w1.td-drv-a"), None).await);
+        assert!(
+            !allowed(
+                &az,
+                &w1,
+                "create",
+                "other.io",
+                td,
+                None,
+                Some("w1.td-drv-a"),
+                None
+            )
+            .await
+        );
         // Without system:nodes the name is nothing.
         let fake = user("system:node:w1", &[]);
         assert!(!allowed(&az, &fake, "create", g, td, None, Some("w1.td-drv-a"), None).await);
-        assert!(!allowed(&az, &fake, "patch", g, tv, None, Some("pvc-a"), Some("status")).await);
+        assert!(
+            !allowed(
+                &az,
+                &fake,
+                "patch",
+                g,
+                tv,
+                None,
+                Some("pvc-a"),
+                Some("status")
+            )
+            .await
+        );
     }
 
     #[tokio::test]
     async fn masters_are_admin_and_others_need_rbac() {
         let az = cluster().await;
         let admin = user("admin", &["system:masters"]);
-        assert!(allowed(&az, &admin, "create", "apps", "deployments", Some("default"), None, None).await);
-        assert!(allowed(&az, &admin, "get", "", "secrets", Some("default"), Some("s-b"), None).await);
-        let sa = user("system:serviceaccount:default:web", &["system:serviceaccounts"]);
+        assert!(
+            allowed(
+                &az,
+                &admin,
+                "create",
+                "apps",
+                "deployments",
+                Some("default"),
+                None,
+                None
+            )
+            .await
+        );
+        assert!(
+            allowed(
+                &az,
+                &admin,
+                "get",
+                "",
+                "secrets",
+                Some("default"),
+                Some("s-b"),
+                None
+            )
+            .await
+        );
+        let sa = user(
+            "system:serviceaccount:default:web",
+            &["system:serviceaccounts"],
+        );
         assert!(!allowed(&az, &sa, "list", "", "pods", None, None, None).await);
         let srv = user("rusternetes-apiserver", &[]);
         assert!(!allowed(&az, &srv, "list", "", "secrets", None, None, None).await);

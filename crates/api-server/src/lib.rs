@@ -106,12 +106,17 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
     info!("Starting Rusternetes API Server");
     if let Some(t) = &config.kubelet_client_tls {
         kubelet_client::configure(t)?;
-        info!("Kubelet node servers: mutual TLS (CA {}, client certificate {})", t.ca_file, t.cert_file);
+        info!(
+            "Kubelet node servers: mutual TLS (CA {}, client certificate {})",
+            t.ca_file, t.cert_file
+        );
     }
 
     let token_manager = match rusternetes_common::auth::cluster_token_manager() {
         Some(tm) => {
-            info!("ServiceAccount tokens: signed and checked with the cluster's service-account key");
+            info!(
+                "ServiceAccount tokens: signed and checked with the cluster's service-account key"
+            );
             tm
         }
         None if !config.jwt_secret.is_empty()
@@ -174,7 +179,10 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         .unwrap_or(6443);
 
     if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
-        warn!("Failed to bootstrap the system namespaces: {}. Continuing anyway.", e);
+        warn!(
+            "Failed to bootstrap the system namespaces: {}. Continuing anyway.",
+            e
+        );
     }
     if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
         warn!(
@@ -187,7 +195,9 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
     // made good here.
     {
         let storage = storage.clone();
-        let root_ca = ca_cert_pem.clone().filter(|_| config.client_ca_file.is_some());
+        let root_ca = ca_cert_pem
+            .clone()
+            .filter(|_| config.client_ca_file.is_some());
         tokio::spawn(async move {
             loop {
                 if let Some(ca) = &root_ca {
@@ -199,7 +209,9 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
                 if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
                     tracing::debug!("system namespaces: {e}");
                 }
-                if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
+                if let Err(e) =
+                    bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await
+                {
                     tracing::debug!("kubernetes Service: {e}");
                 }
             }

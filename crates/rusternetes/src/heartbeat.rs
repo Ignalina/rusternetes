@@ -71,12 +71,17 @@ pub fn spawn(
     api_bind: String,
 ) {
     tokio::spawn(async move {
-        let api_port = api_bind.rsplit_once(':').map(|(_, p)| p.to_string()).unwrap_or_else(|| "6443".into());
+        let api_port = api_bind
+            .rsplit_once(':')
+            .map(|(_, p)| p.to_string())
+            .unwrap_or_else(|| "6443".into());
         let mut timer = tokio::time::interval(EVERY);
         loop {
             timer.tick().await;
             if api_server
-                && tokio::net::TcpStream::connect(format!("127.0.0.1:{api_port}")).await.is_ok()
+                && tokio::net::TcpStream::connect(format!("127.0.0.1:{api_port}"))
+                    .await
+                    .is_ok()
             {
                 renew(&storage, "kube-apiserver", &node).await;
             }
@@ -93,6 +98,9 @@ pub fn spawn(
 mod tests {
     #[test]
     fn a_heartbeat_lease_is_named_by_component_and_node() {
-        assert_eq!(super::lease_name("kube-scheduler", "cp"), "kube-scheduler-cp");
+        assert_eq!(
+            super::lease_name("kube-scheduler", "cp"),
+            "kube-scheduler-cp"
+        );
     }
 }

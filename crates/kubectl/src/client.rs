@@ -127,10 +127,10 @@ impl ApiClient {
     /// upstream kubectl asks for anything it has no printer of its own for.
     pub async fn get_table(&self, path: &str) -> Result<serde_json::Value, GetError> {
         let url = format!("{}{}", self.base_url, path);
-        let mut request = self
-            .client
-            .get(&url)
-            .header("Accept", "application/json;as=Table;v=v1;g=meta.k8s.io,application/json");
+        let mut request = self.client.get(&url).header(
+            "Accept",
+            "application/json;as=Table;v=v1;g=meta.k8s.io,application/json",
+        );
         if let Some(ref token) = self.token {
             request = request.header("Authorization", format!("Bearer {}", token));
         }
@@ -144,7 +144,11 @@ impl ApiClient {
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(GetError::Other(anyhow::anyhow!("Request failed with status {}: {}", status, body)));
+            return Err(GetError::Other(anyhow::anyhow!(
+                "Request failed with status {}: {}",
+                status,
+                body
+            )));
         }
         response
             .json()

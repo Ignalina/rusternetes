@@ -2160,15 +2160,27 @@ pub fn human_duration(secs: i64) -> String {
     if s < 120 {
         format!("{s}s")
     } else if m < 10 {
-        if s % 60 == 0 { format!("{m}m") } else { format!("{m}m{}s", s % 60) }
+        if s % 60 == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{}s", s % 60)
+        }
     } else if m < 180 {
         format!("{m}m")
     } else if h < 8 {
-        if m % 60 == 0 { format!("{h}h") } else { format!("{h}h{}m", m % 60) }
+        if m % 60 == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{}m", m % 60)
+        }
     } else if h < 48 {
         format!("{h}h")
     } else if h < 192 {
-        if h % 24 == 0 { format!("{d}d") } else { format!("{d}d{}h", h % 24) }
+        if h % 24 == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d{}h", h % 24)
+        }
     } else if d < 730 {
         format!("{d}d")
     } else {
@@ -2178,7 +2190,11 @@ pub fn human_duration(secs: i64) -> String {
 
 /// A printer column's simple JSONPath (`.status.a.b`, `{.status.a}`).
 fn column_value(obj: &serde_json::Value, path: &str) -> serde_json::Value {
-    let p = path.trim().trim_start_matches('{').trim_end_matches('}').trim_start_matches('.');
+    let p = path
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim_start_matches('.');
     let mut at = obj;
     for part in p.split('.').filter(|s| !s.is_empty()) {
         let (key, idx) = match part.split_once('[') {
@@ -2204,12 +2220,18 @@ fn cell(v: serde_json::Value, ty: &str, now: chrono::DateTime<chrono::Utc>) -> s
     match (ty, v) {
         (_, Value::Null) => Value::Null,
         ("date", Value::String(t)) => match chrono::DateTime::parse_from_rfc3339(&t) {
-            Ok(at) => Value::String(human_duration((now - at.with_timezone(&chrono::Utc)).num_seconds())),
+            Ok(at) => Value::String(human_duration(
+                (now - at.with_timezone(&chrono::Utc)).num_seconds(),
+            )),
             Err(_) => Value::String(t),
         },
         (_, Value::Array(a)) => Value::String(
             a.iter()
-                .map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string()))
+                .map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| x.to_string())
+                })
                 .collect::<Vec<_>>()
                 .join(","),
         ),
@@ -2222,7 +2244,11 @@ fn cell(v: serde_json::Value, ty: &str, now: chrono::DateTime<chrono::Utc>) -> s
 /// One object or a list of custom resources as a `meta.k8s.io/v1` Table:
 /// `Name`, then the CRD version's `additionalPrinterColumns` (upstream's
 /// default `Age` when it has none), each row with its object's metadata.
-pub fn cr_table(crd: &CustomResourceDefinition, version: &str, value: &serde_json::Value) -> serde_json::Value {
+pub fn cr_table(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    value: &serde_json::Value,
+) -> serde_json::Value {
     use serde_json::{json, Value};
     let columns: Vec<Value> = crd
         .spec
@@ -2233,8 +2259,12 @@ pub fn cr_table(crd: &CustomResourceDefinition, version: &str, value: &serde_jso
         .and_then(|c| serde_json::to_value(c).ok())
         .and_then(|v| v.as_array().cloned())
         .filter(|c| !c.is_empty())
-        .unwrap_or_else(|| vec![json!({"name": "Age", "type": "date", "jsonPath": ".metadata.creationTimestamp"})]);
-    let mut defs = vec![json!({"name": "Name", "type": "string", "format": "name", "description": "Name must be unique within a namespace.", "priority": 0})];
+        .unwrap_or_else(|| {
+            vec![json!({"name": "Age", "type": "date", "jsonPath": ".metadata.creationTimestamp"})]
+        });
+    let mut defs = vec![
+        json!({"name": "Name", "type": "string", "format": "name", "description": "Name must be unique within a namespace.", "priority": 0}),
+    ];
     for c in &columns {
         defs.push(json!({
             "name": c.get("name").cloned().unwrap_or(Value::Null),
@@ -2269,12 +2299,20 @@ pub fn cr_table(crd: &CustomResourceDefinition, version: &str, value: &serde_jso
 }
 
 /// [`cr_table`] for a handler's JSON answer (an error passes unchanged).
-pub async fn table_response(state: &ApiServerState, group: &str, version: &str, plural: &str, resp: axum::response::Response) -> axum::response::Response {
+pub async fn table_response(
+    state: &ApiServerState,
+    group: &str,
+    version: &str,
+    plural: &str,
+    resp: axum::response::Response,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     if !resp.status().is_success() {
         return resp;
     }
-    let Ok(crd) = get_crd_for_resource(state, &format!("{plural}.{group}")).await else { return resp };
+    let Ok(crd) = get_crd_for_resource(state, &format!("{plural}.{group}")).await else {
+        return resp;
+    };
     let (parts, body) = resp.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, 64 << 20).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -2306,10 +2344,22 @@ mod table_tests {
         let o = serde_json::json!({"status": {"a": {"b": true}, "list": ["x", "y"], "arr": [{"n": 1}]}});
         assert_eq!(column_value(&o, ".status.a.b"), serde_json::json!(true));
         assert_eq!(column_value(&o, "{.status.arr[0].n}"), serde_json::json!(1));
-        assert_eq!(column_value(&o, ".status.missing.x"), serde_json::Value::Null);
+        assert_eq!(
+            column_value(&o, ".status.missing.x"),
+            serde_json::Value::Null
+        );
         let now = chrono::Utc::now();
-        assert_eq!(cell(column_value(&o, ".status.list"), "string", now), serde_json::json!("x,y"));
-        assert_eq!(cell(serde_json::json!(true), "string", now), serde_json::json!("true"));
-        assert_eq!(cell(serde_json::json!(true), "boolean", now), serde_json::json!(true));
+        assert_eq!(
+            cell(column_value(&o, ".status.list"), "string", now),
+            serde_json::json!("x,y")
+        );
+        assert_eq!(
+            cell(serde_json::json!(true), "string", now),
+            serde_json::json!("true")
+        );
+        assert_eq!(
+            cell(serde_json::json!(true), "boolean", now),
+            serde_json::json!(true)
+        );
     }
 }

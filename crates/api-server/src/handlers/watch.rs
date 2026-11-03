@@ -1322,8 +1322,14 @@ async fn bookmark_kind_and_version(
     api_group: &str,
 ) -> (String, String) {
     if !api_group.is_empty() {
-        if let Some(plural) = resource_type.strip_prefix(&format!("{}_", api_group.replace('.', "_"))) {
-            let key = rusternetes_storage::build_key("customresourcedefinitions", None, &format!("{plural}.{api_group}"));
+        if let Some(plural) =
+            resource_type.strip_prefix(&format!("{}_", api_group.replace('.', "_")))
+        {
+            let key = rusternetes_storage::build_key(
+                "customresourcedefinitions",
+                None,
+                &format!("{plural}.{api_group}"),
+            );
             if let Ok(crd) = state
                 .storage
                 .get::<rusternetes_common::resources::CustomResourceDefinition>(&key)
@@ -1337,7 +1343,10 @@ async fn bookmark_kind_and_version(
                     .or(crd.spec.versions.first())
                     .map(|v| v.name.clone())
                     .unwrap_or_else(|| "v1".to_string());
-                return (crd.spec.names.kind.clone(), format!("{api_group}/{version}"));
+                return (
+                    crd.spec.names.kind.clone(),
+                    format!("{api_group}/{version}"),
+                );
             }
         }
     }
@@ -2689,7 +2698,10 @@ mod label_selector_without_labels_tests {
     fn an_object_without_labels_matches_negative_requirements_only() {
         let meta = ObjectMeta::new("web");
         let sel = |s: &str| Some(s.to_string());
-        assert!(matches_label_selector(&meta, &sel("!service.kubernetes.io/headless,!service.kubernetes.io/service-proxy-name")));
+        assert!(matches_label_selector(
+            &meta,
+            &sel("!service.kubernetes.io/headless,!service.kubernetes.io/service-proxy-name")
+        ));
         assert!(matches_label_selector(&meta, &sel("app!=x")));
         assert!(!matches_label_selector(&meta, &sel("app=x")));
         assert!(!matches_label_selector(&meta, &sel("app")));

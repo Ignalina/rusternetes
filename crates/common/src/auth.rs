@@ -119,7 +119,8 @@ pub struct TokenManager {
 /// all-in-one binary from `--service-account-signing-key-file` and
 /// `--service-account-key-file`; the API server, the kubelet and the
 /// controller manager in this process sign and check with it.
-static CLUSTER_TOKEN_MANAGER: std::sync::OnceLock<std::sync::Arc<TokenManager>> = std::sync::OnceLock::new();
+static CLUSTER_TOKEN_MANAGER: std::sync::OnceLock<std::sync::Arc<TokenManager>> =
+    std::sync::OnceLock::new();
 
 /// Install the cluster's TokenManager (false: one was already installed).
 pub fn install_cluster_token_manager(tm: std::sync::Arc<TokenManager>) -> bool {
@@ -199,24 +200,41 @@ impl TokenManager {
             std::fs::read(f).map_err(|e| Error::Internal(format!("service-account key {f}: {e}")))
         };
         let (private, public) = (read(signing_key_file)?, read(key_file)?);
-        if let (Ok(encoding_key), Ok(decoding_key)) =
-            (EncodingKey::from_rsa_pem(&private), DecodingKey::from_rsa_pem(&public))
-        {
-            return Ok(Self { encoding_key, decoding_key, algorithm: Algorithm::RS256 });
+        if let (Ok(encoding_key), Ok(decoding_key)) = (
+            EncodingKey::from_rsa_pem(&private),
+            DecodingKey::from_rsa_pem(&public),
+        ) {
+            return Ok(Self {
+                encoding_key,
+                decoding_key,
+                algorithm: Algorithm::RS256,
+            });
         }
         let encoding_key = EncodingKey::from_ec_pem(&private).map_err(|e| {
-            Error::Internal(format!("{signing_key_file}: neither an RSA nor an ECDSA P-256 private key: {e}"))
+            Error::Internal(format!(
+                "{signing_key_file}: neither an RSA nor an ECDSA P-256 private key: {e}"
+            ))
         })?;
         let decoding_key = DecodingKey::from_ec_pem(&public).map_err(|e| {
-            Error::Internal(format!("{key_file}: neither an RSA nor an ECDSA P-256 public key: {e}"))
+            Error::Internal(format!(
+                "{key_file}: neither an RSA nor an ECDSA P-256 public key: {e}"
+            ))
         })?;
-        Ok(Self { encoding_key, decoding_key, algorithm: Algorithm::ES256 })
+        Ok(Self {
+            encoding_key,
+            decoding_key,
+            algorithm: Algorithm::ES256,
+        })
     }
 
     /// A TokenManager with a random HMAC secret: tokens it signs are good in
     /// this process only. Never the well-known default secret.
     pub fn new_random() -> Self {
-        let secret = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+        let secret = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
         Self::new(secret.as_bytes())
     }
 
@@ -908,9 +926,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (k, p) = cluster_key_files(dir.path());
         let tm = TokenManager::from_key_files(&k, &p).unwrap();
-        let claims = ServiceAccountClaims::new("cilium".into(), "kube-system".into(), "u1".into(), 1);
+        let claims =
+            ServiceAccountClaims::new("cilium".into(), "kube-system".into(), "u1".into(), 1);
         let good = tm.generate_token(claims.clone()).unwrap();
-        assert_eq!(tm.validate_token(&good).unwrap().sub, "system:serviceaccount:kube-system:cilium");
+        assert_eq!(
+            tm.validate_token(&good).unwrap().sub,
+            "system:serviceaccount:kube-system:cilium"
+        );
         // A token signed with the well-known default secret is refused.
         let forged = TokenManager::new(b"rusternetes-secret-change-in-production")
             .generate_token(claims.clone())
@@ -928,7 +950,9 @@ mod tests {
         let dir2 = tempfile::tempdir().unwrap();
         let (k2, p2) = cluster_key_files(dir2.path());
         let other = TokenManager::from_key_files(&k2, &p2).unwrap();
-        assert!(tm.validate_token(&other.generate_token(claims).unwrap()).is_err());
+        assert!(tm
+            .validate_token(&other.generate_token(claims).unwrap())
+            .is_err());
     }
 
     #[test]
@@ -936,8 +960,18 @@ mod tests {
         // The controller manager's default ServiceAccounts carry no uid; the
         // empty uid is left out of the token and must read back.
         let tm = TokenManager::new_random();
-        let t = tm.generate_token(ServiceAccountClaims::new("default".into(), "default".into(), String::new(), 1)).unwrap();
-        assert_eq!(tm.validate_token(&t).unwrap().sub, "system:serviceaccount:default:default");
+        let t = tm
+            .generate_token(ServiceAccountClaims::new(
+                "default".into(),
+                "default".into(),
+                String::new(),
+                1,
+            ))
+            .unwrap();
+        assert_eq!(
+            tm.validate_token(&t).unwrap().sub,
+            "system:serviceaccount:default:default"
+        );
     }
 
     #[test]
@@ -949,7 +983,9 @@ mod tests {
         let a = TokenManager::new_random();
         let b = TokenManager::new_random();
         assert!(a.validate_token(&forged).is_err());
-        assert!(b.validate_token(&a.generate_token(claims).unwrap()).is_err());
+        assert!(b
+            .validate_token(&a.generate_token(claims).unwrap())
+            .is_err());
     }
 
     #[test]

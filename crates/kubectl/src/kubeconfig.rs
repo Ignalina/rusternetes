@@ -105,7 +105,6 @@ pub struct EnvVar {
     pub value: String,
 }
 
-
 /// PEM bytes of the CA, the client certificate and its key, each if configured.
 pub type TlsPem = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 

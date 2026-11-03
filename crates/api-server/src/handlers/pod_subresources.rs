@@ -424,7 +424,6 @@ async fn get_container_logs(
     Ok(log_output)
 }
 
-
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec
 /// Execute a command in a container (supports both SPDY and WebSocket)
 pub async fn exec(

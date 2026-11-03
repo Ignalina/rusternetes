@@ -6,8 +6,8 @@ pub mod csi;
 #[allow(dead_code)]
 pub mod eviction;
 pub mod kubelet;
-pub mod readiness_timing;
 pub mod netns;
+pub mod readiness_timing;
 pub mod runtime;
 pub mod seccomp;
 pub mod serving_tls;
@@ -144,16 +144,21 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
                 let cfg = match t.server_config() {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::error!("kubelet node server TLS: {e:#}; not serving {metrics_addr}");
+                        tracing::error!(
+                            "kubelet node server TLS: {e:#}; not serving {metrics_addr}"
+                        );
                         return;
                     }
                 };
                 info!("kubelet node server on {} over mutual TLS (control-plane client certificates only)", metrics_addr);
                 let addr: std::net::SocketAddr = metrics_addr.parse().unwrap();
-                axum_server::bind_rustls(addr, axum_server::tls_rustls::RustlsConfig::from_config(cfg))
-                    .serve(app.into_make_service())
-                    .await
-                    .unwrap();
+                axum_server::bind_rustls(
+                    addr,
+                    axum_server::tls_rustls::RustlsConfig::from_config(cfg),
+                )
+                .serve(app.into_make_service())
+                .await
+                .unwrap();
             }
             None => {
                 let listener = tokio::net::TcpListener::bind(&metrics_addr).await.unwrap();
@@ -166,4 +171,3 @@ pub async fn run(storage: Arc<StorageBackend>, config: KubeletConfig) -> anyhow:
 
     Ok(())
 }
-

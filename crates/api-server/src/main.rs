@@ -232,7 +232,10 @@ async fn main() -> Result<()> {
         .unwrap_or(6443);
 
     if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
-        warn!("Failed to bootstrap the system namespaces: {}. Continuing anyway.", e);
+        warn!(
+            "Failed to bootstrap the system namespaces: {}. Continuing anyway.",
+            e
+        );
     }
     if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
         warn!(

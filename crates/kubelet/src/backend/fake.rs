@@ -131,7 +131,11 @@ impl ContainerBackend for FakeBackend {
         if st.containers.contains_key(name) {
             return Err(anyhow!("409 Conflict: name {} already in use", name));
         }
-        if config.image.as_ref().is_some_and(|i| st.failing_images.iter().any(|f| i.ends_with(f.as_str()))) {
+        if config
+            .image
+            .as_ref()
+            .is_some_and(|i| st.failing_images.iter().any(|f| i.ends_with(f.as_str())))
+        {
             return Err(anyhow!("500 cannot create {}: broken image", name));
         }
         st.next_id += 1;

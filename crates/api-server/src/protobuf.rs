@@ -1157,8 +1157,14 @@ impl ProtoRegistry {
                 fields: HashMap::from([
                     (1, ("holderIdentity".into(), FieldType::String)),
                     (2, ("leaseDurationSeconds".into(), FieldType::Int)),
-                    (3, ("acquireTime".into(), FieldType::Message("MicroTime".into()))),
-                    (4, ("renewTime".into(), FieldType::Message("MicroTime".into()))),
+                    (
+                        3,
+                        ("acquireTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (
+                        4,
+                        ("renewTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
                     (5, ("leaseTransitions".into(), FieldType::Int)),
                     (6, ("strategy".into(), FieldType::String)),
                     (7, ("preferredHolder".into(), FieldType::String)),
@@ -3214,11 +3220,15 @@ fn decode_micro_timestamp(data: &[u8]) -> Value {
     let mut nanos: i64 = 0;
     let mut pos = 0;
     while pos < data.len() {
-        let Some((tag, p)) = read_varint(data, pos) else { break };
+        let Some((tag, p)) = read_varint(data, pos) else {
+            break;
+        };
         if (tag & 0x07) as u8 != WIRE_VARINT {
             break;
         }
-        let Some((val, p)) = read_varint(data, p) else { break };
+        let Some((val, p)) = read_varint(data, p) else {
+            break;
+        };
         pos = p;
         match tag >> 3 {
             1 => seconds = val as i64,
@@ -3307,8 +3317,12 @@ mod tests {
     fn decodes_a_lease_spec_with_micro_time() {
         let registry = ProtoRegistry::new();
         // holderIdentity "a", leaseDurationSeconds 15, renewTime {seconds: 1, nanos: 5000}
-        let data = [0x0a, 0x01, b'a', 0x10, 0x0f, 0x22, 0x05, 0x08, 0x01, 0x10, 0x88, 0x27];
-        let v = registry.decode_message("LeaseSpec", &data).expect("LeaseSpec schema");
+        let data = [
+            0x0a, 0x01, b'a', 0x10, 0x0f, 0x22, 0x05, 0x08, 0x01, 0x10, 0x88, 0x27,
+        ];
+        let v = registry
+            .decode_message("LeaseSpec", &data)
+            .expect("LeaseSpec schema");
         assert_eq!(v["holderIdentity"], "a");
         assert_eq!(v["leaseDurationSeconds"], 15);
         assert_eq!(v["renewTime"], "1970-01-01T00:00:01.000005Z");

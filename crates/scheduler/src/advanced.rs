@@ -1305,7 +1305,8 @@ mod tests {
     #[test]
     fn a_finished_pod_does_not_count_for_anti_affinity() {
         let mut failed = web_pod("web-1", Some("w2"));
-        failed.status = Some(serde_json::from_value(serde_json::json!({"phase": "Failed"})).unwrap());
+        failed.status =
+            Some(serde_json::from_value(serde_json::json!({"phase": "Failed"})).unwrap());
         assert!(check_pod_anti_affinity(&node("w2"), &web_pod("web-2", None), &[failed]).0);
     }
 

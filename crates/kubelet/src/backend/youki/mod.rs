@@ -140,11 +140,17 @@ impl Inner {
     }
 
     fn index_put(&self, m: Meta) {
-        self.index.write().unwrap_or_else(|e| e.into_inner()).insert(m.name.clone(), m);
+        self.index
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(m.name.clone(), m);
     }
 
     fn index_remove(&self, name: &str) {
-        self.index.write().unwrap_or_else(|e| e.into_inner()).remove(name);
+        self.index
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
     }
 }
 
@@ -156,7 +162,9 @@ pub struct YoukiBackend {
 
 impl YoukiBackend {
     pub fn new(cfg: YoukiConfig) -> Result<Self> {
-        Ok(Self { inner: Arc::new(Inner::open(cfg)?) })
+        Ok(Self {
+            inner: Arc::new(Inner::open(cfg)?),
+        })
     }
 
     async fn blocking<T, F>(&self, f: F) -> Result<T>
@@ -326,7 +334,12 @@ impl Inner {
 
     /// Every container, by name (from the index, not the disk).
     fn metas(&self) -> Vec<Meta> {
-        self.index.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+        self.index
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Find a container by name, `/name` or ID (or an ID prefix of 12+).
@@ -1165,7 +1178,11 @@ mod tests {
     #[test]
     fn the_container_index_is_read_from_disk_once_and_kept_in_memory() {
         let root = tempfile::tempdir().unwrap();
-        let cfg = YoukiConfig { root: root.path().to_path_buf(), state_root: root.path().join("state"), shim: "shim".into() };
+        let cfg = YoukiConfig {
+            root: root.path().to_path_buf(),
+            state_root: root.path().join("state"),
+            shim: "shim".into(),
+        };
         for n in ["a", "b"] {
             let d = root.path().join("containers").join(n);
             fs::create_dir_all(&d).unwrap();

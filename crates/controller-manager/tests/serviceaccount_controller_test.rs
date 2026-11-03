@@ -221,8 +221,13 @@ async fn test_serviceaccount_token_contains_required_fields() {
     // The token is signed with the cluster's key.
     let token = data.get("token").unwrap();
     let tm = rusternetes_common::auth::cluster_token_manager().unwrap();
-    let claims = tm.validate_token(std::str::from_utf8(token).unwrap()).unwrap();
-    assert_eq!(claims.sub, "system:serviceaccount:test-token-fields:default");
+    let claims = tm
+        .validate_token(std::str::from_utf8(token).unwrap())
+        .unwrap();
+    assert_eq!(
+        claims.sub,
+        "system:serviceaccount:test-token-fields:default"
+    );
 
     // Namespace should match
     let namespace_bytes = data.get("namespace").unwrap();

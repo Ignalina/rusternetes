@@ -110,19 +110,28 @@ pub async fn authz_middleware(
     let Some(ctx) = request.extensions().get::<AuthContext>().cloned() else {
         return Err(unauthorized("Unauthorized"));
     };
-    let Some(mut attrs) = crate::authn::request_attributes(request.method(), request.uri(), ctx.user.clone()) else {
+    let Some(mut attrs) =
+        crate::authn::request_attributes(request.method(), request.uri(), ctx.user.clone())
+    else {
         // Not a resource URL: any authenticated user (discovery, OpenAPI).
         return Ok(next.run(request).await);
     };
     let mut request = request;
-    if attrs.verb == "create" && attrs.name.is_none() && crate::node_authz::node_of(&ctx.user).is_some() {
+    if attrs.verb == "create"
+        && attrs.name.is_none()
+        && crate::node_authz::node_of(&ctx.user).is_some()
+    {
         let (parts, body) = request.into_parts();
         let bytes = axum::body::to_bytes(body, 8 << 20)
             .await
             .map_err(|_| forbidden("request body too large"))?;
         if let Some(name) = serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
-            .and_then(|v| v.pointer("/metadata/name").and_then(|n| n.as_str()).map(str::to_string))
+            .and_then(|v| {
+                v.pointer("/metadata/name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string)
+            })
         {
             attrs = attrs.with_name(name);
         }
@@ -131,10 +140,18 @@ pub async fn authz_middleware(
     match authorizer.authorize(&attrs).await {
         Ok(rusternetes_common::authz::Decision::Allow) => Ok(next.run(request).await),
         Ok(rusternetes_common::authz::Decision::Deny(reason)) => {
-            info!("Forbidden: {} {} {:?}/{:?}: {}", ctx.user.username, attrs.verb, attrs.resource, attrs.name, reason);
+            info!(
+                "Forbidden: {} {} {:?}/{:?}: {}",
+                ctx.user.username, attrs.verb, attrs.resource, attrs.name, reason
+            );
             Err(forbidden(&format!(
                 "{} \"{}\" is forbidden: User \"{}\" cannot {} resource \"{}\": {}",
-                attrs.resource, attrs.name.as_deref().unwrap_or(""), ctx.user.username, attrs.verb, attrs.resource, reason
+                attrs.resource,
+                attrs.name.as_deref().unwrap_or(""),
+                ctx.user.username,
+                attrs.verb,
+                attrs.resource,
+                reason
             )))
         }
         Err(e) => Err(forbidden(&format!("authorization failed: {e}"))),
@@ -511,7 +528,8 @@ async fn partial_object_metadata_response(response: Response, is_watch: bool) ->
     match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
             Ok(v) => {
-                let out = serde_json::to_vec(&to_partial_object_metadata(v)).unwrap_or_else(|_| b.to_vec());
+                let out = serde_json::to_vec(&to_partial_object_metadata(v))
+                    .unwrap_or_else(|_| b.to_vec());
                 Response::from_parts(parts, Body::from(out))
             }
             Err(_) => Response::from_parts(parts, Body::from(b)),

@@ -153,7 +153,11 @@ impl TlsConfig {
         client_auth_roots.add_parsable_certificates(client_ca_certs);
 
         let builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_auth_roots));
-        let builder = if required { builder } else { builder.allow_unauthenticated() };
+        let builder = if required {
+            builder
+        } else {
+            builder.allow_unauthenticated()
+        };
         let client_cert_verifier = builder
             .build()
             .context("Failed to build client cert verifier")?;

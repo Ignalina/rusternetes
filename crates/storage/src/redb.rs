@@ -85,7 +85,9 @@ impl RedbStorage {
                 let key = key_str(&k);
                 rep.scanned += 1;
                 if t.is_current(&key, &kv.value) {
-                    *rep.census.entry(crate::EncryptionTransformer::label(&kv.value)).or_default() += 1;
+                    *rep.census
+                        .entry(crate::EncryptionTransformer::label(&kv.value))
+                        .or_default() += 1;
                     continue;
                 }
                 let new = match t.decode(&key, &kv.value).and_then(|p| t.encode(&key, &p)) {
@@ -100,14 +102,21 @@ impl RedbStorage {
                 match self.blocking(move |s| s.update(&kk, &nn, Some(rev))).await {
                     Ok(_) => {
                         rep.rewritten += 1;
-                        *rep.census.entry(crate::EncryptionTransformer::label(&new)).or_default() += 1;
+                        *rep.census
+                            .entry(crate::EncryptionTransformer::label(&new))
+                            .or_default() += 1;
                         if rep.rewritten % 100 == 0 {
-                            info!("re-encrypt: {} rewritten under {} so far ({} scanned)", rep.rewritten, rep.write, rep.scanned);
+                            info!(
+                                "re-encrypt: {} rewritten under {} so far ({} scanned)",
+                                rep.rewritten, rep.write, rep.scanned
+                            );
                         }
                     }
                     Err(StoreError::Conflict { .. }) | Err(StoreError::NotFound(_)) => {
                         rep.conflicts += 1;
-                        *rep.census.entry(crate::EncryptionTransformer::label(&kv.value)).or_default() += 1;
+                        *rep.census
+                            .entry(crate::EncryptionTransformer::label(&kv.value))
+                            .or_default() += 1;
                     }
                     Err(e) => return Err(map_err(&key, e)),
                 }
@@ -136,7 +145,12 @@ impl RedbStorage {
         serde_json::to_string(&v).map_err(Error::Serialization)
     }
 
-    fn decode<T: DeserializeOwned>(&self, key: &str, stored: &[u8], mod_revision: i64) -> Result<T> {
+    fn decode<T: DeserializeOwned>(
+        &self,
+        key: &str,
+        stored: &[u8],
+        mod_revision: i64,
+    ) -> Result<T> {
         let json = crate::open(&self.encryption, key, stored)?;
         let s = Self::inject_resource_version(&json, mod_revision)?;
         serde_json::from_str(&s).map_err(Error::Serialization)
@@ -196,10 +210,9 @@ fn to_watch_event(enc: &crate::Encryption, ev: &Event) -> Result<WatchEvent> {
         Event::Put { rev, key, kv, .. } => {
             WatchEvent::Modified(key_str(key), text(key, &kv.value, *rev)?)
         }
-        Event::Delete { rev, key, prev } => WatchEvent::Deleted(
-            key_str(key),
-            text(key, &prev.value, *rev)?,
-        ),
+        Event::Delete { rev, key, prev } => {
+            WatchEvent::Deleted(key_str(key), text(key, &prev.value, *rev)?)
+        }
         // Watches only carry key events; lease events never reach them.
         other => return Err(Error::Storage(format!("unexpected store event {other:?}"))),
     })

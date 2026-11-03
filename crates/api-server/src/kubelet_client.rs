@@ -30,12 +30,15 @@ pub fn client_config(t: &KubeletClientTls) -> Result<rustls::ClientConfig> {
     let read = |p: &str| std::fs::read(p).with_context(|| p.to_string());
     let mut roots = rustls::RootCertStore::empty();
     for c in CertificateDer::pem_slice_iter(&read(&t.ca_file)?) {
-        roots.add(c.context("the kubelet CA")?).context("the kubelet CA")?;
+        roots
+            .add(c.context("the kubelet CA")?)
+            .context("the kubelet CA")?;
     }
     let certs = CertificateDer::pem_slice_iter(&read(&t.cert_file)?)
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("the kubelet client certificate")?;
-    let key = PrivateKeyDer::from_pem_slice(&read(&t.key_file)?).context("the kubelet client key")?;
+    let key =
+        PrivateKeyDer::from_pem_slice(&read(&t.key_file)?).context("the kubelet client key")?;
     Ok(rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
@@ -56,12 +59,20 @@ pub fn tls() -> bool {
 
 /// `https` or `http`.
 pub fn http_scheme() -> &'static str {
-    if tls() { "https" } else { "http" }
+    if tls() {
+        "https"
+    } else {
+        "http"
+    }
 }
 
 /// `wss` or `ws`.
 pub fn ws_scheme() -> &'static str {
-    if tls() { "wss" } else { "ws" }
+    if tls() {
+        "wss"
+    } else {
+        "ws"
+    }
 }
 
 /// An HTTP client for the kubelets.
@@ -83,12 +94,20 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 /// Connect to `host:port` (an IP, as `node_kubelet_addr` gives), over TLS
 /// when it is on.
 pub async fn connect(addr: &str) -> Result<Box<dyn Io>> {
-    let tcp = tokio::net::TcpStream::connect(addr).await.with_context(|| addr.to_string())?;
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .with_context(|| addr.to_string())?;
     let Some(cfg) = TLS.get() else {
         return Ok(Box::new(tcp));
     };
-    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h).trim_start_matches('[').trim_end_matches(']');
-    let ip: std::net::IpAddr = host.parse().with_context(|| format!("{host} is not an IP address"))?;
+    let host = addr
+        .rsplit_once(':')
+        .map_or(addr, |(h, _)| h)
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let ip: std::net::IpAddr = host
+        .parse()
+        .with_context(|| format!("{host} is not an IP address"))?;
     let tls = tokio_rustls::TlsConnector::from(cfg.clone())
         .connect(ServerName::IpAddress(ip.into()), tcp)
         .await

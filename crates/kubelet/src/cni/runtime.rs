@@ -189,10 +189,21 @@ impl CniRuntime {
     ) -> Result<CniResult, CniError> {
         let cni = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            cni.setup_network_with_args(&container_id, &netns, &ifname, network_name.as_deref(), args.as_deref())
+            cni.setup_network_with_args(
+                &container_id,
+                &netns,
+                &ifname,
+                network_name.as_deref(),
+                args.as_deref(),
+            )
         })
         .await
-        .unwrap_or_else(|e| Err(CniError::new(ErrorCode::IoFailure, format!("the CNI ADD task failed: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(CniError::new(
+                ErrorCode::IoFailure,
+                format!("the CNI ADD task failed: {e}"),
+            ))
+        })
     }
 
     /// [`Self::teardown_network`] for the async callers.
@@ -204,9 +215,16 @@ impl CniRuntime {
         network_name: Option<String>,
     ) -> Result<(), CniError> {
         let cni = Arc::clone(self);
-        tokio::task::spawn_blocking(move || cni.teardown_network(&container_id, &netns, &ifname, network_name.as_deref()))
-            .await
-            .unwrap_or_else(|e| Err(CniError::new(ErrorCode::IoFailure, format!("the CNI DEL task failed: {e}"))))
+        tokio::task::spawn_blocking(move || {
+            cni.teardown_network(&container_id, &netns, &ifname, network_name.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(CniError::new(
+                ErrorCode::IoFailure,
+                format!("the CNI DEL task failed: {e}"),
+            ))
+        })
     }
 
     /// Teardown network for a container (DEL operation)
@@ -508,10 +526,18 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         let n = ticks.load(Ordering::SeqCst);
         ticker.abort();
-        assert!(n >= 5, "the runtime ticked {n} times during the plugin's second (stalled)");
+        assert!(
+            n >= 5,
+            "the runtime ticked {n} times during the plugin's second (stalled)"
+        );
         assert_eq!(cni.get_container_ip("pod-a").as_deref(), Some("10.1.0.2"));
         let r = cni
-            .teardown_network_async("pod-a".into(), netns.to_string_lossy().into_owned(), "eth0".into(), None)
+            .teardown_network_async(
+                "pod-a".into(),
+                netns.to_string_lossy().into_owned(),
+                "eth0".into(),
+                None,
+            )
             .await;
         assert!(r.is_ok(), "{r:?}");
         assert!(cni.get_container_ip("pod-a").is_none());

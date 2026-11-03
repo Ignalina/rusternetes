@@ -285,7 +285,9 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
         if let Some(ref resources) = rule.resources {
             let ok = match attrs.subresource.as_deref().filter(|s| !s.is_empty()) {
                 Some(sub) => resources.iter().any(|r| {
-                    r == "*" || *r == format!("{}/{}", attrs.resource, sub) || *r == format!("*/{}", sub)
+                    r == "*"
+                        || *r == format!("{}/{}", attrs.resource, sub)
+                        || *r == format!("*/{}", sub)
                 }),
                 None => resources.iter().any(|r| r == "*" || *r == attrs.resource),
             };
@@ -853,9 +855,19 @@ mod tests {
             resource_names: None,
             non_resource_urls: None,
         };
-        let u = UserInfo { username: "u".into(), uid: String::new(), groups: vec![], extra: Default::default() };
-        let exec = RequestAttributes::new(u.clone(), "create", "pods").with_namespace("d").with_name("p").with_subresource("exec");
-        let get = RequestAttributes::new(u, "get", "pods").with_namespace("d").with_name("p");
+        let u = UserInfo {
+            username: "u".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let exec = RequestAttributes::new(u.clone(), "create", "pods")
+            .with_namespace("d")
+            .with_name("p")
+            .with_subresource("exec");
+        let get = RequestAttributes::new(u, "get", "pods")
+            .with_namespace("d")
+            .with_name("p");
         assert!(rbac.rule_allows(&rule(&["pods"]), &get));
         assert!(!rbac.rule_allows(&rule(&["pods"]), &exec));
         assert!(rbac.rule_allows(&rule(&["pods/exec"]), &exec));
@@ -890,11 +902,18 @@ mod tests {
             extra: Default::default(),
         };
         let admin = user("admin", &["system:masters", "system:authenticated"]);
-        let attrs = RequestAttributes::new(admin, "create", "deployments").with_namespace("default").with_api_group("apps");
+        let attrs = RequestAttributes::new(admin, "create", "deployments")
+            .with_namespace("default")
+            .with_api_group("apps");
         assert_eq!(rbac.authorize(&attrs).await.unwrap(), Decision::Allow);
         let node = user("system:node:w1", &["system:nodes", "system:authenticated"]);
-        let attrs = RequestAttributes::new(node, "create", "deployments").with_namespace("default").with_api_group("apps");
-        assert!(matches!(rbac.authorize(&attrs).await.unwrap(), Decision::Deny(_)));
+        let attrs = RequestAttributes::new(node, "create", "deployments")
+            .with_namespace("default")
+            .with_api_group("apps");
+        assert!(matches!(
+            rbac.authorize(&attrs).await.unwrap(),
+            Decision::Deny(_)
+        ));
     }
 
     #[test]
