@@ -38,7 +38,12 @@ pub fn client() -> Option<&'static ApiTokenClient> {
 }
 
 /// The TokenRequest body for a pod's token.
-pub fn request_body(pod_name: &str, pod_uid: &str, audiences: &[String], expiration_seconds: i64) -> serde_json::Value {
+pub fn request_body(
+    pod_name: &str,
+    pod_uid: &str,
+    audiences: &[String],
+    expiration_seconds: i64,
+) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "authentication.k8s.io/v1",
         "kind": "TokenRequest",
@@ -97,11 +102,16 @@ impl ApiTokenClient {
                 s.trim_end_matches('/')
             );
             match http.post(&url).json(&body).send().await {
-                Ok(r) if r.status().is_success() => return token_of(&r.json::<serde_json::Value>().await?),
+                Ok(r) if r.status().is_success() => {
+                    return token_of(&r.json::<serde_json::Value>().await?)
+                }
                 Ok(r) => {
                     let st = r.status();
                     let text = r.text().await.unwrap_or_default();
-                    last = format!("{url}: HTTP {st}: {}", text.chars().take(200).collect::<String>());
+                    last = format!(
+                        "{url}: HTTP {st}: {}",
+                        text.chars().take(200).collect::<String>()
+                    );
                     // A refusal is the same on every API server.
                     if st.as_u16() == 403 || st.as_u16() == 404 {
                         break;
@@ -132,6 +142,9 @@ mod tests {
     fn an_answer_without_a_token_is_an_error() {
         assert!(token_of(&serde_json::json!({"status": {}})).is_err());
         assert!(token_of(&serde_json::json!({"status": {"token": "x"}})).is_err());
-        assert_eq!(token_of(&serde_json::json!({"status": {"token": "a.b.c"}})).unwrap(), "a.b.c");
+        assert_eq!(
+            token_of(&serde_json::json!({"status": {"token": "a.b.c"}})).unwrap(),
+            "a.b.c"
+        );
     }
 }

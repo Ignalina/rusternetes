@@ -182,8 +182,19 @@ pub fn token_renew_due(token: &str, now: i64) -> bool {
 /// The pod a ServiceAccount user's token is bound to: (namespace, pod name,
 /// pod uid), from the authenticated user's extra (a bound token).
 pub fn bound_pod(user: &UserInfo) -> Option<(String, String, String)> {
-    let ns = user.username.strip_prefix("system:serviceaccount:")?.split(':').next()?.to_string();
-    let one = |k: &str| user.extra.get(k).and_then(|v| v.first()).filter(|s| !s.is_empty()).cloned();
+    let ns = user
+        .username
+        .strip_prefix("system:serviceaccount:")?
+        .split(':')
+        .next()?
+        .to_string();
+    let one = |k: &str| {
+        user.extra
+            .get(k)
+            .and_then(|v| v.first())
+            .filter(|s| !s.is_empty())
+            .cloned()
+    };
     let name = one("authentication.kubernetes.io/pod-name")?;
     let uid = one("authentication.kubernetes.io/pod-uid").unwrap_or_default();
     Some((ns, name, uid))
@@ -478,10 +489,16 @@ impl UserInfo {
             for (key, r) in [("pod", &k.pod), ("node", &k.node)] {
                 if let Some(r) = r {
                     if !r.name.is_empty() {
-                        extra.insert(format!("authentication.kubernetes.io/{key}-name"), vec![r.name.clone()]);
+                        extra.insert(
+                            format!("authentication.kubernetes.io/{key}-name"),
+                            vec![r.name.clone()],
+                        );
                     }
                     if !r.uid.is_empty() {
-                        extra.insert(format!("authentication.kubernetes.io/{key}-uid"), vec![r.uid.clone()]);
+                        extra.insert(
+                            format!("authentication.kubernetes.io/{key}-uid"),
+                            vec![r.uid.clone()],
+                        );
                     }
                 }
             }
@@ -1423,13 +1440,27 @@ mod tests {
     fn a_bound_token_names_its_pod_and_node() {
         let mut c = ServiceAccountClaims::new("web".into(), "default".into(), "u".into(), 1);
         if let Some(k) = c.kubernetes.as_mut() {
-            k.pod = Some(KubeRef { name: "web-1".into(), uid: "p-1".into() });
-            k.node = Some(KubeRef { name: "w1".into(), uid: "n-1".into() });
+            k.pod = Some(KubeRef {
+                name: "web-1".into(),
+                uid: "p-1".into(),
+            });
+            k.node = Some(KubeRef {
+                name: "w1".into(),
+                uid: "n-1".into(),
+            });
         }
         let u = UserInfo::from_service_account_claims(&c);
-        assert_eq!(bound_pod(&u), Some(("default".into(), "web-1".into(), "p-1".into())));
+        assert_eq!(
+            bound_pod(&u),
+            Some(("default".into(), "web-1".into(), "p-1".into()))
+        );
         assert_eq!(bound_node(&u).as_deref(), Some("w1"));
-        let legacy = UserInfo::from_service_account_claims(&ServiceAccountClaims::new("web".into(), "default".into(), "u".into(), 1));
+        let legacy = UserInfo::from_service_account_claims(&ServiceAccountClaims::new(
+            "web".into(),
+            "default".into(),
+            "u".into(),
+            1,
+        ));
         assert_eq!(bound_pod(&legacy), None);
     }
 }

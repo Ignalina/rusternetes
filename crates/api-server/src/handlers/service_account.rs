@@ -65,7 +65,10 @@ pub async fn create(
     let created = state.storage.create(&key, &service_account).await?;
     // No long-lived token Secret (upstream since 1.24): pods get bound,
     // short-lived tokens through TokenRequest.
-    info!("ServiceAccount {}/{} stored", namespace, created.metadata.name);
+    info!(
+        "ServiceAccount {}/{} stored",
+        namespace, created.metadata.name
+    );
 
     Ok((StatusCode::CREATED, Json(created)))
 }
