@@ -662,8 +662,14 @@ mod tests {
         };
         let image = ImageConfig::default();
         let spec = build(&input(&c, &image)).unwrap();
-        assert_eq!(spec["linux"]["sysctl"]["net.ipv4.ip_unprivileged_port_start"], "0");
-        assert_eq!(spec["linux"]["sysctl"]["net.ipv4.ping_group_range"], "0 2147483647");
+        assert_eq!(
+            spec["linux"]["sysctl"]["net.ipv4.ip_unprivileged_port_start"],
+            "0"
+        );
+        assert_eq!(
+            spec["linux"]["sysctl"]["net.ipv4.ping_group_range"],
+            "0 2147483647"
+        );
         let own = ContainerConfig {
             cmd: s(&["web"]),
             host_config: Some(HostConfig {
@@ -679,7 +685,10 @@ mod tests {
             ..Default::default()
         };
         let spec = build(&input(&own, &image)).unwrap();
-        assert_eq!(spec["linux"]["sysctl"]["net.ipv4.ip_unprivileged_port_start"], "1024");
+        assert_eq!(
+            spec["linux"]["sysctl"]["net.ipv4.ip_unprivileged_port_start"],
+            "1024"
+        );
         let mut host = input(&c, &image);
         host.net = Ns::Host;
         let spec = build(&host).unwrap();
