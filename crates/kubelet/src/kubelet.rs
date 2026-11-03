@@ -65,6 +65,8 @@ pub struct Kubelet {
     pod_workers: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
     /// Back-off between failed starts of a pending pod.
     start_backoff: Mutex<StartBackoff>,
+    /// CrashLoopBackOff between restarts of exited containers.
+    crash_backoff: Mutex<CrashBackoff>,
 }
 
 /// Back-off between failed starts of a pending pod: 5 s, doubling, at most
@@ -135,26 +137,35 @@ impl CrashBackoff {
     pub(crate) const RESET_AFTER: Duration = Duration::from_secs(600);
 
     /// The time left before `key` may restart, if it is backing off.
-    pub(crate) fn wait(&self, _key: &str, _now: std::time::Instant) -> Option<Duration> {
-        None
+    pub(crate) fn wait(&self, key: &str, now: std::time::Instant) -> Option<Duration> {
+        match self.entries.get(key) {
+            Some((_, at)) if *at > now => Some(*at - now),
+            _ => None,
+        }
     }
 
     /// `key` is restarted now, after it ran for `ran`; returns the back-off
     /// before its next restart.
     pub(crate) fn restarted(
         &mut self,
-        _key: &str,
-        _now: std::time::Instant,
-        _ran: Option<Duration>,
+        key: &str,
+        now: std::time::Instant,
+        ran: Option<Duration>,
     ) -> Duration {
-        Duration::ZERO
+        let delay = match self.entries.get(key) {
+            Some((last, _)) if ran.is_none_or(|r| r < Self::RESET_AFTER) => {
+                last.saturating_mul(2).min(Self::MAX)
+            }
+            _ => Self::INITIAL,
+        };
+        // Entries quiet for longer than a reset would take (the pod is gone,
+        // or its containers run) go: their next restart starts over anyway.
+        self.entries
+            .retain(|_, (_, at)| now < *at + Self::RESET_AFTER + Self::MAX);
+        self.entries.insert(key.to_string(), (delay, now + delay));
+        delay
     }
 
-    /// Forget every container of a pod UID that is gone.
-    pub(crate) fn forget_pod(&mut self, uid: &str) {
-        let prefix = format!("{}/", uid);
-        self.entries.retain(|k, _| !k.starts_with(&prefix));
-    }
 }
 
 /// Which of a pod's terminated containers may restart now, and which wait
@@ -181,6 +192,18 @@ pub(crate) fn crash_restart_gate(
         }
     }
     (due, waiting)
+}
+
+/// How long a terminated container ran (its status' start to finish).
+pub(crate) fn ran_for(cs: &ContainerStatus) -> Option<Duration> {
+    match &cs.state {
+        Some(ContainerState::Terminated {
+            started_at: Some(a),
+            finished_at: Some(b),
+            ..
+        }) => (*b - *a).to_std().ok(),
+        _ => None,
+    }
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -239,6 +262,7 @@ impl Kubelet {
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
             start_backoff: Mutex::new(StartBackoff::default()),
+            crash_backoff: Mutex::new(CrashBackoff::default()),
             pod_cidr: None,
         })
     }
@@ -2932,6 +2956,33 @@ impl Kubelet {
                             if let Ok(container_statuses) =
                                 self.runtime.get_container_statuses(pod).await
                             {
+                                // CrashLoopBackOff: only the exited containers whose
+                                // back-off passed restart now (never a sleep in the
+                                // pod worker); the others show Waiting/CrashLoopBackOff.
+                                let uid = pod.metadata.uid.clone();
+                                let now = std::time::Instant::now();
+                                let (due, waiting) = crash_restart_gate(
+                                    &self.crash_backoff.lock().unwrap(),
+                                    &uid,
+                                    &container_statuses,
+                                    now,
+                                );
+                                if !waiting.is_empty() {
+                                    self.show_crash_loop(namespace, pod_name, &container_statuses, &waiting)
+                                        .await;
+                                }
+                                let ran: HashMap<String, Option<Duration>> = container_statuses
+                                    .iter()
+                                    .map(|c| (c.name.clone(), ran_for(c)))
+                                    .collect();
+                                let container_statuses: Vec<ContainerStatus> = container_statuses
+                                    .into_iter()
+                                    .filter(|c| {
+                                        !matches!(c.state, Some(ContainerState::Terminated { .. }))
+                                            || due.contains(&c.name)
+                                    })
+                                    .collect();
+                                if !due.is_empty() {
                                 // Get existing restart counts from pod status
                                 let prev_counts: std::collections::HashMap<String, u32> = pod
                                     .status
@@ -2944,11 +2995,6 @@ impl Kubelet {
                                             .collect()
                                     })
                                     .unwrap_or_default();
-
-                                // Check if any container failed (for backoff decision later)
-                                let has_failed_container = container_statuses.iter().any(|cs| {
-                                    matches!(&cs.state, Some(ContainerState::Terminated { exit_code, .. }) if *exit_code != 0)
-                                });
 
                                 // Build updated statuses with incremented restart counts
                                 let updated_statuses: Vec<ContainerStatus> = container_statuses
@@ -3002,26 +3048,6 @@ impl Kubelet {
                                 }
                                 let _ = self.storage.update(&key, &new_pod).await;
 
-                                // Apply CrashLoopBackOff delay before restarting, but only for
-                                // containers that exited with non-zero code. K8s resets backoff
-                                // on successful exit (code 0).
-                                // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — backOff
-                                if has_failed_container {
-                                    let max_restart_count =
-                                        prev_counts.values().copied().max().unwrap_or(0);
-                                    if max_restart_count > 1 {
-                                        let backoff_secs = std::cmp::min(
-                                            10u64 * 2u64.pow((max_restart_count - 2).min(8)),
-                                            300,
-                                        );
-                                        debug!(
-                                            "CrashLoopBackOff: waiting {}s before restarting containers in pod {}/{}",
-                                            backoff_secs, namespace, pod_name
-                                        );
-                                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                                    }
-                                }
-
                                 // Restart only the terminated containers (not the entire pod).
                                 // start_pod() would redo init containers, networking, etc.
                                 // We just need to remove and recreate the exited containers.
@@ -3046,6 +3072,9 @@ impl Kubelet {
                                             })
                                             .unwrap_or_default();
                                     for c in &spec.containers {
+                                        if !due.contains(&c.name) {
+                                            continue;
+                                        }
                                         let cname = format!("{}_{}", pod_name, c.name);
                                         // Check if this specific container is terminated
                                         if !self
@@ -3092,6 +3121,11 @@ impl Kubelet {
                                                     c.name, namespace, pod_name, e
                                                 );
                                             } else {
+                                                self.crash_backoff.lock().unwrap().restarted(
+                                                    &format!("{}/{}", uid, c.name),
+                                                    now,
+                                                    ran.get(&c.name).copied().flatten(),
+                                                );
                                                 info!(
                                                     "Restarted container {} in pod {}/{}, updating status immediately",
                                                     c.name, namespace, pod_name
@@ -3121,6 +3155,7 @@ impl Kubelet {
                                         }
                                         let _ = self.storage.update(&key, &p).await;
                                     }
+                                }
                                 }
                             }
                         }
@@ -3610,80 +3645,62 @@ impl Kubelet {
 
                 match restart_policy {
                     "Always" => {
+                        // CrashLoopBackOff: restart only once the exited containers'
+                        // back-off passed (10 s doubling to 5 min, per container). Until
+                        // then the status shows Waiting/CrashLoopBackOff and the restart
+                        // count stays: it counts restarts, not syncs.
+                        let statuses = container_statuses.clone().unwrap_or_default();
+                        let uid = pod.metadata.uid.clone();
+                        let now = std::time::Instant::now();
+                        let (due, waiting) = crash_restart_gate(
+                            &self.crash_backoff.lock().unwrap(),
+                            &uid,
+                            &statuses,
+                            now,
+                        );
+                        if due.is_empty() && !waiting.is_empty() {
+                            self.show_crash_loop(namespace, pod_name, &statuses, &waiting)
+                                .await;
+                            return Ok(());
+                        }
                         debug!(
                             "Restarting pod {}/{} (restartPolicy=Always)",
                             namespace, pod_name
                         );
-
-                        // CrashLoopBackOff: update status to show Terminated state
-                        // with the actual exit reason. Don't immediately set Waiting —
-                        // the test needs to observe the Terminated state with a reason.
+                        // The restarted containers' restart counts, and their back-off
+                        // before the next restart.
                         let key = build_key("pods", Some(namespace), pod_name);
-                        let mut fresh_pod: Pod = match self.storage.get(&key).await {
-                            Ok(p) => p,
-                            _ => pod.clone(),
-                        };
-
-                        // Get current restart count from pod status
-                        let prev_restart = fresh_pod
-                            .status
-                            .as_ref()
-                            .and_then(|s| s.container_statuses.as_ref())
-                            .and_then(|cs| cs.iter().map(|c| c.restart_count).max())
-                            .unwrap_or(0);
-
-                        if let Some(ref mut status) = fresh_pod.status {
-                            if let Some(ref cs) = container_statuses {
-                                let updated_statuses: Vec<ContainerStatus> = cs
+                        if let Ok(mut fresh_pod) = self.storage.get::<Pod>(&key).await {
+                            if let Some(ref mut status) = fresh_pod.status {
+                                let stored: HashMap<String, u32> = status
+                                    .container_statuses
                                     .iter()
-                                    .map(|c| {
-                                        let mut new_cs = c.clone();
-                                        // Preserve the Terminated state (with reason) from
-                                        // get_container_statuses. Increment restart count.
-                                        new_cs.restart_count = prev_restart + 1;
-                                        new_cs.ready = false;
-                                        new_cs.started = Some(false);
-                                        // Keep state as Terminated — tests need to observe it.
-                                        // On the NEXT sync cycle, after backoff, we'll set
-                                        // Waiting/CrashLoopBackOff and restart.
-                                        new_cs
-                                    })
+                                    .flatten()
+                                    .map(|c| (c.name.clone(), c.restart_count))
                                     .collect();
-                                status.container_statuses = Some(updated_statuses);
+                                status.container_statuses = Some(
+                                    statuses
+                                        .iter()
+                                        .map(|c| {
+                                            let mut new_cs = c.clone();
+                                            let prev = stored.get(&c.name).copied().unwrap_or(0);
+                                            new_cs.restart_count =
+                                                prev + u32::from(due.contains(&c.name));
+                                            new_cs.ready = false;
+                                            new_cs.started = Some(false);
+                                            new_cs
+                                        })
+                                        .collect(),
+                                );
+                            }
+                            let _ = self.storage.update(&key, &fresh_pod).await;
+                        }
+                        {
+                            let mut b = self.crash_backoff.lock().unwrap();
+                            for c in statuses.iter().filter(|c| due.contains(&c.name)) {
+                                b.restarted(&format!("{}/{}", uid, c.name), now, ran_for(c));
                             }
                         }
-                        let _ = self.storage.update(&key, &fresh_pod).await;
-
-                        // CrashLoopBackOff: compute backoff delay based on restart count
-                        // K8s uses: 10s, 20s, 40s, 80s, 160s, 300s (capped at 5m)
-                        let current_restart = prev_restart + 1;
-                        let backoff_secs: i64 =
-                            std::cmp::min(10 * (1_i64 << (current_restart as i64 - 1).min(5)), 300);
-                        // Check if enough time has passed since the container finished
-                        let should_restart = container_statuses
-                            .as_ref()
-                            .and_then(|cs| cs.first())
-                            .and_then(|c| match &c.state {
-                                Some(ContainerState::Terminated { finished_at, .. }) => finished_at
-                                    .as_ref()
-                                    .map(|finished| {
-                                        let elapsed =
-                                            (chrono::Utc::now() - *finished).num_seconds();
-                                        elapsed >= backoff_secs
-                                    })
-                                    .or(Some(true)),
-                                _ => Some(true),
-                            })
-                            .unwrap_or(true);
-
-                        if !should_restart {
-                            debug!(
-                                "CrashLoopBackOff: pod {}/{} waiting (restart #{}, backoff {}s)",
-                                namespace, pod_name, current_restart, backoff_secs
-                            );
-                            return Ok(());
-                        }
-
                         if let Err(e) = self.runtime.start_pod(pod).await {
                             error!("Failed to restart pod: {}", e);
                             self.update_pod_status(
@@ -3697,6 +3714,27 @@ impl Kubelet {
                     }
                     "OnFailure" => {
                         if any_failed {
+                            // CrashLoopBackOff, as for Always.
+                            let statuses = container_statuses.clone().unwrap_or_default();
+                            let uid = pod.metadata.uid.clone();
+                            let now = std::time::Instant::now();
+                            let (due, waiting) = crash_restart_gate(
+                                &self.crash_backoff.lock().unwrap(),
+                                &uid,
+                                &statuses,
+                                now,
+                            );
+                            if due.is_empty() && !waiting.is_empty() {
+                                self.show_crash_loop(namespace, pod_name, &statuses, &waiting)
+                                    .await;
+                                return Ok(());
+                            }
+                            {
+                                let mut b = self.crash_backoff.lock().unwrap();
+                                for c in statuses.iter().filter(|c| due.contains(&c.name)) {
+                                    b.restarted(&format!("{}/{}", uid, c.name), now, ran_for(c));
+                                }
+                            }
                             debug!(
                                 "Restarting pod {}/{} (restartPolicy=OnFailure, container failed)",
                                 namespace, pod_name
@@ -4122,6 +4160,61 @@ impl Kubelet {
             "Guaranteed".to_string()
         } else {
             "Burstable".to_string()
+        }
+    }
+
+    /// Containers waiting out their CrashLoopBackOff: Waiting/CrashLoopBackOff
+    /// with the exit as their last state, written only when that changes.
+    async fn show_crash_loop(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        statuses: &[ContainerStatus],
+        waiting: &HashMap<String, Duration>,
+    ) {
+        let key = build_key("pods", Some(namespace), pod_name);
+        let Ok(mut p) = self.storage.get::<Pod>(&key).await else {
+            return;
+        };
+        let original = p.clone();
+        if let Some(ref mut status) = p.status {
+            let mut list = status.container_statuses.clone().unwrap_or_default();
+            for rt in statuses {
+                let Some(left) = waiting.get(&rt.name) else {
+                    continue;
+                };
+                let already = |c: &ContainerStatus| {
+                    matches!(&c.state, Some(ContainerState::Waiting { reason: Some(r), .. }) if r == "CrashLoopBackOff")
+                };
+                let restart_count = list
+                    .iter()
+                    .find(|c| c.name == rt.name)
+                    .map(|c| c.restart_count)
+                    .unwrap_or(rt.restart_count);
+                let mut cs = rt.clone();
+                cs.restart_count = restart_count;
+                cs.last_state = rt.state.clone();
+                cs.state = Some(ContainerState::Waiting {
+                    reason: Some("CrashLoopBackOff".to_string()),
+                    message: Some(format!(
+                        "back-off {}s restarting failed container={} pod={}",
+                        left.as_secs().max(1),
+                        rt.name,
+                        pod_name
+                    )),
+                });
+                cs.ready = false;
+                cs.started = Some(false);
+                match list.iter_mut().find(|c| c.name == rt.name) {
+                    Some(c) if already(c) => {}
+                    Some(c) => *c = cs,
+                    None => list.push(cs),
+                }
+            }
+            status.container_statuses = Some(list);
+        }
+        if !pod_status_equal(&original, &p) {
+            let _ = self.storage.update(&key, &p).await;
         }
     }
 
@@ -5072,9 +5165,10 @@ mod crash_backoff_tests {
         assert_eq!(b.restarted("u/c", t, Some(s(1))), s(40));
         assert_eq!(b.restarted("u/c", t, Some(s(600))), s(10));
         assert_eq!(b.restarted("u/c", t, Some(s(1))), s(20));
-        b.forget_pod("u");
-        assert_eq!(b.wait("u/c", t), None);
-        assert_eq!(b.restarted("u/c", t, None), s(10));
+        // A pod gone for a while: its entry is dropped by the next restart elsewhere.
+        b.restarted("v/c", t + s(1200), None);
+        assert!(!b.entries.contains_key("u/c"));
+        assert_eq!(b.restarted("u/c", t + s(1200), None), s(10));
     }
 
     #[test]
