@@ -301,7 +301,8 @@ mod tests {
             let mut req = String::new();
             std::io::Read::read_to_string(&mut s, &mut req).unwrap();
             let req: ResultRequest = serde_json::from_str(&req).unwrap();
-            s.write_all(b"heimdall-features: {}\nheimdall-signed-result: AAAA\n").unwrap();
+            s.write_all(b"heimdall-features: {}\nheimdall-signed-result: AAAA\n")
+                .unwrap();
             Ok(req)
         });
         std::fs::write(
@@ -334,7 +335,10 @@ mod tests {
         let log = d.path().join("output.log");
         result_hook(d.path(), &log, "c1", None, Some(9), 1, 2);
         let text = std::fs::read_to_string(&log).unwrap();
-        assert!(text.starts_with("heimdall-refused: no result hook at "), "{text}");
+        assert!(
+            text.starts_with("heimdall-refused: no result hook at "),
+            "{text}"
+        );
     }
 
     #[test]
@@ -343,7 +347,11 @@ mod tests {
         let log = d.path().join("output.log");
         result_hook(d.path(), &log, "c1", Some(0), None, 1, 2);
         assert!(!log.exists());
-        std::fs::write(d.path().join(RECORD_FILE), serde_json::to_vec(&record(None)).unwrap()).unwrap();
+        std::fs::write(
+            d.path().join(RECORD_FILE),
+            serde_json::to_vec(&record(None)).unwrap(),
+        )
+        .unwrap();
         result_hook(d.path(), &log, "c1", Some(0), None, 1, 2);
         assert!(!log.exists());
     }
