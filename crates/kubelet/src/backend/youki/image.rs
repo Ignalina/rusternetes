@@ -234,7 +234,9 @@ mod tests {
             std::fs::create_dir_all(root.join("tmp").join(n).join("rootfs")).unwrap();
         }
         assert_eq!(super::clean_tmp(&root), 2);
-        assert!(root.join("tmp").exists() && std::fs::read_dir(root.join("tmp")).unwrap().count() == 0);
+        assert!(
+            root.join("tmp").exists() && std::fs::read_dir(root.join("tmp")).unwrap().count() == 0
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
