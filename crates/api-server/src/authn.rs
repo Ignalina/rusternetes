@@ -100,32 +100,51 @@ pub fn authenticate(
 /// exists with the uid in the token, runs on the node in the token (when
 /// it names one) and is not deleted for more than a minute (upstream's
 /// bound-token validation). `Err` is the 401 message.
-pub async fn check_bound(user: &UserInfo, storage: &rusternetes_storage::StorageBackend) -> Result<(), String> {
+pub async fn check_bound(
+    user: &UserInfo,
+    storage: &rusternetes_storage::StorageBackend,
+) -> Result<(), String> {
     use rusternetes_storage::Storage as _;
     let Some((ns, name, uid)) = rusternetes_common::auth::bound_pod(user) else {
         return Ok(());
     };
-    let pod: serde_json::Value = match storage.get(&rusternetes_storage::build_key("pods", Some(&ns), &name)).await {
+    let pod: serde_json::Value = match storage
+        .get(&rusternetes_storage::build_key("pods", Some(&ns), &name))
+        .await
+    {
         Ok(p) => p,
         Err(rusternetes_common::Error::NotFound(_)) => {
-            return Err(format!("Unauthorized: the token's pod {ns}/{name} no longer exists"))
+            return Err(format!(
+                "Unauthorized: the token's pod {ns}/{name} no longer exists"
+            ))
         }
         // The store is not answering: not this token's fault (503 is the caller's).
         Err(e) => return Err(format!("the token's pod {ns}/{name} cannot be read: {e}")),
     };
-    let s = |p: &str| pod.pointer(p).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s = |p: &str| {
+        pod.pointer(p)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
     if !uid.is_empty() && s("/metadata/uid") != uid {
-        return Err(format!("Unauthorized: the token's pod {ns}/{name} was replaced (uid {uid})"));
+        return Err(format!(
+            "Unauthorized: the token's pod {ns}/{name} was replaced (uid {uid})"
+        ));
     }
     if let Some(node) = rusternetes_common::auth::bound_node(user) {
         let on = s("/spec/nodeName");
         if !on.is_empty() && on != node {
-            return Err(format!("Unauthorized: the token's pod {ns}/{name} is on {on}, not {node}"));
+            return Err(format!(
+                "Unauthorized: the token's pod {ns}/{name} is on {on}, not {node}"
+            ));
         }
     }
     if let Ok(t) = chrono::DateTime::parse_from_rfc3339(&s("/metadata/deletionTimestamp")) {
         if chrono::Utc::now().signed_duration_since(t) > chrono::Duration::seconds(60) {
-            return Err(format!("Unauthorized: the token's pod {ns}/{name} is deleted"));
+            return Err(format!(
+                "Unauthorized: the token's pod {ns}/{name} is deleted"
+            ));
         }
     }
     Ok(())

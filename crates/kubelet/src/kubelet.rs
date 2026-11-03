@@ -165,7 +165,6 @@ impl CrashBackoff {
         self.entries.insert(key.to_string(), (delay, now + delay));
         delay
     }
-
 }
 
 impl CrashBackoff {
@@ -190,7 +189,9 @@ impl CrashBackoff {
         let delay = Self::INITIAL
             .saturating_mul(1u32 << (cs.restart_count - 1).min(16))
             .min(Self::MAX);
-        let since = (chrono::Utc::now() - *finished).to_std().unwrap_or_default();
+        let since = (chrono::Utc::now() - *finished)
+            .to_std()
+            .unwrap_or_default();
         let until = (now + delay).checked_sub(since).unwrap_or(now);
         self.entries.insert(key.to_string(), (delay, until));
     }
@@ -2998,8 +2999,13 @@ impl Kubelet {
                                     now,
                                 );
                                 if !waiting.is_empty() {
-                                    self.show_crash_loop(namespace, pod_name, &container_statuses, &waiting)
-                                        .await;
+                                    self.show_crash_loop(
+                                        namespace,
+                                        pod_name,
+                                        &container_statuses,
+                                        &waiting,
+                                    )
+                                    .await;
                                 }
                                 let ran: HashMap<String, Option<Duration>> = container_statuses
                                     .iter()
@@ -3013,79 +3019,83 @@ impl Kubelet {
                                     })
                                     .collect();
                                 if !due.is_empty() {
-                                // Get existing restart counts from pod status
-                                let prev_counts: std::collections::HashMap<String, u32> = pod
-                                    .status
-                                    .as_ref()
-                                    .and_then(|s| s.container_statuses.as_ref())
-                                    .map(|statuses| {
-                                        statuses
-                                            .iter()
-                                            .map(|cs| (cs.name.clone(), cs.restart_count))
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
+                                    // Get existing restart counts from pod status
+                                    let prev_counts: std::collections::HashMap<String, u32> = pod
+                                        .status
+                                        .as_ref()
+                                        .and_then(|s| s.container_statuses.as_ref())
+                                        .map(|statuses| {
+                                            statuses
+                                                .iter()
+                                                .map(|cs| (cs.name.clone(), cs.restart_count))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
 
-                                // Build updated statuses with incremented restart counts
-                                let updated_statuses: Vec<ContainerStatus> = container_statuses
-                                    .into_iter()
-                                    .map(|mut cs| {
-                                        if matches!(
-                                            cs.state,
-                                            Some(ContainerState::Terminated { .. })
-                                        ) {
-                                            let prev =
-                                                prev_counts.get(&cs.name).copied().unwrap_or(0);
-                                            cs.restart_count = prev + 1;
-                                            cs.last_state = cs.state.take();
-                                            cs.state = Some(ContainerState::Waiting {
-                                                reason: Some("CrashLoopBackOff".to_string()),
-                                                message: Some(
-                                                    "Back-off restarting failed container"
-                                                        .to_string(),
-                                                ),
-                                            });
-                                            cs.ready = false;
-                                            cs.started = Some(false);
-                                        }
-                                        cs
-                                    })
-                                    .collect();
+                                    // Build updated statuses with incremented restart counts
+                                    let updated_statuses: Vec<ContainerStatus> = container_statuses
+                                        .into_iter()
+                                        .map(|mut cs| {
+                                            if matches!(
+                                                cs.state,
+                                                Some(ContainerState::Terminated { .. })
+                                            ) {
+                                                let prev =
+                                                    prev_counts.get(&cs.name).copied().unwrap_or(0);
+                                                cs.restart_count = prev + 1;
+                                                cs.last_state = cs.state.take();
+                                                cs.state = Some(ContainerState::Waiting {
+                                                    reason: Some("CrashLoopBackOff".to_string()),
+                                                    message: Some(
+                                                        "Back-off restarting failed container"
+                                                            .to_string(),
+                                                    ),
+                                                });
+                                                cs.ready = false;
+                                                cs.started = Some(false);
+                                            }
+                                            cs
+                                        })
+                                        .collect();
 
-                                // Write restart counts to storage so they persist across
-                                // container removal/recreation (Docker resets restart_count).
-                                // But keep the state as-is (Terminated) rather than setting
-                                // Waiting/CrashLoopBackOff — the post-restart update will
-                                // set the actual Running state. This avoids a window where
-                                // tests observe the wrong intermediate state.
-                                let key = build_key("pods", Some(namespace), pod_name);
-                                let mut new_pod: Pod = match self.storage.get(&key).await {
-                                    Ok(p) => p,
-                                    _ => pod.clone(),
-                                };
-                                if let Some(ref mut status) = new_pod.status {
-                                    // Only update restart_count and last_state, keep current state
-                                    if let Some(ref mut cs_list) = status.container_statuses {
-                                        for cs in cs_list.iter_mut() {
-                                            if let Some(updated) =
-                                                updated_statuses.iter().find(|u| u.name == cs.name)
-                                            {
-                                                cs.restart_count = updated.restart_count;
-                                                cs.last_state = updated.last_state.clone();
+                                    // Write restart counts to storage so they persist across
+                                    // container removal/recreation (Docker resets restart_count).
+                                    // But keep the state as-is (Terminated) rather than setting
+                                    // Waiting/CrashLoopBackOff — the post-restart update will
+                                    // set the actual Running state. This avoids a window where
+                                    // tests observe the wrong intermediate state.
+                                    let key = build_key("pods", Some(namespace), pod_name);
+                                    let mut new_pod: Pod = match self.storage.get(&key).await {
+                                        Ok(p) => p,
+                                        _ => pod.clone(),
+                                    };
+                                    if let Some(ref mut status) = new_pod.status {
+                                        // Only update restart_count and last_state, keep current state
+                                        if let Some(ref mut cs_list) = status.container_statuses {
+                                            for cs in cs_list.iter_mut() {
+                                                if let Some(updated) = updated_statuses
+                                                    .iter()
+                                                    .find(|u| u.name == cs.name)
+                                                {
+                                                    cs.restart_count = updated.restart_count;
+                                                    cs.last_state = updated.last_state.clone();
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                let _ = self.storage.update(&key, &new_pod).await;
+                                    let _ = self.storage.update(&key, &new_pod).await;
 
-                                // Restart only the terminated containers (not the entire pod).
-                                // start_pod() would redo init containers, networking, etc.
-                                // We just need to remove and recreate the exited containers.
-                                if let Some(spec) = &pod.spec {
-                                    // Rebuild volume paths from existing pod volumes on disk.
-                                    // Volumes were created during start_pod and persist on disk.
-                                    let volume_paths: std::collections::HashMap<String, String> =
-                                        spec.volumes
+                                    // Restart only the terminated containers (not the entire pod).
+                                    // start_pod() would redo init containers, networking, etc.
+                                    // We just need to remove and recreate the exited containers.
+                                    if let Some(spec) = &pod.spec {
+                                        // Rebuild volume paths from existing pod volumes on disk.
+                                        // Volumes were created during start_pod and persist on disk.
+                                        let volume_paths: std::collections::HashMap<
+                                            String,
+                                            String,
+                                        > = spec
+                                            .volumes
                                             .as_ref()
                                             .map(|vols| {
                                                 vols.iter()
@@ -3101,91 +3111,91 @@ impl Kubelet {
                                                     .collect()
                                             })
                                             .unwrap_or_default();
-                                    for c in &spec.containers {
-                                        if !due.contains(&c.name) {
-                                            continue;
-                                        }
-                                        let cname = format!("{}_{}", pod_name, c.name);
-                                        // Check if this specific container is terminated
-                                        if !self
-                                            .runtime
-                                            .is_container_running(&cname)
-                                            .await
-                                            .unwrap_or(true)
-                                        {
-                                            // For OnFailure, only restart if exit code != 0
-                                            if restart_policy == "OnFailure" {
-                                                let exit_code = self
-                                                    .runtime
-                                                    .get_container_exit_code(&cname)
-                                                    .await
-                                                    .unwrap_or(1);
-                                                if exit_code == 0 {
-                                                    debug!("Container {} exited successfully, not restarting (OnFailure)", cname);
-                                                    continue;
-                                                }
+                                        for c in &spec.containers {
+                                            if !due.contains(&c.name) {
+                                                continue;
                                             }
-                                            let _ = self
+                                            let cname = format!("{}_{}", pod_name, c.name);
+                                            // Check if this specific container is terminated
+                                            if !self
                                                 .runtime
-                                                .remove_terminated_container(&cname)
-                                                .await;
-                                            // Recreate just this container with its volumes
-                                            let pod_ip = pod
-                                                .status
-                                                .as_ref()
-                                                .and_then(|s| s.pod_ip.as_deref());
-                                            if let Err(e) = self
-                                                .runtime
-                                                .start_container(
-                                                    pod,
-                                                    c,
-                                                    &volume_paths,
-                                                    None,
-                                                    None,
-                                                    pod_ip,
-                                                )
+                                                .is_container_running(&cname)
                                                 .await
+                                                .unwrap_or(true)
                                             {
-                                                debug!(
+                                                // For OnFailure, only restart if exit code != 0
+                                                if restart_policy == "OnFailure" {
+                                                    let exit_code = self
+                                                        .runtime
+                                                        .get_container_exit_code(&cname)
+                                                        .await
+                                                        .unwrap_or(1);
+                                                    if exit_code == 0 {
+                                                        debug!("Container {} exited successfully, not restarting (OnFailure)", cname);
+                                                        continue;
+                                                    }
+                                                }
+                                                let _ = self
+                                                    .runtime
+                                                    .remove_terminated_container(&cname)
+                                                    .await;
+                                                // Recreate just this container with its volumes
+                                                let pod_ip = pod
+                                                    .status
+                                                    .as_ref()
+                                                    .and_then(|s| s.pod_ip.as_deref());
+                                                if let Err(e) = self
+                                                    .runtime
+                                                    .start_container(
+                                                        pod,
+                                                        c,
+                                                        &volume_paths,
+                                                        None,
+                                                        None,
+                                                        pod_ip,
+                                                    )
+                                                    .await
+                                                {
+                                                    debug!(
                                                     "Failed to restart container {} in pod {}/{}: {}",
                                                     c.name, namespace, pod_name, e
                                                 );
-                                            } else {
-                                                self.crash_backoff.lock().unwrap().restarted(
-                                                    &format!("{}/{}", uid, c.name),
-                                                    now,
-                                                    ran.get(&c.name).copied().flatten(),
-                                                );
-                                                info!(
+                                                } else {
+                                                    self.crash_backoff.lock().unwrap().restarted(
+                                                        &format!("{}/{}", uid, c.name),
+                                                        now,
+                                                        ran.get(&c.name).copied().flatten(),
+                                                    );
+                                                    info!(
                                                     "Restarted container {} in pod {}/{}, updating status immediately",
                                                     c.name, namespace, pod_name
                                                 );
+                                                }
                                             }
                                         }
                                     }
-                                }
-                                // After restarting containers, immediately update status
-                                // to reflect Running state. Without this, the status shows
-                                // CrashLoopBackOff/Waiting until the next sync cycle (5s),
-                                // causing runtime.go:129 to see wrong state.
-                                // K8s PLEG updates status immediately on container events.
-                                //
-                                // IMPORTANT: Read the fresh pod from storage first, then pass
-                                // it to get_container_statuses(). The stale `pod` variable has
-                                // the OLD restart_count/last_state, so Docker status would be
-                                // merged with stale data, resetting the incremented restart count.
-                                let key = build_key("pods", Some(namespace), pod_name);
-                                if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
-                                    if let Ok(fresh_statuses) =
-                                        self.runtime.get_container_statuses(&fresh_pod).await
-                                    {
-                                        let mut p = fresh_pod;
-                                        if let Some(ref mut s) = p.status {
-                                            s.container_statuses = Some(fresh_statuses);
+                                    // After restarting containers, immediately update status
+                                    // to reflect Running state. Without this, the status shows
+                                    // CrashLoopBackOff/Waiting until the next sync cycle (5s),
+                                    // causing runtime.go:129 to see wrong state.
+                                    // K8s PLEG updates status immediately on container events.
+                                    //
+                                    // IMPORTANT: Read the fresh pod from storage first, then pass
+                                    // it to get_container_statuses(). The stale `pod` variable has
+                                    // the OLD restart_count/last_state, so Docker status would be
+                                    // merged with stale data, resetting the incremented restart count.
+                                    let key = build_key("pods", Some(namespace), pod_name);
+                                    if let Ok(fresh_pod) = self.storage.get::<Pod>(&key).await {
+                                        if let Ok(fresh_statuses) =
+                                            self.runtime.get_container_statuses(&fresh_pod).await
+                                        {
+                                            let mut p = fresh_pod;
+                                            if let Some(ref mut s) = p.status {
+                                                s.container_statuses = Some(fresh_statuses);
+                                            }
+                                            let _ = self.storage.update(&key, &p).await;
                                         }
-                                        let _ = self.storage.update(&key, &p).await;
                                     }
-                                }
                                 }
                             }
                         }
@@ -4213,9 +4223,7 @@ impl Kubelet {
                 let Some(left) = waiting.get(&rt.name) else {
                     continue;
                 };
-                let already = |c: &ContainerStatus| {
-                    matches!(&c.state, Some(ContainerState::Waiting { reason: Some(r), .. }) if r == "CrashLoopBackOff")
-                };
+                let already = |c: &ContainerStatus| matches!(&c.state, Some(ContainerState::Waiting { reason: Some(r), .. }) if r == "CrashLoopBackOff");
                 let restart_count = list
                     .iter()
                     .find(|c| c.name == rt.name)
@@ -5178,7 +5186,11 @@ mod crash_backoff_tests {
         for w in want.drain(..) {
             let d = b.restarted("u/c", now, Some(s(1)));
             assert_eq!(d, s(w));
-            assert_eq!(b.wait("u/c", now + d - s(1)), Some(s(1)), "still backing off");
+            assert_eq!(
+                b.wait("u/c", now + d - s(1)),
+                Some(s(1)),
+                "still backing off"
+            );
             now += d;
             assert_eq!(b.wait("u/c", now), None, "due once the back-off passed");
         }
@@ -5215,13 +5227,22 @@ mod crash_backoff_tests {
             "state": {"running": {}}
         }))
         .unwrap();
-        assert!(matches!(term("x").state, Some(ContainerState::Terminated { .. })));
-        let (due, _) = crash_restart_gate(&mut CrashBackoff::default(), "u", &[running], Instant::now());
+        assert!(matches!(
+            term("x").state,
+            Some(ContainerState::Terminated { .. })
+        ));
+        let (due, _) = crash_restart_gate(
+            &mut CrashBackoff::default(),
+            "u",
+            &[running],
+            Instant::now(),
+        );
         assert!(due.is_empty(), "a running container is not restarted");
         let mut b = CrashBackoff::default();
         let t = Instant::now();
         b.restarted("u/crash", t, Some(s(1)));
-        let (due, waiting) = crash_restart_gate(&mut b, "u", &[term("crash"), term("fresh")], t + s(3));
+        let (due, waiting) =
+            crash_restart_gate(&mut b, "u", &[term("crash"), term("fresh")], t + s(3));
         assert!(due.contains("fresh") && !due.contains("crash"), "{due:?}");
         assert_eq!(waiting.get("crash"), Some(&s(7)));
         let (due, waiting) = crash_restart_gate(&mut b, "u", &[term("crash")], t + s(10));

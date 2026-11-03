@@ -198,18 +198,29 @@ async fn test_serviceaccount_token_contains_required_fields() {
 
     // Reconcile: the default ServiceAccount, no token Secret.
     controller.reconcile_all().await.unwrap();
-    assert!(storage.get::<Secret>(&build_key("secrets", Some("test-token-fields"), "default-token")).await.is_err());
+    assert!(storage
+        .get::<Secret>(&build_key(
+            "secrets",
+            Some("test-token-fields"),
+            "default-token"
+        ))
+        .await
+        .is_err());
 
     // A token Secret a user asks for is filled: token (signed with the
     // cluster's key) and namespace.
-    let mut req = Secret::new("default-legacy", "test-token-fields").with_type("kubernetes.io/service-account-token");
+    let mut req = Secret::new("default-legacy", "test-token-fields")
+        .with_type("kubernetes.io/service-account-token");
     req.metadata.annotations = Some(std::collections::HashMap::from([(
         "kubernetes.io/service-account.name".to_string(),
         "default".to_string(),
     )]));
     let secret_key = build_key("secrets", Some("test-token-fields"), "default-legacy");
     storage.create(&secret_key, &req).await.unwrap();
-    controller.reconcile_serviceaccount("test-token-fields", "default").await.unwrap();
+    controller
+        .reconcile_serviceaccount("test-token-fields", "default")
+        .await
+        .unwrap();
     let secret: Secret = storage.get(&secret_key).await.unwrap();
     let data = secret.data.as_ref().unwrap();
     assert!(data.contains_key("token"));

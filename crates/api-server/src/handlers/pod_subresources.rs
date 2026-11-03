@@ -1558,7 +1558,10 @@ mod tests {
         );
         match e {
             Error::Internal(m) => {
-                assert!(m.contains("docker.sock") && m.contains("connection refused"), "{m}");
+                assert!(
+                    m.contains("docker.sock") && m.contains("connection refused"),
+                    "{m}"
+                );
             }
             other => panic!("want Internal, got {other:?}"),
         }
