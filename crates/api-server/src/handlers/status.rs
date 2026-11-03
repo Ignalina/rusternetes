@@ -32,6 +32,23 @@ use tracing::{debug, info};
 /// For cluster-scoped resources, the URI looks like:
 ///   /api/v1/{resource}/{name}/status  (e.g. /api/v1/nodes/node1/status)
 ///   /api/v1/namespaces/{name}/status  (namespaces are cluster-scoped)
+/// Merge a /status request's metadata.annotations or .labels into the stored map: a key set to
+/// null is REMOVED (JSON merge / strategic merge semantics), never stored as null. A stored null
+/// makes the object undecodable ('invalid type: null, expected a string'), e.g. a Node after
+/// ovn-kubernetes' PATCH nodes/<n>/status {"metadata":{"annotations":{"k8s.ovn.org/x":null}}}.
+fn merge_string_map(
+    target: &mut serde_json::Map<String, Value>,
+    patch: &serde_json::Map<String, Value>,
+) {
+    for (k, v) in patch {
+        if v.is_null() {
+            target.remove(k);
+        } else {
+            target.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 fn extract_resource_type_from_uri(uri: &Uri) -> String {
     let path = uri.path();
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -265,9 +282,7 @@ pub async fn update_status(
                         .entry("annotations")
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
                     if let Some(existing) = annotations.as_object_mut() {
-                        for (k, v) in new_annotations {
-                            existing.insert(k.clone(), v.clone());
-                        }
+                        merge_string_map(existing, new_annotations);
                     }
                 }
                 if let Some(new_labels) = new_meta.get("labels").and_then(|l| l.as_object()) {
@@ -275,9 +290,7 @@ pub async fn update_status(
                         .entry("labels")
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
                     if let Some(existing) = labels.as_object_mut() {
-                        for (k, v) in new_labels {
-                            existing.insert(k.clone(), v.clone());
-                        }
+                        merge_string_map(existing, new_labels);
                     }
                 }
             }
@@ -517,9 +530,7 @@ pub async fn update_cluster_status(
                         .entry("annotations")
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
                     if let Some(ann_obj) = annotations.as_object_mut() {
-                        for (k, v) in new_annotations {
-                            ann_obj.insert(k.clone(), v.clone());
-                        }
+                        merge_string_map(ann_obj, new_annotations);
                     }
                 }
                 if let Some(new_labels) = new_meta.get("labels").and_then(|l| l.as_object()) {
@@ -527,9 +538,7 @@ pub async fn update_cluster_status(
                         .entry("labels")
                         .or_insert_with(|| Value::Object(serde_json::Map::new()));
                     if let Some(lbl_obj) = labels.as_object_mut() {
-                        for (k, v) in new_labels {
-                            lbl_obj.insert(k.clone(), v.clone());
-                        }
+                        merge_string_map(lbl_obj, new_labels);
                     }
                 }
             }
@@ -744,6 +753,14 @@ mod tests {
         let conditions = merged["conditions"].as_array().unwrap();
         assert_eq!(conditions.len(), 1);
         assert_eq!(conditions[0]["type"], "StatusPatched");
+    }
+
+    #[test]
+    fn status_metadata_null_annotation_is_removed_not_stored() {
+        let mut target = serde_json::json!({"a": "1", "b": "2"}).as_object().unwrap().clone();
+        let patch = serde_json::json!({"a": null, "never": null, "c": "3"}).as_object().unwrap().clone();
+        merge_string_map(&mut target, &patch);
+        assert_eq!(Value::Object(target), serde_json::json!({"b": "2", "c": "3"}));
     }
 
     #[test]
