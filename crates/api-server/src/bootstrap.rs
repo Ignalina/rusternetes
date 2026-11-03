@@ -320,39 +320,11 @@ pub fn kubernetes_service(api_server_port: u16) -> Result<rusternetes_common::re
     serde_json::from_value(v).context("the kubernetes Service")
 }
 
-#[cfg(test)]
-mod kubernetes_service_tests {
-    use super::*;
-
-    #[test]
-    fn the_kubernetes_service_is_upstreams() {
-        let svc = kubernetes_service(6443).unwrap();
-        let v = serde_json::to_value(&svc).unwrap();
-        assert_eq!(v["metadata"]["namespace"], "default");
-        assert_eq!(v["metadata"]["labels"]["component"], "apiserver");
-        assert_eq!(v["metadata"]["labels"]["provider"], "kubernetes");
-        assert_eq!(v["spec"]["type"], "ClusterIP");
-        assert_eq!(v["spec"]["clusterIP"], "10.96.0.1");
-        assert_eq!(v["spec"]["ports"][0]["name"], "https");
-        assert_eq!(v["spec"]["ports"][0]["port"], 443);
-        assert_eq!(v["spec"]["ports"][0]["targetPort"], 6443);
-        assert!(v["spec"].get("selector").is_none_or(|s| s.is_null()), "no selector: its Endpoints are the API servers'");
-        assert!(!v["metadata"]["uid"].as_str().unwrap_or("").is_empty());
-        assert!(v["metadata"]["creationTimestamp"].is_string());
-    }
-
-    #[test]
-    fn the_first_service_ip_is_reserved_for_it() {
-        // The allocator's first address is the kubernetes Service's.
-        let a = crate::ip_allocator::ClusterIPAllocator::new();
-        assert_eq!(a.allocate().as_deref(), Some(KUBERNETES_SERVICE_IP));
-    }
-}
-
 /// The root CA publisher (upstream's kube-controller-manager
 /// root-ca-cert-publisher): ConfigMap `kube-root-ca.crt` with `ca.crt` = the
 /// cluster CA in every namespace, which every pod's ServiceAccount volume
 /// projects. Creates it where it is missing and corrects a wrong one.
+#[allow(dead_code)] // used by the library's serve path; the api-server binary compiles this module again
 pub async fn publish_root_ca(storage: &Arc<StorageBackend>, ca_pem: &str) -> Result<()> {
     let namespaces: Vec<serde_json::Value> = storage.list("/registry/namespaces/").await?;
     for ns in namespaces {
@@ -389,4 +361,33 @@ pub async fn publish_root_ca(storage: &Arc<StorageBackend>, ca_pem: &str) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod kubernetes_service_tests {
+    use super::*;
+
+    #[test]
+    fn the_kubernetes_service_is_upstreams() {
+        let svc = kubernetes_service(6443).unwrap();
+        let v = serde_json::to_value(&svc).unwrap();
+        assert_eq!(v["metadata"]["namespace"], "default");
+        assert_eq!(v["metadata"]["labels"]["component"], "apiserver");
+        assert_eq!(v["metadata"]["labels"]["provider"], "kubernetes");
+        assert_eq!(v["spec"]["type"], "ClusterIP");
+        assert_eq!(v["spec"]["clusterIP"], "10.96.0.1");
+        assert_eq!(v["spec"]["ports"][0]["name"], "https");
+        assert_eq!(v["spec"]["ports"][0]["port"], 443);
+        assert_eq!(v["spec"]["ports"][0]["targetPort"], 6443);
+        assert!(v["spec"].get("selector").is_none_or(|s| s.is_null()), "no selector: its Endpoints are the API servers'");
+        assert!(!v["metadata"]["uid"].as_str().unwrap_or("").is_empty());
+        assert!(v["metadata"]["creationTimestamp"].is_string());
+    }
+
+    #[test]
+    fn the_first_service_ip_is_reserved_for_it() {
+        // The allocator's first address is the kubernetes Service's.
+        let a = crate::ip_allocator::ClusterIPAllocator::new();
+        assert_eq!(a.allocate().as_deref(), Some(KUBERNETES_SERVICE_IP));
+    }
 }

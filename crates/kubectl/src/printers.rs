@@ -427,7 +427,7 @@ fn pod_row(o: &Value, now: DateTime<Utc>, wide: bool) -> Vec<String> {
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
         {
             let t = t.with_timezone(&Utc);
-            if last.map_or(true, |l| t > l) {
+            if last.is_none_or(|l| t > l) {
                 *last = Some(t);
             }
         }
@@ -499,7 +499,7 @@ fn pod_row(o: &Value, now: DateTime<Utc>, wide: bool) -> Vec<String> {
         }
     }
     if o.pointer("/metadata/deletionTimestamp")
-        .map_or(false, |v| !v.is_null())
+        .is_some_and(|v| !v.is_null())
     {
         reason = if s(o, "/status/reason") == "NodeLost" {
             "Unknown".into()
@@ -814,7 +814,7 @@ fn event_row(o: &Value, now: DateTime<Utc>, wide: bool) -> Vec<String> {
         None => first.clone(),
     };
     let mut count = int(o, "/count");
-    if o.get("series").map_or(false, |v| !v.is_null()) {
+    if o.get("series").is_some_and(|v| !v.is_null()) {
         last = since(ts("/series/lastObservedTime"), now);
         count = int(o, "/series/count");
     } else if count == 0 {

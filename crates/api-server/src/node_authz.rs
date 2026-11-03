@@ -371,6 +371,7 @@ mod tests {
         ClusterAuthorizer::new(st)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn allowed(az: &ClusterAuthorizer, u: &UserInfo, verb: &str, group: &str, res: &str, ns: Option<&str>, name: Option<&str>, sub: Option<&str>) -> bool {
         let mut a = RequestAttributes::new(u.clone(), verb, res).with_api_group(group);
         if let Some(n) = ns { a = a.with_namespace(n); }

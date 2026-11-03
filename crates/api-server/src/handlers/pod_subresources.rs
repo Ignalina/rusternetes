@@ -926,9 +926,7 @@ pub async fn attach(
                 .headers()
                 .get("sec-websocket-protocol")
                 .and_then(|v| v.to_str().ok())
-                .map_or(true, |p| {
-                    !p.contains("v4.channel") && !p.contains("v5.channel")
-                });
+                .is_none_or(|p| !p.contains("v4.channel") && !p.contains("v5.channel"));
             return Ok(ws
                 .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
                 .on_upgrade(move |socket| streaming::proxy_to_kubelet(socket, url, v1))

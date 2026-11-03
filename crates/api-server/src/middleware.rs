@@ -196,6 +196,7 @@ pub fn normalize_boolean_query(uri: &axum::http::Uri) -> Option<axum::http::Uri>
 /// The Kubernetes client defaults to application/vnd.kubernetes.protobuf, but we only
 /// support JSON. Axum's Json extractor rejects non-application/json content types with
 /// HTTP 415, so we rewrite the header before the request reaches the handler.
+#[allow(clippy::result_large_err)]
 pub async fn normalize_content_type_middleware(
     mut request: Request,
     next: Next,

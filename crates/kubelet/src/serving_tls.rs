@@ -94,7 +94,7 @@ impl ServingTls {
     /// The server config: its certificate, mandatory control-plane client auth.
     pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>> {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let read = |p: &str| std::fs::read(p).with_context(|| format!("{p}"));
+        let read = |p: &str| std::fs::read(p).with_context(|| p.to_string());
         let certs: Vec<CertificateDer<'static>> =
             rustls_pemfile_certs(&read(&self.cert_file)?).context("the serving certificate")?;
         let key = rustls::pki_types::pem::PemObject::from_pem_slice(&read(&self.key_file)?)

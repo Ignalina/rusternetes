@@ -3350,7 +3350,7 @@ impl ContainerRuntime {
                         // Secret exists): an empty file, filled by refresh_volumes as
                         // soon as there is one; the pod starts either way (a failed
                         // start after the network is set up would leak it).
-                        let token = match self.projected_sa_token(pod, &pod_name, namespace, sa_token).await {
+                        let token = match self.projected_sa_token(pod, pod_name, namespace, sa_token).await {
                             Ok(t) => t,
                             Err(e) => {
                                 warn!("{e:#}; the token file stays empty until there is one");

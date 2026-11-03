@@ -360,6 +360,7 @@ async fn run() -> Result<()> {
         cert_file,
         key_file,
     });
+    #[cfg_attr(not(any(feature = "redb", feature = "store-raft")), allow(unused_variables))]
     let serve_etcd_tls = all_or_none(
         "--serve-etcd TLS",
         [
@@ -647,8 +648,8 @@ async fn run() -> Result<()> {
             }
         });
         info!("Leader election on: the scheduler and the controller manager wait for the control-plane lease");
-        let running: Arc<std::sync::Mutex<Vec<(&'static str, tokio::task::JoinHandle<()>)>>> =
-            Arc::default();
+        type Running = Arc<std::sync::Mutex<Vec<(&'static str, tokio::task::JoinHandle<()>)>>>;
+        let running: Running = Arc::default();
         let slot = running.clone();
         let waiter = Arc::new(tokio::spawn(async move {
             while !el.is_leader().await {
@@ -749,7 +750,10 @@ async fn run() -> Result<()> {
     let main_task = async move {
         match main_task {
             Some(h) => h.await,
-            None => Ok(std::future::pending::<()>().await),
+            None => {
+                std::future::pending::<()>().await;
+                Ok(())
+            }
         }
     };
     tokio::select! {

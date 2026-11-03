@@ -1,5 +1,7 @@
 mod admission;
 mod admission_webhook;
+// The library's serve path uses this module; this binary compiles it again.
+#[allow(dead_code)]
 mod authn;
 mod bootstrap;
 mod conversion;
@@ -9,8 +11,12 @@ mod flow_control;
 mod gnostic;
 mod handlers;
 mod ip_allocator;
+// The library's serve path uses this module; this binary compiles it again.
+#[allow(dead_code)]
 mod kubelet_client;
 mod middleware;
+// The library's serve path uses this module; this binary compiles it again.
+#[allow(dead_code)]
 mod node_authz;
 mod openapi;
 mod patch;

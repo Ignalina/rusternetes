@@ -132,7 +132,7 @@ pub async fn run_exec(
         while let Some(Ok(msg)) = rx.next().await {
             match msg {
                 Message::Binary(d) => match d.split_first() {
-                    Some((0, payload)) if payload.is_empty() => {
+                    Some((0, [])) => {
                         if let Some(mut w) = input.take() {
                             let _ = w.shutdown().await;
                         }

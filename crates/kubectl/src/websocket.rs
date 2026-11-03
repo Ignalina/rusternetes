@@ -513,6 +513,7 @@ mod tests {
     /// CA, then exec framing over it: the same path as `kubectl exec` against
     /// an API server with `--client-ca-file`.
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn exec_over_mutual_tls() {
         // A CA, a server certificate for 127.0.0.1 and a client certificate.
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();

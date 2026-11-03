@@ -309,6 +309,7 @@ pub async fn node_kubelet_addr(
 
 /// The kubelet's streaming URL for `verb` (`exec` or `attach`) on a
 /// container, with the exec options as its query.
+#[allow(clippy::too_many_arguments)]
 pub fn kubelet_stream_url(
     addr: &str,
     verb: &str,

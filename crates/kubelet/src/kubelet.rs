@@ -132,6 +132,7 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
 
 impl Kubelet {
     /// The container backend this kubelet's runtime drives.
+    #[allow(dead_code)] // used by the library (lib.rs); the kubelet binary compiles this module again
     pub fn backend(&self) -> Arc<dyn crate::backend::ContainerBackend> {
         self.runtime.backend().clone()
     }
@@ -175,6 +176,7 @@ impl Kubelet {
     }
 
     /// Register the node with this pod CIDR (`spec.podCIDR` + `spec.podCIDRs`).
+    #[allow(dead_code)] // used by the library (lib.rs); the kubelet binary compiles this module again
     pub fn with_pod_cidr(mut self, pod_cidr: Option<String>) -> Self {
         self.pod_cidr = pod_cidr.filter(|c| !c.is_empty());
         self
