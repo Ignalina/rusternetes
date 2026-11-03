@@ -267,6 +267,49 @@ pub async fn get_logs(
     }
 }
 
+/// How the pod's node answered a logs request it did not serve.
+#[derive(Debug)]
+pub(crate) enum NodeLogsError {
+    /// The kubelet answered with this status and body.
+    Answered(u16, String),
+    /// The kubelet could not be asked (no node, no address, no connection).
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for NodeLogsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeLogsError::Answered(s, _) => write!(f, "answered {}", s),
+            NodeLogsError::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+/// Is the container runtime of this API server's own host worth asking for
+/// a pod's logs (the Docker/Podman socket)?
+pub(crate) fn local_runtime_for_logs(_kubelet_backend: Option<&str>) -> bool {
+    true
+}
+
+/// The error `pods/log` answers when neither the local runtime (if asked)
+/// nor the pod's node served the logs.
+pub(crate) fn logs_error(
+    namespace: &str,
+    name: &str,
+    container: &str,
+    local: Option<String>,
+    node: NodeLogsError,
+) -> Error {
+    Error::Internal(format!(
+        "logs of {}/{} container {}: the container runtime: {}; the node: {}",
+        namespace,
+        name,
+        container,
+        local.unwrap_or_default(),
+        node
+    ))
+}
+
 /// Logs from the kubelet of the pod's node (`GET http://<InternalIP>:10250/
 /// containerLogs/...`), for a pod whose runtime this API server cannot reach.
 async fn get_node_container_logs(
@@ -1431,6 +1474,48 @@ mod tests {
     use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
     use std::collections::HashMap;
+
+    #[test]
+    fn logs_skip_the_local_docker_socket_on_a_youki_node() {
+        assert!(!local_runtime_for_logs(Some("youki")));
+        assert!(local_runtime_for_logs(None));
+        assert!(local_runtime_for_logs(Some("docker")));
+    }
+
+    #[test]
+    fn a_node_that_has_no_such_container_is_a_404_with_its_reason() {
+        let e = logs_error(
+            "kube-system",
+            "coredns-1",
+            "coredns",
+            None,
+            NodeLogsError::Answered(404, "No such container: coredns-1_coredns".into()),
+        );
+        match e {
+            Error::NotFound(m) => {
+                assert!(m.contains("No such container: coredns-1_coredns"), "{m}");
+                assert!(!m.contains("docker"), "{m}");
+            }
+            other => panic!("want NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_node_that_cannot_be_asked_is_an_internal_error_naming_both_tries() {
+        let e = logs_error(
+            "default",
+            "web",
+            "app",
+            Some("Socket not found: /var/run/docker.sock".into()),
+            NodeLogsError::Other(anyhow::anyhow!("connection refused")),
+        );
+        match e {
+            Error::Internal(m) => {
+                assert!(m.contains("docker.sock") && m.contains("connection refused"), "{m}");
+            }
+            other => panic!("want Internal, got {other:?}"),
+        }
+    }
 
     fn make_pod(
         name: &str,

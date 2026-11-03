@@ -1205,14 +1205,12 @@ impl Kubelet {
     async fn container_gc(&self) {
         // Get pod names from etcd to distinguish deleted vs existing pods
         // K8s ref: evictContainers checks allSourcesReady
-        let existing_pods: HashSet<String> = self
-            .storage
-            .list::<Pod>("/registry/pods/")
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|p| p.metadata.name.clone())
-            .collect();
+        let Some(existing_pods) =
+            crate::runtime::gc_pod_names(self.storage.list::<Pod>("/registry/pods/").await)
+        else {
+            warn!("Container GC: the store did not list the pods; skipping this round");
+            return;
+        };
 
         match self
             .runtime

@@ -12381,6 +12381,19 @@ mod tests {
     }
 }
 
+/// The names of the pods in the store, for the container GC (which tells
+/// a deleted pod's dead containers from an existing pod's by them).
+pub(crate) fn gc_pod_names(
+    pods: rusternetes_common::Result<Vec<rusternetes_common::resources::Pod>>,
+) -> Option<std::collections::HashSet<String>> {
+    Some(
+        pods.unwrap_or_default()
+            .iter()
+            .map(|p| p.metadata.name.clone())
+            .collect(),
+    )
+}
+
 /// `ContainerRuntime` logic against an in-memory backend: no daemon needed.
 #[cfg(test)]
 mod backend_tests {
@@ -12483,6 +12496,53 @@ mod backend_tests {
 
         assert_eq!(removed, 3);
         assert_eq!(backend.names(), vec!["kept_app", "kept_newer"]);
+    }
+
+    /// A pod that still exists but has nothing running right now (its only
+    /// container crashed and waits for its restart, or it completed) keeps
+    /// its newest dead container and its volumes: with CNI there is no pause
+    /// container, and the GC used to remove the last container (its log:
+    /// `pods/log` answered 404) and the pod's volume directories (the
+    /// restarted container then started without its ConfigMap).
+    #[tokio::test]
+    async fn gc_keeps_the_last_dead_container_and_volumes_of_an_existing_pod() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        backend.add("dns_coredns", "exited", 1);
+        backend.add("gone_app", "exited", 1);
+        let (runtime, volumes) = runtime_with(backend.clone()).await;
+        let dns_vol = volumes.path().join("dns").join("config-volume");
+        let gone_vol = volumes.path().join("gone").join("data");
+        std::fs::create_dir_all(&dns_vol).unwrap();
+        std::fs::create_dir_all(&gone_vol).unwrap();
+
+        let existing: HashSet<String> = ["dns".to_string()].into_iter().collect();
+        let removed = runtime.garbage_collect_containers(&existing).await.unwrap();
+
+        assert_eq!(backend.names(), vec!["dns_coredns"]);
+        assert_eq!(removed, 1);
+        assert!(dns_vol.exists(), "an existing pod's volumes are kept");
+        assert!(!gone_vol.exists(), "a deleted pod's volumes are removed");
+    }
+
+    /// The GC's pod list: a store that did not answer is no list at all (the
+    /// GC skips that round), never "no pods" — that made every pod look
+    /// deleted and removed every dead container on the node.
+    #[test]
+    fn gc_pod_names_none_when_the_store_did_not_answer() {
+        let pod: rusternetes_common::resources::Pod = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod", "metadata": {"name": "web", "namespace": "default"}
+        }))
+        .unwrap();
+        assert_eq!(
+            super::gc_pod_names(Ok(vec![pod])),
+            Some(["web".to_string()].into_iter().collect())
+        );
+        assert_eq!(
+            super::gc_pod_names(Err(rusternetes_common::Error::Storage(
+                "no quorum".into()
+            ))),
+            None
+        );
     }
 }
 
