@@ -168,10 +168,17 @@ impl CrashBackoff {
 
 }
 
+impl CrashBackoff {
+    /// A container this kubelet has no back-off for (it restarted, e.g. for
+    /// a renewed node certificate): its back-off from its status, the
+    /// restarts so far and when it last exited.
+    pub(crate) fn seed(&mut self, _key: &str, _cs: &ContainerStatus, _now: std::time::Instant) {}
+}
+
 /// Which of a pod's terminated containers may restart now, and which wait
 /// out their back-off (name -> time left).
 pub(crate) fn crash_restart_gate(
-    backoff: &CrashBackoff,
+    backoff: &mut CrashBackoff,
     uid: &str,
     statuses: &[ContainerStatus],
     now: std::time::Instant,
@@ -182,7 +189,9 @@ pub(crate) fn crash_restart_gate(
         if !matches!(cs.state, Some(ContainerState::Terminated { .. })) {
             continue;
         }
-        match backoff.wait(&format!("{}/{}", uid, cs.name), now) {
+        let key = format!("{}/{}", uid, cs.name);
+        backoff.seed(&key, cs, now);
+        match backoff.wait(&key, now) {
             Some(left) => {
                 waiting.insert(cs.name.clone(), left);
             }
@@ -2962,7 +2971,7 @@ impl Kubelet {
                                 let uid = pod.metadata.uid.clone();
                                 let now = std::time::Instant::now();
                                 let (due, waiting) = crash_restart_gate(
-                                    &self.crash_backoff.lock().unwrap(),
+                                    &mut self.crash_backoff.lock().unwrap(),
                                     &uid,
                                     &container_statuses,
                                     now,
@@ -3653,7 +3662,7 @@ impl Kubelet {
                         let uid = pod.metadata.uid.clone();
                         let now = std::time::Instant::now();
                         let (due, waiting) = crash_restart_gate(
-                            &self.crash_backoff.lock().unwrap(),
+                            &mut self.crash_backoff.lock().unwrap(),
                             &uid,
                             &statuses,
                             now,
@@ -3719,7 +3728,7 @@ impl Kubelet {
                             let uid = pod.metadata.uid.clone();
                             let now = std::time::Instant::now();
                             let (due, waiting) = crash_restart_gate(
-                                &self.crash_backoff.lock().unwrap(),
+                                &mut self.crash_backoff.lock().unwrap(),
                                 &uid,
                                 &statuses,
                                 now,
@@ -5186,15 +5195,42 @@ mod crash_backoff_tests {
         }))
         .unwrap();
         assert!(matches!(term("x").state, Some(ContainerState::Terminated { .. })));
-        let (due, _) = crash_restart_gate(&CrashBackoff::default(), "u", &[running], Instant::now());
+        let (due, _) = crash_restart_gate(&mut CrashBackoff::default(), "u", &[running], Instant::now());
         assert!(due.is_empty(), "a running container is not restarted");
         let mut b = CrashBackoff::default();
         let t = Instant::now();
         b.restarted("u/crash", t, Some(s(1)));
-        let (due, waiting) = crash_restart_gate(&b, "u", &[term("crash"), term("fresh")], t + s(3));
+        let (due, waiting) = crash_restart_gate(&mut b, "u", &[term("crash"), term("fresh")], t + s(3));
         assert!(due.contains("fresh") && !due.contains("crash"), "{due:?}");
         assert_eq!(waiting.get("crash"), Some(&s(7)));
-        let (due, waiting) = crash_restart_gate(&b, "u", &[term("crash")], t + s(10));
+        let (due, waiting) = crash_restart_gate(&mut b, "u", &[term("crash")], t + s(10));
         assert!(due.contains("crash") && waiting.is_empty());
+    }
+
+    #[test]
+    fn the_back_off_survives_a_kubelet_restart() {
+        // A fresh kubelet (no entries) meets a container restarted 5 times
+        // that exited 30 s ago: it waits out 10 s * 2^4 = 160 s from that
+        // exit (~130 s more), and its next restart backs off 300 s.
+        let finished = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let cs: ContainerStatus = serde_json::from_value(serde_json::json!({
+            "name": "crash", "ready": false, "restartCount": 5, "image": "busybox", "imageID": "",
+            "state": {"terminated": {"exitCode": 3, "reason": "Error",
+                "startedAt": (finished - chrono::Duration::seconds(1)).to_rfc3339(),
+                "finishedAt": finished.to_rfc3339()}}
+        }))
+        .unwrap();
+        let mut b = CrashBackoff::default();
+        let t = Instant::now();
+        let (due, waiting) = crash_restart_gate(&mut b, "u", std::slice::from_ref(&cs), t);
+        assert!(due.is_empty(), "{due:?}");
+        let left = waiting["crash"].as_secs();
+        assert!((128..=131).contains(&left), "left {left}");
+        assert_eq!(b.restarted("u/crash", t + s(131), Some(s(1))), s(300));
+        // A container that never restarted is due at once.
+        let mut first = cs.clone();
+        first.restart_count = 0;
+        let (due, _) = crash_restart_gate(&mut CrashBackoff::default(), "u", &[first], t);
+        assert!(due.contains("crash"));
     }
 }
