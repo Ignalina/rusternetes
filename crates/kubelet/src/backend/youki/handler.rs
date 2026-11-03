@@ -163,8 +163,11 @@ pub fn load(dir: &Path, name: &str) -> Result<Handler> {
 pub fn image_digest(image: &str) -> Option<String> {
     let (_, d) = image.rsplit_once('@')?;
     let hex = d.strip_prefix("sha256:")?;
-    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-        .then(|| d.to_string())
+    (hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then(|| d.to_string())
 }
 
 fn sha256_hex(b: &[u8]) -> String {
@@ -242,7 +245,9 @@ pub fn apply(
         None => {}
         Some("none") => hc.network_mode = Some("none".to_string()),
         Some(other) => {
-            bail!("CreateContainerError: runtime handler {name:?}: unknown network {other:?} (none)")
+            bail!(
+                "CreateContainerError: runtime handler {name:?}: unknown network {other:?} (none)"
+            )
         }
     }
     applied.network = hc.network_mode.clone().unwrap_or_default();
@@ -370,7 +375,10 @@ mod tests {
         assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
         assert_eq!(hc.cap_add, None);
         assert_eq!(hc.privileged, Some(false));
-        assert!(hc.security_opt.unwrap().contains(&"no-new-privileges".to_string()));
+        assert!(hc
+            .security_opt
+            .unwrap()
+            .contains(&"no-new-privileges".to_string()));
         assert_eq!(hc.network_mode.as_deref(), Some("none"));
         // An Unconfined pod still runs filtered under this handler.
         assert_eq!(hc.seccomp, Some(Seccomp::RuntimeDefault));
@@ -384,7 +392,10 @@ mod tests {
         );
         assert_eq!(r.applied.seccomp, "RuntimeDefault");
         assert!(!r.applied.seccomp_from_image);
-        assert_eq!(r.result_socket, Some(PathBuf::from("/run/heimdall/k8s.sock")));
+        assert_eq!(
+            r.result_socket,
+            Some(PathBuf::from("/run/heimdall/k8s.sock"))
+        );
     }
 
     #[test]
@@ -438,8 +449,11 @@ mod tests {
     #[test]
     fn a_handler_file_with_an_unknown_field_is_refused() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("x.json"), r#"{"readonlyRootfs":true,"landlock":true}"#)
-            .unwrap();
+        std::fs::write(
+            d.path().join("x.json"),
+            r#"{"readonlyRootfs":true,"landlock":true}"#,
+        )
+        .unwrap();
         assert!(load(d.path(), "x").is_err());
         std::fs::write(d.path().join("y.json"), r#"{"readonlyRootfs":true}"#).unwrap();
         assert!(load(d.path(), "y").unwrap().readonly_rootfs);
@@ -447,11 +461,17 @@ mod tests {
 
     #[test]
     fn digests_are_read_only_from_a_full_sha256_reference() {
-        assert_eq!(image_digest(&format!("a/b@{DIGEST}")).as_deref(), Some(DIGEST));
+        assert_eq!(
+            image_digest(&format!("a/b@{DIGEST}")).as_deref(),
+            Some(DIGEST)
+        );
         assert_eq!(image_digest("a/b:1"), None);
         assert_eq!(image_digest("a/b@sha256:abc"), None);
         assert_eq!(
-            image_digest(&format!("a/b@{}", DIGEST.to_uppercase().replace("SHA256", "sha256"))),
+            image_digest(&format!(
+                "a/b@{}",
+                DIGEST.to_uppercase().replace("SHA256", "sha256")
+            )),
             None
         );
     }
@@ -474,13 +494,17 @@ mod tests {
         // The heimdall handler: locked down, and a record for the shim.
         let mut c = config(&format!("busybox@{DIGEST}"));
         c.host_config.as_mut().unwrap().runtime_handler = Some("heimdall".into());
-        let r = prepare(&mut c, &handlers, d.path()).unwrap().expect("a record");
+        let r = prepare(&mut c, &handlers, d.path())
+            .unwrap()
+            .expect("a record");
         assert_eq!(r.handler, "heimdall");
         assert_eq!(c.host_config.unwrap().network_mode.as_deref(), Some("none"));
         // A handler this node does not have refuses the container.
         let mut c = config(&format!("busybox@{DIGEST}"));
         c.host_config.as_mut().unwrap().runtime_handler = Some("gvisor".into());
-        let e = prepare(&mut c, &handlers, d.path()).unwrap_err().to_string();
+        let e = prepare(&mut c, &handlers, d.path())
+            .unwrap_err()
+            .to_string();
         assert!(e.contains("no runtime handler \"gvisor\""), "{e}");
     }
 }
