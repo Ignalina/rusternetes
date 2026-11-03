@@ -552,16 +552,36 @@ mod tests {
     #[test]
     fn io_uring_is_denied_by_the_runtime_default_with_every_capability() {
         let all = caps(&[
-            "CAP_SYS_ADMIN", "CAP_SYS_CHROOT", "CAP_SYS_PTRACE", "CAP_SYS_BOOT", "CAP_SYS_MODULE",
-            "CAP_SYS_PACCT", "CAP_SYS_RAWIO", "CAP_SYS_TIME", "CAP_SYS_TTY_CONFIG", "CAP_SYS_NICE",
-            "CAP_BPF", "CAP_PERFMON", "CAP_SYSLOG", "CAP_NET_ADMIN", "CAP_IPC_LOCK",
+            "CAP_SYS_ADMIN",
+            "CAP_SYS_CHROOT",
+            "CAP_SYS_PTRACE",
+            "CAP_SYS_BOOT",
+            "CAP_SYS_MODULE",
+            "CAP_SYS_PACCT",
+            "CAP_SYS_RAWIO",
+            "CAP_SYS_TIME",
+            "CAP_SYS_TTY_CONFIG",
+            "CAP_SYS_NICE",
+            "CAP_BPF",
+            "CAP_PERFMON",
+            "CAP_SYSLOG",
+            "CAP_NET_ADMIN",
+            "CAP_IPC_LOCK",
         ]);
         for (c, kernel) in [(caps(&[]), "6.12.0"), (all, "7.0.0")] {
             let v = to_oci(RUNTIME_DEFAULT, &c, kernel).unwrap();
-            for action in ["SCMP_ACT_ALLOW", "SCMP_ACT_LOG", "SCMP_ACT_TRACE", "SCMP_ACT_NOTIFY"] {
+            for action in [
+                "SCMP_ACT_ALLOW",
+                "SCMP_ACT_LOG",
+                "SCMP_ACT_TRACE",
+                "SCMP_ACT_NOTIFY",
+            ] {
                 let named = names_of(&v, action);
                 for call in ["io_uring_setup", "io_uring_enter", "io_uring_register"] {
-                    assert!(!named.iter().any(|n| n == call), "{call} under {action} with {c:?}");
+                    assert!(
+                        !named.iter().any(|n| n == call),
+                        "{call} under {action} with {c:?}"
+                    );
                 }
             }
             assert_eq!(v["defaultAction"], "SCMP_ACT_ERRNO");
