@@ -636,6 +636,44 @@ mod tests {
             .is_none());
     }
 
+    /// A pod's own network namespace opens the unprivileged ports from 0 and lets any group
+    /// ping, as containerd (enable_unprivileged_ports / enable_unprivileged_icmp, on by default
+    /// since 2.0) and Docker do: CoreDNS runs non-root and listens on :53 (on KVM it failed with
+    /// "listen tcp :53: bind: permission denied" once youki became the default). A pod's own
+    /// sysctl wins; a host-network pod gets none (that would change the host).
+    #[test]
+    fn a_pod_netns_opens_unprivileged_ports_and_ping_a_host_net_pod_does_not() {
+        let c = ContainerConfig {
+            cmd: s(&["coredns"]),
+            ..Default::default()
+        };
+        let image = ImageConfig::default();
+        let spec = build(&input(&c, &image)).unwrap();
+        assert_eq!(spec["linux"]["sysctl"]["net.ipv4.ip_unprivileged_port_start"], "0");
+        assert_eq!(spec["linux"]["sysctl"]["net.ipv4.ping_group_range"], "0 2147483647");
+        let own = ContainerConfig {
+            cmd: s(&["web"]),
+            host_config: Some(HostConfig {
+                sysctls: Some(
+                    [(
+                        "net.ipv4.ip_unprivileged_port_start".to_string(),
+                        "1024".to_string(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let spec = build(&input(&own, &image)).unwrap();
+        assert_eq!(spec["linux"]["sysctl"]["net.ipv4.ip_unprivileged_port_start"], "1024");
+        let mut host = input(&c, &image);
+        host.net = Ns::Host;
+        let spec = build(&host).unwrap();
+        assert!(spec["linux"].get("sysctl").map_or(true, |v| v.is_null()
+            || v.get("net.ipv4.ip_unprivileged_port_start").is_none()));
+    }
+
     #[test]
     fn joined_uts_drops_hostname_and_host_net_drops_namespace() {
         let c = ContainerConfig {
