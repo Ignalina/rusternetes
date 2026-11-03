@@ -6055,9 +6055,7 @@ dependencies = [
 
 [[package]]
 name = "tunnr-etcd"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4f5c71c78a8dac8ac1e8b6c6a0689bfa158a8da5897da60d852000c7ecec4f"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "openraft",
