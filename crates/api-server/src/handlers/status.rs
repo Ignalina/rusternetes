@@ -757,10 +757,19 @@ mod tests {
 
     #[test]
     fn status_metadata_null_annotation_is_removed_not_stored() {
-        let mut target = serde_json::json!({"a": "1", "b": "2"}).as_object().unwrap().clone();
-        let patch = serde_json::json!({"a": null, "never": null, "c": "3"}).as_object().unwrap().clone();
+        let mut target = serde_json::json!({"a": "1", "b": "2"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let patch = serde_json::json!({"a": null, "never": null, "c": "3"})
+            .as_object()
+            .unwrap()
+            .clone();
         merge_string_map(&mut target, &patch);
-        assert_eq!(Value::Object(target), serde_json::json!({"b": "2", "c": "3"}));
+        assert_eq!(
+            Value::Object(target),
+            serde_json::json!({"b": "2", "c": "3"})
+        );
     }
 
     #[test]
