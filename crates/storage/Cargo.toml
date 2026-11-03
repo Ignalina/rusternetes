@@ -17,7 +17,7 @@ etcd-tls = ["etcd-client/tls", "dep:rustls"]
 [dependencies]
 rusternetes-common = { path = "../common" }
 rhino = { git = "https://github.com/calfonso/rhino", branch = "main", optional = true }
-tunnr-etcd = { version = "0.2", optional = true }
+tunnr-etcd = { version = "0.3.3", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,7 +34,7 @@ chrono.workspace = true
 
 [dev-dependencies]
 # Encryption at rest through a served store (tests/encryption.rs).
-tunnr-etcd = { version = "0.2", features = ["server"] }
+tunnr-etcd = { version = "0.3.3", features = ["server"] }
 
 [[test]]
 name = "encryption"

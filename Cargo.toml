@@ -76,11 +76,7 @@ codegen-units = 1
 opt-level = 3
 strip = "symbols"
 
-# tunnr-etcd's `tls` and `authz` features (mutual TLS and per-node limits on the served store) are on its main
-# (git.gunnar.rs/nordisk/tunnr-etcd 9053006), not on crates.io yet: the
-# sibling checkout until a release carries it.
 [patch.crates-io]
-tunnr-etcd = { path = "../tunnr-etcd/crates/tunnr-etcd" }
 # youki's libcontainer 0.7.0 plus a pure-Rust seccomp backend (feature
 # `seccomp-bpf`: seccompiler + syscalls, no libseccomp C library) and the
 # noNewPrivileges=false fix (node/rtclass; candidate upstream youki PRs).
