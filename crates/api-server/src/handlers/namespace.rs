@@ -582,10 +582,7 @@ async fn create_default_service_account(
 
     // No long-lived token Secret: bound tokens through TokenRequest.
     let _ = created_sa;
-    info!(
-        "Created default ServiceAccount in namespace: {}",
-        namespace
-    );
+    info!("Created default ServiceAccount in namespace: {}", namespace);
     Ok(())
 }
 

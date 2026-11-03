@@ -301,18 +301,32 @@ async fn who_may_do_what() {
     );
 }
 
-async fn call_json(r: &axum::Router, who: &Who<'_>, method: Method, uri: &str, body: Option<Value>) -> (u16, Value) {
-    let mut b = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+async fn call_json(
+    r: &axum::Router,
+    who: &Who<'_>,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
     if let Who::Token(t) = who {
         b = b.header("authorization", format!("Bearer {t}"));
     }
-    let mut req = b.body(body.map_or(Body::empty(), |v| Body::from(v.to_string()))).unwrap();
+    let mut req = b
+        .body(body.map_or(Body::empty(), |v| Body::from(v.to_string())))
+        .unwrap();
     if let Who::Cert(u) = who {
-        req.extensions_mut().insert(PeerIdentity(Some(Arc::new(u.clone()))));
+        req.extensions_mut()
+            .insert(PeerIdentity(Some(Arc::new(u.clone()))));
     }
     let resp = r.clone().oneshot(req).await.unwrap();
     let st = resp.status().as_u16();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (st, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
 }
 
@@ -320,7 +334,8 @@ fn token_request(pod: &str, uid: Option<&str>, seconds: i64) -> Value {
     let mut r = json!({"apiVersion": "authentication.k8s.io/v1", "kind": "TokenRequest",
                        "spec": {"audiences": [], "expirationSeconds": seconds}});
     if !pod.is_empty() {
-        r["spec"]["boundObjectRef"] = json!({"apiVersion": "v1", "kind": "Pod", "name": pod, "uid": uid});
+        r["spec"]["boundObjectRef"] =
+            json!({"apiVersion": "v1", "kind": "Pod", "name": pod, "uid": uid});
     }
     r
 }
@@ -345,43 +360,153 @@ async fn bound_tokens_through_token_request() {
     let w1 = Who::Cert(cert_user("system:node:w1", &["system:nodes"]));
     let w2 = Who::Cert(cert_user("system:node:w2", &["system:nodes"]));
     for sa in ["web", "other"] {
-        assert_eq!(call(&r, &admin, Method::POST, "/api/v1/namespaces/default/serviceaccounts",
-                        Some(json!({"metadata": {"name": sa, "namespace": "default"}}))).await, 201);
+        assert_eq!(
+            call(
+                &r,
+                &admin,
+                Method::POST,
+                "/api/v1/namespaces/default/serviceaccounts",
+                Some(json!({"metadata": {"name": sa, "namespace": "default"}}))
+            )
+            .await,
+            201
+        );
     }
     // No long-lived token Secret for a ServiceAccount.
-    assert!(backend.get::<Value>("/registry/secrets/default/web-token").await.is_err());
+    assert!(backend
+        .get::<Value>("/registry/secrets/default/web-token")
+        .await
+        .is_err());
     let pod = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "web-1", "namespace": "default", "uid": "uid-1"},
                      "spec": {"nodeName": "w1", "serviceAccountName": "web", "containers": [{"name": "c", "image": "x"}]}});
-    backend.create("/registry/pods/default/web-1", &pod).await.unwrap();
+    backend
+        .create("/registry/pods/default/web-1", &pod)
+        .await
+        .unwrap();
     let url = "/api/v1/namespaces/default/serviceaccounts/web/token";
 
     // w1, for its own pod: a token of at least 10 minutes.
-    let (st, body) = call_json(&r, &w1, Method::POST, url, Some(token_request("web-1", Some("uid-1"), 60))).await;
+    let (st, body) = call_json(
+        &r,
+        &w1,
+        Method::POST,
+        url,
+        Some(token_request("web-1", Some("uid-1"), 60)),
+    )
+    .await;
     assert!(st == 200 || st == 201, "{st} {body}");
-    let token = body.pointer("/status/token").and_then(Value::as_str).unwrap().to_string();
+    let token = body
+        .pointer("/status/token")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
     let (iat, exp) = rusternetes_common::auth::token_times(&token).unwrap();
     assert_eq!(exp - iat, 600);
     // It authenticates as the ServiceAccount (RBAC grants it nothing: 403, not 401).
-    assert_eq!(call(&r, &Who::Token(&token), Method::GET, "/api", None).await, 200);
-    assert_eq!(call(&r, &Who::Token(&token), Method::GET, "/api/v1/namespaces/default/pods", None).await, 403);
+    assert_eq!(
+        call(&r, &Who::Token(&token), Method::GET, "/api", None).await,
+        200
+    );
+    assert_eq!(
+        call(
+            &r,
+            &Who::Token(&token),
+            Method::GET,
+            "/api/v1/namespaces/default/pods",
+            None
+        )
+        .await,
+        403
+    );
 
     // Another node, another ServiceAccount, no binding, a wrong uid: refused.
-    assert_eq!(call(&r, &w2, Method::POST, url, Some(token_request("web-1", Some("uid-1"), 600))).await, 403);
-    assert_eq!(call(&r, &w1, Method::POST, "/api/v1/namespaces/default/serviceaccounts/other/token",
-                    Some(token_request("web-1", Some("uid-1"), 600))).await, 403);
-    assert_eq!(call(&r, &w1, Method::POST, url, Some(token_request("", None, 600))).await, 403);
-    assert_eq!(call(&r, &w1, Method::POST, url, Some(token_request("web-1", Some("uid-9"), 600))).await, 403);
+    assert_eq!(
+        call(
+            &r,
+            &w2,
+            Method::POST,
+            url,
+            Some(token_request("web-1", Some("uid-1"), 600))
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        call(
+            &r,
+            &w1,
+            Method::POST,
+            "/api/v1/namespaces/default/serviceaccounts/other/token",
+            Some(token_request("web-1", Some("uid-1"), 600))
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        call(
+            &r,
+            &w1,
+            Method::POST,
+            url,
+            Some(token_request("", None, 600))
+        )
+        .await,
+        403
+    );
+    assert_eq!(
+        call(
+            &r,
+            &w1,
+            Method::POST,
+            url,
+            Some(token_request("web-1", Some("uid-9"), 600))
+        )
+        .await,
+        403
+    );
     // A node reads no ServiceAccount token Secret.
-    assert_eq!(call(&r, &w1, Method::GET, "/api/v1/namespaces/default/secrets/web-token", None).await, 403);
+    assert_eq!(
+        call(
+            &r,
+            &w1,
+            Method::GET,
+            "/api/v1/namespaces/default/secrets/web-token",
+            None
+        )
+        .await,
+        403
+    );
 
     // The pod replaced (same name, new uid), then gone: the token is 401.
     let mut again = pod.clone();
     again["metadata"]["uid"] = json!("uid-2");
-    backend.update("/registry/pods/default/web-1", &again).await.unwrap();
-    assert_eq!(call(&r, &Who::Token(&token), Method::GET, "/api", None).await, 401);
-    backend.delete("/registry/pods/default/web-1").await.unwrap();
-    assert_eq!(call(&r, &Who::Token(&token), Method::GET, "/api", None).await, 401);
+    backend
+        .update("/registry/pods/default/web-1", &again)
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&r, &Who::Token(&token), Method::GET, "/api", None).await,
+        401
+    );
+    backend
+        .delete("/registry/pods/default/web-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        call(&r, &Who::Token(&token), Method::GET, "/api", None).await,
+        401
+    );
     // An unbound token (a requested legacy Secret's) still authenticates.
-    let legacy = tm.generate_token(ServiceAccountClaims::new("web".into(), "default".into(), "u".into(), 1)).unwrap();
-    assert_eq!(call(&r, &Who::Token(&legacy), Method::GET, "/api", None).await, 200);
+    let legacy = tm
+        .generate_token(ServiceAccountClaims::new(
+            "web".into(),
+            "default".into(),
+            "u".into(),
+            1,
+        ))
+        .unwrap();
+    assert_eq!(
+        call(&r, &Who::Token(&legacy), Method::GET, "/api", None).await,
+        200
+    );
 }

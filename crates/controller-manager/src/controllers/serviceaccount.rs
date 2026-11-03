@@ -260,21 +260,32 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
     /// `kubernetes.io/service-account-token`, annotation
     /// `kubernetes.io/service-account.name: <sa>`, no token yet): a token
     /// signed with the cluster's key, plus `namespace`. Nothing without the key.
-    async fn fill_requested_token_secrets(&self, namespace: &str, sa: &ServiceAccount) -> Result<()> {
+    async fn fill_requested_token_secrets(
+        &self,
+        namespace: &str,
+        sa: &ServiceAccount,
+    ) -> Result<()> {
         if self.tokens.is_none() {
             return Ok(());
         }
         let sa_name = &sa.metadata.name;
-        let secrets: Vec<Secret> = self.storage.list(&build_prefix("secrets", Some(namespace))).await?;
+        let secrets: Vec<Secret> = self
+            .storage
+            .list(&build_prefix("secrets", Some(namespace)))
+            .await?;
         for mut secret in secrets {
-            let wanted = secret.secret_type.as_deref() == Some("kubernetes.io/service-account-token")
+            let wanted = secret.secret_type.as_deref()
+                == Some("kubernetes.io/service-account-token")
                 && secret
                     .metadata
                     .annotations
                     .as_ref()
                     .and_then(|a| a.get("kubernetes.io/service-account.name"))
                     == Some(sa_name);
-            let has = secret.data.as_ref().is_some_and(|d| d.get("token").is_some_and(|t| !t.is_empty()));
+            let has = secret
+                .data
+                .as_ref()
+                .is_some_and(|d| d.get("token").is_some_and(|t| !t.is_empty()));
             if !wanted || has {
                 continue;
             }
@@ -286,10 +297,16 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
                 .metadata
                 .annotations
                 .get_or_insert_with(HashMap::new)
-                .insert("kubernetes.io/service-account.uid".to_string(), sa.metadata.uid.clone());
+                .insert(
+                    "kubernetes.io/service-account.uid".to_string(),
+                    sa.metadata.uid.clone(),
+                );
             let key = build_key("secrets", Some(namespace), &secret.metadata.name);
             match self.storage.update(&key, &secret).await {
-                Ok(_) => info!("Filled the requested token Secret {}/{} for ServiceAccount {}", namespace, secret.metadata.name, sa_name),
+                Ok(_) => info!(
+                    "Filled the requested token Secret {}/{} for ServiceAccount {}",
+                    namespace, secret.metadata.name, sa_name
+                ),
                 Err(e) => warn!("Token Secret {}/{}: {}", namespace, secret.metadata.name, e),
             }
         }
@@ -397,15 +414,31 @@ mod tests {
         c.tokens = Some(Arc::new(TokenManager::new_random()));
         let mut sa = ServiceAccount::new("app", "default");
         sa.metadata.ensure_uid();
-        storage.create(&build_key("serviceaccounts", Some("default"), "app"), &sa).await.unwrap();
+        storage
+            .create(&build_key("serviceaccounts", Some("default"), "app"), &sa)
+            .await
+            .unwrap();
         c.reconcile_serviceaccount("default", "app").await.unwrap();
-        assert!(storage.get::<Secret>(&build_key("secrets", Some("default"), "app-token")).await.is_err());
+        assert!(storage
+            .get::<Secret>(&build_key("secrets", Some("default"), "app-token"))
+            .await
+            .is_err());
         // A user asks for a long-lived token Secret.
-        let mut req = Secret::new("app-legacy", "default").with_type("kubernetes.io/service-account-token");
-        req.metadata.annotations = Some(HashMap::from([("kubernetes.io/service-account.name".to_string(), "app".to_string())]));
-        storage.create(&build_key("secrets", Some("default"), "app-legacy"), &req).await.unwrap();
+        let mut req =
+            Secret::new("app-legacy", "default").with_type("kubernetes.io/service-account-token");
+        req.metadata.annotations = Some(HashMap::from([(
+            "kubernetes.io/service-account.name".to_string(),
+            "app".to_string(),
+        )]));
+        storage
+            .create(&build_key("secrets", Some("default"), "app-legacy"), &req)
+            .await
+            .unwrap();
         c.reconcile_serviceaccount("default", "app").await.unwrap();
-        let got: Secret = storage.get(&build_key("secrets", Some("default"), "app-legacy")).await.unwrap();
+        let got: Secret = storage
+            .get(&build_key("secrets", Some("default"), "app-legacy"))
+            .await
+            .unwrap();
         let t = String::from_utf8(got.data.unwrap()["token"].clone()).unwrap();
         assert_eq!(t.split('.').count(), 3);
     }

@@ -153,7 +153,13 @@ pub async fn create_token_request(
     // The bound object (a Pod): it must exist, have the uid asked for and run
     // as this ServiceAccount. A node asks only for a pod bound to it
     // (upstream NodeRestriction).
-    let bound = bound_pod_for(&state, &namespace, &service_account_name, token_request.spec.bound_object_ref.as_ref()).await?;
+    let bound = bound_pod_for(
+        &state,
+        &namespace,
+        &service_account_name,
+        token_request.spec.bound_object_ref.as_ref(),
+    )
+    .await?;
     if let Some(node) = crate::node_authz::node_of(&auth_ctx.user) {
         match &bound {
             Some(b) if b.node.as_deref() == Some(node) => {}
@@ -218,8 +224,14 @@ pub async fn create_token_request(
         claims.node_name = b.node.clone();
         claims.node_uid = b.node_uid.clone();
         if let Some(k) = claims.kubernetes.as_mut() {
-            k.pod = Some(rusternetes_common::auth::KubeRef { name: b.name, uid: b.uid });
-            k.node = b.node.map(|n| rusternetes_common::auth::KubeRef { name: n, uid: b.node_uid.unwrap_or_default() });
+            k.pod = Some(rusternetes_common::auth::KubeRef {
+                name: b.name,
+                uid: b.uid,
+            });
+            k.node = b.node.map(|n| rusternetes_common::auth::KubeRef {
+                name: n,
+                uid: b.node_uid.unwrap_or_default(),
+            });
         }
     }
 
@@ -261,9 +273,17 @@ pub(crate) async fn bound_pod_for(
         let name = r.name.clone().unwrap_or_default();
         state
             .storage
-            .get::<serde_json::Value>(&rusternetes_storage::build_key("secrets", Some(namespace), &name))
+            .get::<serde_json::Value>(&rusternetes_storage::build_key(
+                "secrets",
+                Some(namespace),
+                &name,
+            ))
             .await
-            .map_err(|_| rusternetes_common::Error::Forbidden(format!("the bound secret {namespace}/{name} does not exist")))?;
+            .map_err(|_| {
+                rusternetes_common::Error::Forbidden(format!(
+                    "the bound secret {namespace}/{name} does not exist"
+                ))
+            })?;
         return Ok(None);
     }
     if r.kind.as_deref() != Some("Pod") {
@@ -272,16 +292,22 @@ pub(crate) async fn bound_pod_for(
             r.kind
         )));
     }
-    let name = r
-        .name
-        .clone()
-        .filter(|n| !n.is_empty())
-        .ok_or_else(|| rusternetes_common::Error::InvalidResource("boundObjectRef.name is required".into()))?;
+    let name = r.name.clone().filter(|n| !n.is_empty()).ok_or_else(|| {
+        rusternetes_common::Error::InvalidResource("boundObjectRef.name is required".into())
+    })?;
     let pod: rusternetes_common::resources::Pod = state
         .storage
-        .get(&rusternetes_storage::build_key("pods", Some(namespace), &name))
+        .get(&rusternetes_storage::build_key(
+            "pods",
+            Some(namespace),
+            &name,
+        ))
         .await
-        .map_err(|_| rusternetes_common::Error::Forbidden(format!("the bound pod {namespace}/{name} does not exist")))?;
+        .map_err(|_| {
+            rusternetes_common::Error::Forbidden(format!(
+                "the bound pod {namespace}/{name} does not exist"
+            ))
+        })?;
     if let Some(uid) = r.uid.as_deref().filter(|u| !u.is_empty()) {
         if uid != pod.metadata.uid {
             return Err(rusternetes_common::Error::Forbidden(format!(
@@ -300,18 +326,29 @@ pub(crate) async fn bound_pod_for(
             "the bound pod {namespace}/{name} runs as ServiceAccount {sa}, not {service_account}"
         )));
     }
-    let node = spec.and_then(|s| s.node_name.clone()).filter(|n| !n.is_empty());
+    let node = spec
+        .and_then(|s| s.node_name.clone())
+        .filter(|n| !n.is_empty());
     let mut node_uid = None;
     if let Some(n) = &node {
         if let Ok(nd) = state
             .storage
-            .get::<rusternetes_common::resources::Node>(&rusternetes_storage::build_key("nodes", None::<&str>, n))
+            .get::<rusternetes_common::resources::Node>(&rusternetes_storage::build_key(
+                "nodes",
+                None::<&str>,
+                n,
+            ))
             .await
         {
             node_uid = Some(nd.metadata.uid.clone()).filter(|u| !u.is_empty());
         }
     }
-    Ok(Some(BoundPod { name, uid: pod.metadata.uid.clone(), node, node_uid }))
+    Ok(Some(BoundPod {
+        name,
+        uid: pod.metadata.uid.clone(),
+        node,
+        node_uid,
+    }))
 }
 
 /// Create a SelfSubjectReview (authentication.k8s.io/v1)

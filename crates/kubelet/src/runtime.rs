@@ -12298,9 +12298,7 @@ mod backend_tests {
             Some(["web".to_string()].into_iter().collect())
         );
         assert_eq!(
-            super::gc_pod_names(Err(rusternetes_common::Error::Storage(
-                "no quorum".into()
-            ))),
+            super::gc_pod_names(Err(rusternetes_common::Error::Storage("no quorum".into()))),
             None
         );
     }

@@ -851,7 +851,9 @@ mod tests {
             where
                 T: DeserializeOwned + Send + Sync,
             {
-                Err(crate::error::Error::Storage("no Raft leader for a linearizable read".into()))
+                Err(crate::error::Error::Storage(
+                    "no Raft leader for a linearizable read".into(),
+                ))
             }
             async fn list<T>(&self, ns: Option<&str>) -> Result<Vec<T>>
             where
@@ -860,11 +862,13 @@ mod tests {
                 let b = serde_json::json!({"metadata": {"name": "b", "namespace": "default"},
                     "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "r"},
                     "subjects": [{"kind": "ServiceAccount", "name": "app", "namespace": "default"}]});
-                Ok(if ns.is_some() && std::any::type_name::<T>().contains("RoleBinding") {
-                    vec![serde_json::from_value(b).unwrap()]
-                } else {
-                    vec![]
-                })
+                Ok(
+                    if ns.is_some() && std::any::type_name::<T>().contains("RoleBinding") {
+                        vec![serde_json::from_value(b).unwrap()]
+                    } else {
+                        vec![]
+                    },
+                )
             }
         }
         let rbac = RBACAuthorizer::new(Arc::new(Down));

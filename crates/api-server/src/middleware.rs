@@ -172,14 +172,20 @@ pub async fn authz_middleware(
         // The store did not answer (no Raft leader yet, a replica catching
         // up): not a denial — 503, and the client asks again.
         Err(e) => {
-            warn!("authorization of {} {} {:?}: the store did not answer: {e}", ctx.user.username, attrs.verb, attrs.resource);
+            warn!(
+                "authorization of {} {} {:?}: the store did not answer: {e}",
+                ctx.user.username, attrs.verb, attrs.resource
+            );
             let body = serde_json::json!({
                 "kind": "Status", "apiVersion": "v1", "metadata": {},
                 "status": "Failure", "message": format!("authorization could not be decided: {e}"),
                 "reason": "ServiceUnavailable", "code": 503
             });
             let mut r = (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-            r.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+            r.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
             Err(r)
         }
     }
