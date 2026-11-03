@@ -194,6 +194,9 @@ fn apply_json_patch_operation(value: &Value, op: &JsonPatchOperation) -> Result<
 fn add_operation(value: &Value, path: &str, new_value: &Value) -> Result<Value, PatchError> {
     let mut result = value.clone();
     let (parent_path, key) = split_path(path)?;
+    // RFC 6901: the last reference token is unescaped too (`~1` -> `/`, `~0` -> `~`).
+    let key = unescape_token(key);
+    let key = key.as_str();
 
     if parent_path.is_empty() {
         // Adding to root
@@ -226,6 +229,9 @@ fn add_operation(value: &Value, path: &str, new_value: &Value) -> Result<Value, 
 fn remove_operation(value: &Value, path: &str) -> Result<Value, PatchError> {
     let mut result = value.clone();
     let (parent_path, key) = split_path(path)?;
+    // RFC 6901: the last reference token is unescaped too (`~1` -> `/`, `~0` -> `~`).
+    let key = unescape_token(key);
+    let key = key.as_str();
 
     let parent = get_mut_value(&mut result, parent_path)?;
 
@@ -261,6 +267,9 @@ fn replace_operation(value: &Value, path: &str, new_value: &Value) -> Result<Val
     }
 
     let (parent_path, key) = split_path(path)?;
+    // RFC 6901: the last reference token is unescaped too (`~1` -> `/`, `~0` -> `~`).
+    let key = unescape_token(key);
+    let key = key.as_str();
     let parent = get_mut_value(&mut result, parent_path)?;
 
     if let Some(obj) = parent.as_object_mut() {
@@ -622,6 +631,11 @@ fn parse_path(path: &str) -> Result<Vec<String>, PatchError> {
         .collect())
 }
 
+/// One JSON pointer reference token, unescaped (RFC 6901 section 4: `~1` first, then `~0`).
+fn unescape_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
 /// Split a path into parent path and final key
 fn split_path(path: &str) -> Result<(&str, &str), PatchError> {
     if path.is_empty() || path == "/" {
@@ -646,6 +660,19 @@ fn split_path(path: &str) -> Result<(&str, &str), PatchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_patch_unescapes_the_last_token_of_an_annotation_path() {
+        // ovn-kubernetes: [{"op":"add","path":"/metadata/annotations/k8s.ovn.org~1node-subnets",...}]
+        let original = json!({"metadata": {"annotations": {"a": "1", "x~y": "2"}}});
+        let patch = json!([
+            {"op": "add", "path": "/metadata/annotations/k8s.ovn.org~1node-subnets", "value": "{}"},
+            {"op": "replace", "path": "/metadata/annotations/x~0y", "value": "3"},
+            {"op": "remove", "path": "/metadata/annotations/a"}
+        ]);
+        let out = apply_json_patch(&original, &patch).unwrap();
+        assert_eq!(out, json!({"metadata": {"annotations": {"k8s.ovn.org/node-subnets": "{}", "x~y": "3"}}}));
+    }
 
     #[test]
     fn test_json_merge_patch_simple() {
