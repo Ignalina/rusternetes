@@ -336,8 +336,21 @@ pub fn build(input: &SpecInput) -> Result<Value> {
         linux["maskedPaths"] = json!([]);
         linux["readonlyPaths"] = json!([]);
     }
-    if let Some(sysctls) = &hc.sysctls {
-        linux["sysctl"] = json!(sysctls);
+    // The pod's own network namespace: unprivileged ports from 0 and ping for any group,
+    // as containerd (enable_unprivileged_ports / enable_unprivileged_icmp) and Docker do, so
+    // a non-root server can listen on :53 or :80. The pod's own sysctls win; a host-network
+    // pod gets none of these (they would change the host).
+    let mut sysctl = hc.sysctls.clone().unwrap_or_default();
+    if input.net != Ns::Host {
+        for (k, v) in [
+            ("net.ipv4.ip_unprivileged_port_start", "0"),
+            ("net.ipv4.ping_group_range", "0 2147483647"),
+        ] {
+            sysctl.entry(k.to_string()).or_insert_with(|| v.to_string());
+        }
+    }
+    if !sysctl.is_empty() {
+        linux["sysctl"] = json!(sysctl);
     }
     let mut allow = Vec::new();
     if let Some(devices) = hc.devices.as_ref().filter(|d| !d.is_empty()) {
