@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use crate::advanced::{
     check_host_port_conflicts, check_node_affinity, check_pod_affinity, check_pod_anti_affinity,
     check_preemption, check_taints_tolerations, check_topology_spread_constraints,
-    parse_resource_quantity, NodeScore,
+    matches_node_selector, parse_resource_quantity, NodeScore,
 };
 
 pub struct Scheduler<S: Storage + Send + Sync + 'static = StorageBackend> {
@@ -644,8 +644,29 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
             return None;
         }
 
+        // Phase 4a: Volume binding — a claim the pod uses must be bound, and
+        // the bound PV's node affinity (a local disk's node) must match.
+        let mut volume_ok_nodes: Vec<&Node> = Vec::new();
+        for node in dra_matched_nodes {
+            match self.check_volume_node_affinity(node, pod).await {
+                Ok(true) => volume_ok_nodes.push(node),
+                Ok(false) => debug!(
+                    "Node {} rejected for pod {}: a bound PV's node affinity does not match",
+                    node.metadata.name, pod.metadata.name
+                ),
+                Err(why) => {
+                    debug!("Pod {} waits: {}", pod.metadata.name, why);
+                    return None;
+                }
+            }
+        }
+        if volume_ok_nodes.is_empty() {
+            debug!("No nodes match the pod's volumes");
+            return None;
+        }
+
         // Phase 4b: Check hostPort conflicts
-        let port_ok_nodes: Vec<&Node> = dra_matched_nodes
+        let port_ok_nodes: Vec<&Node> = volume_ok_nodes
             .into_iter()
             .filter(|node| {
                 if !check_host_port_conflicts(node, pod, all_pods) {
@@ -1193,6 +1214,58 @@ impl<S: Storage + Send + Sync + 'static> Scheduler<S> {
 
     /// Check if node has available devices for DRA ResourceClaims
     /// Returns true if all required devices are available on the node, or if no resource claims are specified
+    /// `Ok(true)`: every PVC the pod uses is bound and its PV may be used on
+    /// `node` (`spec.nodeAffinity.required`, the upstream VolumeBinding
+    /// filter for bound claims). `Err`: a claim is missing or not bound yet,
+    /// so the pod waits (a dynamic provisioner is making its volume).
+    async fn check_volume_node_affinity(&self, node: &Node, pod: &Pod) -> Result<bool, String> {
+        use rusternetes_common::resources::{PersistentVolume, PersistentVolumeClaim};
+        let ns = pod.metadata.namespace.as_deref().unwrap_or("default");
+        let volumes = pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.volumes.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        for v in volumes {
+            let Some(src) = v.persistent_volume_claim else {
+                continue;
+            };
+            let pvc: PersistentVolumeClaim = self
+                .storage
+                .get(&build_key(
+                    "persistentvolumeclaims",
+                    Some(ns),
+                    &src.claim_name,
+                ))
+                .await
+                .map_err(|_| format!("claim {ns}/{} does not exist", src.claim_name))?;
+            let Some(pv_name) = pvc.spec.volume_name.clone() else {
+                return Err(format!("claim {ns}/{} is not bound yet", src.claim_name));
+            };
+            let pv: PersistentVolume = self
+                .storage
+                .get(&build_key("persistentvolumes", None, &pv_name))
+                .await
+                .map_err(|_| format!("PV {pv_name} does not exist"))?;
+            if let Some(req) = pv
+                .spec
+                .node_affinity
+                .as_ref()
+                .and_then(|a| a.required.as_ref())
+            {
+                // The PV's NodeSelector is its own type with the same shape.
+                let sel: rusternetes_common::resources::NodeSelector = serde_json::to_value(req)
+                    .and_then(serde_json::from_value)
+                    .map_err(|e| format!("PV {pv_name}: node affinity: {e}"))?;
+                if !matches_node_selector(node, &sel) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     async fn check_dra_device_availability(&self, node: &Node, pod: &Pod) -> bool {
         use rusternetes_common::resources::{ResourceClaim, ResourceSlice};
 

@@ -280,9 +280,18 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
             }
         }
 
-        // Check resource
+        // Check resource: a subresource is `<resource>/<subresource>` (a rule
+        // for `pods` does not grant `pods/exec`), or `*/<subresource>`.
         if let Some(ref resources) = rule.resources {
-            if !resources.contains(&attrs.resource) && !resources.contains(&"*".to_string()) {
+            let ok = match attrs.subresource.as_deref().filter(|s| !s.is_empty()) {
+                Some(sub) => resources.iter().any(|r| {
+                    r == "*"
+                        || *r == format!("{}/{}", attrs.resource, sub)
+                        || *r == format!("*/{}", sub)
+                }),
+                None => resources.iter().any(|r| r == "*" || *r == attrs.resource),
+            };
+            if !ok {
                 return false;
             }
         }
@@ -303,8 +312,11 @@ impl<S: AuthzStorage> RBACAuthorizer<S> {
 #[async_trait]
 impl<S: AuthzStorage> Authorizer for RBACAuthorizer<S> {
     async fn authorize(&self, attrs: &RequestAttributes) -> Result<Decision> {
-        // System admin has full access
-        if attrs.user.username == "system:admin" {
+        // System admin, and the system:masters group (the cluster admin
+        // certificate, O=system:masters), have full access.
+        if attrs.user.username == "system:admin"
+            || attrs.user.groups.iter().any(|g| g == "system:masters")
+        {
             return Ok(Decision::Allow);
         }
 
@@ -816,6 +828,93 @@ impl Authorizer for WebhookAuthorizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rule_for_a_resource_does_not_grant_its_subresources() {
+        struct Empty;
+        #[async_trait]
+        impl AuthzStorage for Empty {
+            async fn get<T>(&self, key: &str, _: Option<&str>) -> Result<T>
+            where
+                T: DeserializeOwned + Send + Sync,
+            {
+                Err(crate::error::Error::NotFound(key.to_string()))
+            }
+            async fn list<T>(&self, _: Option<&str>) -> Result<Vec<T>>
+            where
+                T: serde::Serialize + DeserializeOwned + Send + Sync,
+            {
+                Ok(vec![])
+            }
+        }
+        let rbac = RBACAuthorizer::new(Arc::new(Empty));
+        let rule = |res: &[&str]| PolicyRule {
+            verbs: vec!["get".into(), "create".into()],
+            api_groups: Some(vec!["".into()]),
+            resources: Some(res.iter().map(|r| r.to_string()).collect()),
+            resource_names: None,
+            non_resource_urls: None,
+        };
+        let u = UserInfo {
+            username: "u".into(),
+            uid: String::new(),
+            groups: vec![],
+            extra: Default::default(),
+        };
+        let exec = RequestAttributes::new(u.clone(), "create", "pods")
+            .with_namespace("d")
+            .with_name("p")
+            .with_subresource("exec");
+        let get = RequestAttributes::new(u, "get", "pods")
+            .with_namespace("d")
+            .with_name("p");
+        assert!(rbac.rule_allows(&rule(&["pods"]), &get));
+        assert!(!rbac.rule_allows(&rule(&["pods"]), &exec));
+        assert!(rbac.rule_allows(&rule(&["pods/exec"]), &exec));
+        assert!(!rbac.rule_allows(&rule(&["pods/exec"]), &get));
+        assert!(rbac.rule_allows(&rule(&["*"]), &exec));
+        assert!(rbac.rule_allows(&rule(&["*/exec"]), &exec));
+    }
+
+    #[tokio::test]
+    async fn system_masters_group_is_admin_others_are_not() {
+        struct Empty;
+        #[async_trait]
+        impl AuthzStorage for Empty {
+            async fn get<T>(&self, key: &str, _: Option<&str>) -> Result<T>
+            where
+                T: DeserializeOwned + Send + Sync,
+            {
+                Err(crate::error::Error::NotFound(key.to_string()))
+            }
+            async fn list<T>(&self, _: Option<&str>) -> Result<Vec<T>>
+            where
+                T: serde::Serialize + DeserializeOwned + Send + Sync,
+            {
+                Ok(vec![])
+            }
+        }
+        let rbac = RBACAuthorizer::new(Arc::new(Empty));
+        let user = |name: &str, groups: &[&str]| UserInfo {
+            username: name.into(),
+            uid: name.into(),
+            groups: groups.iter().map(|g| g.to_string()).collect(),
+            extra: Default::default(),
+        };
+        let admin = user("admin", &["system:masters", "system:authenticated"]);
+        let attrs = RequestAttributes::new(admin, "create", "deployments")
+            .with_namespace("default")
+            .with_api_group("apps");
+        assert_eq!(rbac.authorize(&attrs).await.unwrap(), Decision::Allow);
+        let node = user("system:node:w1", &["system:nodes", "system:authenticated"]);
+        let attrs = RequestAttributes::new(node, "create", "deployments")
+            .with_namespace("default")
+            .with_api_group("apps");
+        assert!(matches!(
+            rbac.authorize(&attrs).await.unwrap(),
+            Decision::Deny(_)
+        ));
+    }
 
     #[test]
     fn test_policy_rule_matching() {

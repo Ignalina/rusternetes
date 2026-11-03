@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod admission_webhook;
+pub mod authn;
 pub mod bootstrap;
 pub mod conversion;
 pub mod dynamic_routes;
@@ -8,7 +9,9 @@ pub mod flow_control;
 pub mod gnostic;
 pub mod handlers;
 pub mod ip_allocator;
+pub mod kubelet_client;
 pub mod middleware;
+pub mod node_authz;
 pub mod openapi;
 pub mod patch;
 pub mod prometheus_client;
@@ -27,7 +30,6 @@ pub mod watch_cache;
 
 use axum_server::tls_rustls::RustlsConfig;
 use rusternetes_common::auth::TokenManager;
-use rusternetes_common::authz::RBACAuthorizer;
 use rusternetes_common::observability::MetricsRegistry;
 use rusternetes_common::tls::TlsConfig;
 use rusternetes_storage::{Storage, StorageBackend};
@@ -55,13 +57,30 @@ pub struct ApiServerConfig {
     /// When set, the API server requires clients to present a certificate signed
     /// by this CA. The CN field becomes the username and O fields become groups.
     pub client_ca_file: Option<String>,
+    /// Reach the kubelets' node servers (exec, attach, logs) over mutual
+    /// TLS: their certificates checked against this CA, this client
+    /// certificate and key presented (`--kubelet-certificate-authority`,
+    /// `--kubelet-client-certificate`, `--kubelet-client-key`). `None`: plain HTTP.
+    pub kubelet_client_tls: Option<kubelet_client::KubeletClientTls>,
+    /// Nodes publish ConfigMaps `kube-system/<prefix><node>` (the Node
+    /// authorizer: get any node's, write its own). `None`: none.
+    pub node_configmap_prefix: Option<String>,
+    /// Custom resources nodes write when named `<node>.<…>`
+    /// (`<plural>.<group>`, node_authz `with_node_resources`).
+    pub node_named_resources: Vec<String>,
+    /// Custom resources whose status a node writes when their label names it
+    /// (`<plural>.<group>=<label key>`).
+    pub node_status_resources: Vec<String>,
 }
 
 impl Default for ApiServerConfig {
     fn default() -> Self {
         Self {
             bind_address: "0.0.0.0:6443".to_string(),
-            jwt_secret: "rusternetes-secret-change-in-production".to_string(),
+            // No shared default: without the cluster's key (installed with
+            // rusternetes_common::auth::install_cluster_token_manager) or a
+            // secret, tokens are signed with a random per-process secret.
+            jwt_secret: String::new(),
             tls: false,
             tls_cert_file: None,
             tls_key_file: None,
@@ -71,6 +90,10 @@ impl Default for ApiServerConfig {
             prometheus_url: None,
             console_dir: None,
             client_ca_file: None,
+            kubelet_client_tls: None,
+            node_configmap_prefix: None,
+            node_named_resources: Vec::new(),
+            node_status_resources: Vec::new(),
         }
     }
 }
@@ -81,15 +104,42 @@ impl Default for ApiServerConfig {
 /// Starts the HTTPS/HTTP server and blocks until shutdown.
 pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyhow::Result<()> {
     info!("Starting Rusternetes API Server");
+    if let Some(t) = &config.kubelet_client_tls {
+        kubelet_client::configure(t)?;
+        info!(
+            "Kubelet node servers: mutual TLS (CA {}, client certificate {})",
+            t.ca_file, t.cert_file
+        );
+    }
 
-    let token_manager = Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()));
+    let token_manager = match rusternetes_common::auth::cluster_token_manager() {
+        Some(tm) => {
+            info!(
+                "ServiceAccount tokens: signed and checked with the cluster's service-account key"
+            );
+            tm
+        }
+        None if !config.jwt_secret.is_empty()
+            && config.jwt_secret != "rusternetes-secret-change-in-production" =>
+        {
+            Arc::new(TokenManager::new_auto(config.jwt_secret.as_bytes()))
+        }
+        None => {
+            warn!("No service-account key: ServiceAccount tokens are signed with a random secret of this process only");
+            Arc::new(TokenManager::new_random())
+        }
+    };
 
     let authorizer: Arc<dyn rusternetes_common::authz::Authorizer> = if config.skip_auth {
         warn!("Authentication and authorization disabled - insecure mode");
         Arc::new(rusternetes_common::authz::AlwaysAllowAuthorizer)
     } else {
-        info!("Initializing RBAC Authorizer");
-        Arc::new(RBACAuthorizer::new(storage.clone()))
+        info!("Authorization: Node authorizer + RBAC (system:masters is admin)");
+        Arc::new(
+            node_authz::ClusterAuthorizer::new(storage.clone())
+                .with_node_configmaps(config.node_configmap_prefix.clone())
+                .with_node_resources(&config.node_named_resources, &config.node_status_resources),
+        )
     };
 
     let metrics = Arc::new(MetricsRegistry::new().with_api_server_metrics()?);
@@ -110,7 +160,12 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         } else {
             anyhow::bail!("TLS enabled but no certificate provided");
         };
-        tls_config.cert_pem.clone()
+        // The CA pods trust (kube-root-ca.crt, token Secrets' ca.crt): the
+        // cluster CA when there is one, else the serving certificate.
+        match &config.client_ca_file {
+            Some(ca) => Some(std::fs::read_to_string(ca)?),
+            None => tls_config.cert_pem.clone(),
+        }
     } else {
         None
     };
@@ -123,11 +178,44 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
+    if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
+        warn!(
+            "Failed to bootstrap the system namespaces: {}. Continuing anyway.",
+            e
+        );
+    }
     if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
         warn!(
             "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",
             e
         );
+    }
+    // Keep them (upstream reconciles every 10 s): a store not ready at start
+    // (an HA control plane without a Raft leader yet) or a deleted object is
+    // made good here.
+    {
+        let storage = storage.clone();
+        let root_ca = ca_cert_pem
+            .clone()
+            .filter(|_| config.client_ca_file.is_some());
+        tokio::spawn(async move {
+            loop {
+                if let Some(ca) = &root_ca {
+                    if let Err(e) = bootstrap::publish_root_ca(&storage, ca).await {
+                        tracing::debug!("kube-root-ca.crt: {e}");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
+                    tracing::debug!("system namespaces: {e}");
+                }
+                if let Err(e) =
+                    bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await
+                {
+                    tracing::debug!("kubernetes Service: {e}");
+                }
+            }
+        });
     }
 
     // Create default ServiceCIDR
@@ -251,13 +339,20 @@ pub async fn run(storage: Arc<StorageBackend>, config: ApiServerConfig) -> anyho
                 "Client certificate authentication enabled (CA: {})",
                 client_ca
             );
-            tls_config.into_mtls_server_config(client_ca)?
+            if config.skip_auth {
+                tls_config.into_mtls_server_config(client_ca)?
+            } else {
+                // A client certificate is optional: pods come with a
+                // ServiceAccount bearer token; no credentials at all is 401.
+                tls_config.into_optional_mtls_server_config(client_ca)?
+            }
         } else {
             tls_config.into_server_config()?
         };
         let rustls_config = RustlsConfig::from_config(server_config);
         info!("HTTPS server listening on {}", config.bind_address);
-        let mut server = axum_server::bind_rustls(config.bind_address.parse()?, rustls_config);
+        let mut server = axum_server::bind_rustls(config.bind_address.parse()?, rustls_config)
+            .map(|inner| authn::PeerCertAcceptor { inner });
         server
             .http_builder()
             .http2()

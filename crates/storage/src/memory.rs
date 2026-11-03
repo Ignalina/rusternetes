@@ -262,7 +262,7 @@ impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
         let full_key = match namespace {
             Some(ns) => {
                 let tn = std::any::type_name::<T>();
-                if tn.contains("Role") && !tn.contains("Cluster") {
+                if tn.contains("Role") && !tn.contains("Cluster") && !tn.contains("Binding") {
                     format!("/registry/roles/{}/{}", ns, key)
                 } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
                     format!("/registry/rolebindings/{}/{}", ns, key)
@@ -291,7 +291,7 @@ impl rusternetes_common::authz::AuthzStorage for MemoryStorage {
         let prefix = match namespace {
             Some(ns) => {
                 let tn = std::any::type_name::<T>();
-                if tn.contains("Role") && !tn.contains("Cluster") {
+                if tn.contains("Role") && !tn.contains("Cluster") && !tn.contains("Binding") {
                     format!("/registry/roles/{}/", ns)
                 } else if tn.contains("RoleBinding") && !tn.contains("Cluster") {
                     format!("/registry/rolebindings/{}/", ns)

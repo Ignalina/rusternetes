@@ -46,65 +46,116 @@ pub async fn skip_auth_middleware(mut request: Request, next: Next) -> Result<Re
     Ok(next.run(request).await)
 }
 
-/// Returns the token of an `Authorization: Bearer <token>` header. The scheme name is
-/// case-insensitive; the Python Kubernetes client sends it in lowercase.
-fn bearer_token(header: &str) -> Option<&str> {
-    let (scheme, token) = header.split_once(' ')?;
-    if scheme.eq_ignore_ascii_case("Bearer") {
-        Some(token.trim())
-    } else {
-        None
-    }
+#[cfg(test)]
+use crate::authn::bearer_token;
+
+fn unauthorized(msg: &str) -> Response {
+    let body = serde_json::json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {},
+        "status": "Failure", "message": msg, "reason": "Unauthorized", "code": 401
+    });
+    (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response()
 }
 
-/// Authentication middleware that extracts and validates JWT tokens
+fn forbidden(msg: &str) -> Response {
+    let body = serde_json::json!({
+        "kind": "Status", "apiVersion": "v1", "metadata": {},
+        "status": "Failure", "message": msg, "reason": "Forbidden", "code": 403
+    });
+    (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
+}
+
+/// Authentication (crate::authn): the connection's client certificate, else
+/// a bearer token; neither, or a bad token, is 401. There is no anonymous user.
 pub async fn auth_middleware(
     Extension(token_manager): Extension<Arc<TokenManager>>,
     Extension(bootstrap_token_manager): Extension<Arc<BootstrapTokenManager>>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, Response> {
-    // Extract Bearer token from Authorization header
-    let auth_header = request
+    let peer = request
+        .extensions()
+        .get::<crate::authn::PeerIdentity>()
+        .and_then(|p| p.0.clone());
+    let header = request
         .headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    let user = if let Some(token) = bearer_token(auth_header) {
-        // Try to validate as a service account token first
-        if let Ok(claims) = token_manager.validate_token(token) {
-            let user_info = UserInfo::from_service_account_claims(&claims);
-            debug!(
-                "Authenticated user (service account): {}",
-                user_info.username
-            );
-            user_info
+        .map(str::to_string);
+    let user = match crate::authn::authenticate(
+        peer.as_deref(),
+        header.as_deref(),
+        &token_manager,
+        &bootstrap_token_manager,
+    ) {
+        Ok(u) => u,
+        Err(msg) => {
+            debug!("{} {}: {}", request.method(), request.uri().path(), msg);
+            return Err(unauthorized(msg));
         }
-        // Try to validate as a bootstrap token
-        else if let Ok(bootstrap_token) = bootstrap_token_manager.validate_token(token) {
-            let user_info = UserInfo::from_bootstrap_token(&bootstrap_token);
-            debug!(
-                "Authenticated user (bootstrap token): {}",
-                user_info.username
-            );
-            user_info
-        }
-        // Invalid token
-        else {
-            warn!("Invalid token");
-            return Err((StatusCode::UNAUTHORIZED, "Invalid token").into_response());
-        }
-    } else {
-        // Anonymous user
-        debug!("Anonymous request");
-        UserInfo::anonymous()
     };
-
-    // Insert UserInfo into request extensions
+    debug!("Authenticated {} {:?}", user.username, user.groups);
     request.extensions_mut().insert(AuthContext { user });
-
     Ok(next.run(request).await)
+}
+
+/// Authorization of every resource request from its URL (crate::authn::request_attributes),
+/// before any handler: the handlers' own checks come on top. A node's create
+/// is checked with the object's name from the body (its own Node, Lease, CSINode).
+pub async fn authz_middleware(
+    Extension(authorizer): Extension<Arc<dyn rusternetes_common::authz::Authorizer>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, Response> {
+    let Some(ctx) = request.extensions().get::<AuthContext>().cloned() else {
+        return Err(unauthorized("Unauthorized"));
+    };
+    let Some(mut attrs) =
+        crate::authn::request_attributes(request.method(), request.uri(), ctx.user.clone())
+    else {
+        // Not a resource URL: any authenticated user (discovery, OpenAPI).
+        return Ok(next.run(request).await);
+    };
+    let mut request = request;
+    if attrs.verb == "create"
+        && attrs.name.is_none()
+        && crate::node_authz::node_of(&ctx.user).is_some()
+    {
+        let (parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, 8 << 20)
+            .await
+            .map_err(|_| forbidden("request body too large"))?;
+        if let Some(name) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/metadata/name")
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string)
+            })
+        {
+            attrs = attrs.with_name(name);
+        }
+        request = Request::from_parts(parts, Body::from(bytes));
+    }
+    match authorizer.authorize(&attrs).await {
+        Ok(rusternetes_common::authz::Decision::Allow) => Ok(next.run(request).await),
+        Ok(rusternetes_common::authz::Decision::Deny(reason)) => {
+            info!(
+                "Forbidden: {} {} {:?}/{:?}: {}",
+                ctx.user.username, attrs.verb, attrs.resource, attrs.name, reason
+            );
+            Err(forbidden(&format!(
+                "{} \"{}\" is forbidden: User \"{}\" cannot {} resource \"{}\": {}",
+                attrs.resource,
+                attrs.name.as_deref().unwrap_or(""),
+                ctx.user.username,
+                attrs.verb,
+                attrs.resource,
+                reason
+            )))
+        }
+        Err(e) => Err(forbidden(&format!("authorization failed: {e}"))),
+    }
 }
 
 /// Query parameters that hold a boolean.
@@ -162,6 +213,7 @@ pub fn normalize_boolean_query(uri: &axum::http::Uri) -> Option<axum::http::Uri>
 /// The Kubernetes client defaults to application/vnd.kubernetes.protobuf, but we only
 /// support JSON. Axum's Json extractor rejects non-application/json content types with
 /// HTTP 415, so we rewrite the header before the request reaches the handler.
+#[allow(clippy::result_large_err)]
 pub async fn normalize_content_type_middleware(
     mut request: Request,
     next: Next,
@@ -358,8 +410,15 @@ pub async fn normalize_content_type_middleware(
     // sends "Accept: application/vnd.kubernetes.protobuf, application/json"
     // and falls back to JSON when protobuf is unavailable.
     let wants_protobuf = false;
+    // `Accept: application/json;as=PartialObjectMetadata[List];g=meta.k8s.io;v=v1`
+    // — the metadata-only view client-go's metadata informers ask for.
+    let wants_partial = accept_header.contains("as=PartialObjectMetadata");
 
     let response = next.run(request).await;
+
+    if wants_partial {
+        return Ok(partial_object_metadata_response(response, _is_watch_request).await);
+    }
 
     // Wrap response in protobuf if:
     // 1. The Accept header requests protobuf
@@ -397,6 +456,89 @@ pub async fn normalize_content_type_middleware(
     }
 
     Ok(response)
+}
+
+/// One object as `meta.k8s.io/v1` `PartialObjectMetadata` (its metadata only),
+/// a list as `PartialObjectMetadataList`. A `Status` (an error) is left as it is.
+fn to_partial_object_metadata(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::{json, Value};
+    if v.get("kind").and_then(Value::as_str) == Some("Status") {
+        return v;
+    }
+    if let Some(items) = v.get("items").and_then(Value::as_array) {
+        let items: Vec<Value> = items
+            .iter()
+            .map(|i| json!({"kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1", "metadata": i.get("metadata").cloned().unwrap_or(json!({}))}))
+            .collect();
+        return json!({
+            "kind": "PartialObjectMetadataList",
+            "apiVersion": "meta.k8s.io/v1",
+            "metadata": v.get("metadata").cloned().unwrap_or(json!({})),
+            "items": items,
+        });
+    }
+    json!({"kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1", "metadata": v.get("metadata").cloned().unwrap_or(json!({}))})
+}
+
+/// A watch event line `{"type":…,"object":{…}}` with its object as
+/// `PartialObjectMetadata`; a line that is not an event passes unchanged.
+fn partial_watch_line(line: &[u8]) -> Vec<u8> {
+    let Ok(mut ev) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return line.to_vec();
+    };
+    if let Some(obj) = ev.get_mut("object") {
+        let o = std::mem::take(obj);
+        *obj = to_partial_object_metadata(o);
+    }
+    let mut out = serde_json::to_vec(&ev).unwrap_or_else(|_| line.to_vec());
+    out.push(b'\n');
+    out
+}
+
+/// The handler's JSON response re-shaped for a client that asked for
+/// `as=PartialObjectMetadata` (a list, an object, or a watch stream, event by
+/// event). Non-JSON and error responses pass unchanged.
+async fn partial_object_metadata_response(response: Response, is_watch: bool) -> Response {
+    use futures::StreamExt;
+    let ct = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !response.status().is_success() || !(ct.starts_with("application/json") || is_watch) {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    if is_watch {
+        let mut buf: Vec<u8> = Vec::new();
+        let stream = body.into_data_stream().map(move |chunk| {
+            let chunk = chunk?;
+            buf.extend_from_slice(&chunk);
+            let mut out = Vec::new();
+            while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                out.extend_from_slice(&partial_watch_line(&line[..line.len() - 1]));
+            }
+            Ok::<_, axum::Error>(bytes::Bytes::from(out))
+        });
+        return Response::from_parts(parts, Body::from_stream(stream));
+    }
+    match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => match serde_json::from_slice::<serde_json::Value>(&b) {
+            Ok(v) => {
+                let out = serde_json::to_vec(&to_partial_object_metadata(v))
+                    .unwrap_or_else(|_| b.to_vec());
+                Response::from_parts(parts, Body::from(out))
+            }
+            Err(_) => Response::from_parts(parts, Body::from(b)),
+        },
+        Err(_) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .unwrap(),
+    }
 }
 
 /// Extract apiVersion and kind from JSON bytes without full parsing.
@@ -1711,6 +1853,29 @@ mod tests {
             json,
             "extracted JSON must match original"
         );
+    }
+
+    #[test]
+    fn partial_object_metadata_shapes_objects_lists_and_watch_events() {
+        let obj = serde_json::json!({"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition",
+            "metadata": {"name": "a.b", "resourceVersion": "7"}, "spec": {"group": "b"}});
+        let p = to_partial_object_metadata(obj.clone());
+        assert_eq!(p["kind"], "PartialObjectMetadata");
+        assert_eq!(p["apiVersion"], "meta.k8s.io/v1");
+        assert_eq!(p["metadata"]["name"], "a.b");
+        assert!(p.get("spec").is_none());
+        let list = serde_json::json!({"kind": "CustomResourceDefinitionList", "apiVersion": "apiextensions.k8s.io/v1",
+            "metadata": {"resourceVersion": "9"}, "items": [obj]});
+        let pl = to_partial_object_metadata(list);
+        assert_eq!(pl["kind"], "PartialObjectMetadataList");
+        assert_eq!(pl["metadata"]["resourceVersion"], "9");
+        assert_eq!(pl["items"][0]["kind"], "PartialObjectMetadata");
+        let status = serde_json::json!({"kind": "Status", "status": "Failure"});
+        assert_eq!(to_partial_object_metadata(status.clone()), status);
+        let line = br#"{"type":"ADDED","object":{"kind":"CustomResourceDefinition","metadata":{"name":"a.b"},"spec":{}}}"#;
+        let ev: serde_json::Value = serde_json::from_slice(&partial_watch_line(line)).unwrap();
+        assert_eq!(ev["type"], "ADDED");
+        assert_eq!(ev["object"]["kind"], "PartialObjectMetadata");
     }
 
     #[test]

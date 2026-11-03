@@ -1,118 +1,34 @@
 use anyhow::Result;
 use futures::StreamExt;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use rusternetes_common::auth::{ServiceAccountClaims, TokenManager};
 use rusternetes_common::resources::{Namespace, Secret, ServiceAccount};
 use rusternetes_common::types::{ObjectMeta, TypeMeta};
 use rusternetes_storage::{build_key, build_prefix, extract_key, Storage, WorkQueue};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
-
-/// JWT Claims for ServiceAccount tokens
-/// Follows Kubernetes ServiceAccount token format
-#[derive(Debug, Serialize, Deserialize)]
-struct ServiceAccountClaims {
-    /// Issuer - typically the API server URL
-    iss: String,
-    /// Subject - the ServiceAccount in format "system:serviceaccount:<namespace>:<name>"
-    sub: String,
-    /// Audience - who the token is intended for
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aud: Option<Vec<String>>,
-    /// Expiration time (Unix timestamp)
-    exp: i64,
-    /// Issued at time (Unix timestamp)
-    iat: i64,
-    /// Not before time (Unix timestamp)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nbf: Option<i64>,
-    /// Kubernetes-specific claims
-    #[serde(rename = "kubernetes.io")]
-    kubernetes: KubernetesClaims,
-}
-
-/// Kubernetes-specific claims in the JWT
-#[derive(Debug, Serialize, Deserialize)]
-struct KubernetesClaims {
-    namespace: String,
-    serviceaccount: ServiceAccountRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pod: Option<PodRef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ServiceAccountRef {
-    name: String,
-    uid: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PodRef {
-    name: String,
-    uid: String,
-}
 
 /// ServiceAccountController automatically creates default ServiceAccounts in new namespaces
 /// and manages ServiceAccount tokens.
 ///
 /// Responsibilities:
 /// 1. Create "default" ServiceAccount in each namespace
-/// 2. Create ServiceAccount tokens as Secrets
+/// 2. Create ServiceAccount tokens as Secrets, signed with the cluster's
+///    service-account key (rusternetes_common::auth::cluster_token_manager);
+///    without that key no token Secret is created (never an unsigned token)
 /// 3. Handle ServiceAccount deletion and cleanup
 pub struct ServiceAccountController<S: Storage> {
     storage: Arc<S>,
-    /// RSA private key for signing tokens (PEM format)
-    /// In production, this would be loaded from a secure key file
-    signing_key: Option<EncodingKey>,
+    tokens: Option<Arc<TokenManager>>,
 }
 
 impl<S: Storage + 'static> ServiceAccountController<S> {
     pub fn new(storage: Arc<S>) -> Self {
-        // Try to load the signing key from environment or default location
-        let signing_key = Self::load_signing_key();
-
-        if signing_key.is_none() {
-            warn!("ServiceAccount signing key not found - tokens will be unsigned. Set SA_SIGNING_KEY_PATH environment variable to enable JWT signing.");
+        let tokens = rusternetes_common::auth::cluster_token_manager();
+        if tokens.is_none() {
+            warn!("No service-account key in this process: ServiceAccount token Secrets are left to the API server");
         }
-
-        Self {
-            storage,
-            signing_key,
-        }
-    }
-
-    /// Load the RSA private key for signing ServiceAccount tokens
-    /// Looks for the key at SA_SIGNING_KEY_PATH environment variable
-    /// or defaults to ~/.rusternetes/keys/sa-signing-key.pem
-    fn load_signing_key() -> Option<EncodingKey> {
-        let key_path = std::env::var("SA_SIGNING_KEY_PATH").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            format!("{}/.rusternetes/keys/sa-signing-key.pem", home)
-        });
-
-        match std::fs::read(&key_path) {
-            Ok(key_bytes) => match EncodingKey::from_rsa_pem(&key_bytes) {
-                Ok(key) => {
-                    info!("Loaded ServiceAccount signing key from {}", key_path);
-                    Some(key)
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to parse ServiceAccount signing key from {}: {}",
-                        key_path, e
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                debug!(
-                    "Failed to read ServiceAccount signing key from {}: {}",
-                    key_path, e
-                );
-                None
-            }
-        }
+        Self { storage, tokens }
     }
 
     /// Watch-based run loop. Watches for serviceaccount changes and
@@ -345,6 +261,9 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         let secret_name = format!("{}-token", sa_name);
         let secret_key = build_key("secrets", Some(namespace), &secret_name);
 
+        if self.tokens.is_none() {
+            return Ok(());
+        }
         // Check if token secret already exists
         if self.storage.get::<Secret>(&secret_key).await.is_ok() {
             debug!(
@@ -427,58 +346,19 @@ impl<S: Storage + 'static> ServiceAccountController<S> {
         Ok(())
     }
 
-    /// Generate a ServiceAccount token as a signed JWT
-    /// Uses RS256 (RSA + SHA256) for signing if a signing key is available
-    /// Falls back to a simple token format if no signing key is configured
+    /// A ServiceAccount token signed with the cluster's key (the API
+    /// server's issuer and audience). `Err` without the key.
     fn generate_token(&self, namespace: &str, sa_name: &str, sa_uid: &str) -> Result<String> {
-        // If we have a signing key, generate a proper JWT
-        if let Some(ref signing_key) = self.signing_key {
-            let now = chrono::Utc::now().timestamp();
-
-            // Token valid for 1 year (in production, this could be configurable)
-            let expiration = now + (365 * 24 * 60 * 60);
-
-            // Build the claims
-            let claims = ServiceAccountClaims {
-                iss: "rusternetes".to_string(), // In production, this would be the API server URL
-                sub: format!("system:serviceaccount:{}:{}", namespace, sa_name),
-                aud: Some(vec!["rusternetes".to_string()]), // In production, this would be configurable
-                exp: expiration,
-                iat: now,
-                nbf: Some(now),
-                kubernetes: KubernetesClaims {
-                    namespace: namespace.to_string(),
-                    serviceaccount: ServiceAccountRef {
-                        name: sa_name.to_string(),
-                        uid: sa_uid.to_string(),
-                    },
-                    pod: None, // Pod reference is added when the token is projected into a pod
-                },
-            };
-
-            // Create JWT header with RS256 algorithm
-            let header = Header::new(Algorithm::RS256);
-
-            // Encode the JWT
-            let token = encode(&header, &claims, signing_key)
-                .map_err(|e| anyhow::anyhow!("Failed to encode JWT token: {}", e))?;
-
-            info!(
-                "Generated signed JWT token for ServiceAccount {}/{}",
-                namespace, sa_name
-            );
-            Ok(token)
-        } else {
-            // Fallback to simple token format if no signing key
-            warn!(
-                "No signing key available - generating unsigned token for ServiceAccount {}/{}",
-                namespace, sa_name
-            );
-            Ok(format!(
-                "rusternetes-sa-{}-{}-token-{}",
-                namespace, sa_name, sa_uid
-            ))
-        }
+        let tm = self.tokens.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("no service-account key: no token for {namespace}/{sa_name}")
+        })?;
+        let claims = ServiceAccountClaims::new(
+            sa_name.to_string(),
+            namespace.to_string(),
+            sa_uid.to_string(),
+            24 * 365,
+        );
+        Ok(tm.generate_token(claims)?)
     }
 
     /// Reconcile a specific ServiceAccount (called when a SA is created/updated)
@@ -561,14 +441,12 @@ mod tests {
     }
 
     #[test]
-    fn test_token_generation() {
+    fn without_the_cluster_key_no_token_is_made() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = ServiceAccountController::new(storage);
-        let token = controller
+        // Never an unsigned placeholder token.
+        assert!(controller
             .generate_token("default", "default", "test-uid-123")
-            .unwrap();
-        // Without a signing key, should generate a simple token
-        assert!(token.contains("default"));
-        assert!(token.contains("test-uid-123"));
+            .is_err());
     }
 }

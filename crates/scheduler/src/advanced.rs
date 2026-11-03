@@ -222,7 +222,7 @@ pub fn check_pod_anti_affinity(node: &Node, pod: &Pod, all_pods: &[Pod]) -> (boo
 }
 
 /// Check if node matches a node selector
-fn matches_node_selector(node: &Node, selector: &NodeSelector) -> bool {
+pub fn matches_node_selector(node: &Node, selector: &NodeSelector) -> bool {
     // At least one term must match (OR logic)
     selector
         .node_selector_terms
@@ -399,6 +399,14 @@ fn matches_pod_affinity_term(
             if p.spec.as_ref().and_then(|s| s.node_name.as_ref()).is_none() {
                 return false;
             }
+            // A finished pod (Succeeded, Failed) holds no place on its node.
+            if matches!(
+                p.status.as_ref().and_then(|s| s.phase.as_ref()),
+                Some(rusternetes_common::types::Phase::Succeeded)
+                    | Some(rusternetes_common::types::Phase::Failed)
+            ) {
+                return false;
+            }
 
             // Check if pod matches the label selector
             if !match_selector(&term.label_selector, &p.metadata.labels) {
@@ -413,8 +421,14 @@ fn matches_pod_affinity_term(
                 }
             }
 
-            // TODO: Check if the pod is on a node with matching topology value
-            // For now, we simplify by checking if any matching pod exists
+            // The pod must be in this node's topology domain. With the
+            // per-node key that is this node itself; other keys need every
+            // node's labels, which this check does not have: any matching
+            // pod counts there (stricter than Kubernetes, never looser).
+            if term.topology_key == "kubernetes.io/hostname" {
+                return p.spec.as_ref().and_then(|s| s.node_name.as_deref())
+                    == Some(node.metadata.name.as_str());
+            }
             true
         })
         .collect();
@@ -1250,6 +1264,51 @@ fn check_single_topology_constraint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node(name: &str) -> Node {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Node",
+            "metadata": {"name": name, "labels": {"kubernetes.io/hostname": name}}
+        }))
+        .unwrap()
+    }
+
+    fn web_pod(name: &str, on: Option<&str>) -> Pod {
+        let mut spec = serde_json::json!({
+            "containers": [{"name": "main", "image": "busybox"}],
+            "affinity": {"podAntiAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": [
+                {"labelSelector": {"matchLabels": {"app": "web"}}, "topologyKey": "kubernetes.io/hostname"}]}}
+        });
+        if let Some(n) = on {
+            spec["nodeName"] = serde_json::json!(n);
+        }
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default", "labels": {"app": "web"}},
+            "spec": spec
+        }))
+        .unwrap()
+    }
+
+    /// Hostname anti-affinity spreads replicas: a matching pod on another
+    /// node does not keep a pod off this one (it kept every replica but the
+    /// first Pending).
+    #[test]
+    fn hostname_anti_affinity_only_counts_pods_on_the_same_node() {
+        let running = vec![web_pod("web-1", Some("w1"))];
+        let new = web_pod("web-2", None);
+        assert!(!check_pod_anti_affinity(&node("w1"), &new, &running).0);
+        assert!(check_pod_anti_affinity(&node("w2"), &new, &running).0);
+    }
+
+    /// A Failed pod (a node rebooted under it) does not keep its replacement off the node.
+    #[test]
+    fn a_finished_pod_does_not_count_for_anti_affinity() {
+        let mut failed = web_pod("web-1", Some("w2"));
+        failed.status =
+            Some(serde_json::from_value(serde_json::json!({"phase": "Failed"})).unwrap());
+        assert!(check_pod_anti_affinity(&node("w2"), &web_pod("web-2", None), &[failed]).0);
+    }
 
     #[test]
     fn test_parse_cpu_quantity() {

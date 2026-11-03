@@ -27,7 +27,9 @@ pub async fn create(
     let is_dry_run = crate::handlers::dryrun::is_dry_run(&params);
 
     // Check authorization
-    let attrs = RequestAttributes::new(auth_ctx.user, "create", "nodes").with_api_group("");
+    let attrs = RequestAttributes::new(auth_ctx.user, "create", "nodes")
+        .with_api_group("")
+        .with_name(&node.metadata.name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}

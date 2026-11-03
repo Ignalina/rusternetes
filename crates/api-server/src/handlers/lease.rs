@@ -29,7 +29,8 @@ pub async fn create(
 
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "leases")
         .with_namespace(&namespace)
-        .with_api_group("coordination.k8s.io");
+        .with_api_group("coordination.k8s.io")
+        .with_name(&lease.metadata.name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}

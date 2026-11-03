@@ -475,7 +475,7 @@ async fn exec_with_stdin(
 ) -> Result<()> {
     use crate::websocket::{StreamChannel, StreamMessage};
     use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tokio_tungstenite::tungstenite::Message;
 
     // Build the exec URL with query parameters
     let mut url_path = format!("/api/v1/namespaces/{}/pods/{}/exec?", namespace, pod_name);
@@ -490,12 +490,8 @@ async fn exec_with_stdin(
 
     url_path.push_str("stdin=true&stdout=true&stderr=true");
 
-    // Get WebSocket URL
-    let ws_url = client.get_ws_url(&url_path)?;
-    let url = url::Url::parse(&ws_url)?;
-
-    // Connect WebSocket
-    let (ws_stream, _) = connect_async(url)
+    let ws_stream = client
+        .ws_connect(&url_path, crate::websocket::EXEC_PROTOCOLS)
         .await
         .context("Failed to connect to exec WebSocket")?;
 
@@ -508,8 +504,11 @@ async fn exec_with_stdin(
         .await
         .context("Failed to send stdin data")?;
 
-    // Close stdin to signal end of input
-    write.close().await.ok();
+    // Close stdin to signal end of input (v5 close message)
+    write
+        .send(Message::Binary(vec![crate::websocket::CLOSE_CHANNEL, 0]))
+        .await
+        .ok();
 
     // Read output (for error handling)
     while let Some(msg) = read.next().await {
@@ -557,7 +556,7 @@ async fn exec_capture_output(
 ) -> Result<Vec<u8>> {
     use crate::websocket::{StreamChannel, StreamMessage};
     use futures::StreamExt;
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tokio_tungstenite::tungstenite::Message;
 
     // Build the exec URL with query parameters
     let mut url_path = format!("/api/v1/namespaces/{}/pods/{}/exec?", namespace, pod_name);
@@ -572,12 +571,8 @@ async fn exec_capture_output(
 
     url_path.push_str("stdout=true&stderr=true");
 
-    // Get WebSocket URL
-    let ws_url = client.get_ws_url(&url_path)?;
-    let url = url::Url::parse(&ws_url)?;
-
-    // Connect WebSocket
-    let (ws_stream, _) = connect_async(url)
+    let ws_stream = client
+        .ws_connect(&url_path, crate::websocket::EXEC_PROTOCOLS)
         .await
         .context("Failed to connect to exec WebSocket")?;
 

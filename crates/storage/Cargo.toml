@@ -9,19 +9,33 @@ license.workspace = true
 default = []
 sqlite = ["dep:rhino"]
 redis = ["dep:rhino"]
+# Embedded redb store: no rhino, no external process.
+redb = ["dep:tunnr-etcd"]
+# The etcd backend over TLS with a client certificate (StorageConfig::EtcdTls).
+etcd-tls = ["etcd-client/tls", "dep:rustls"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
 rhino = { git = "https://github.com/calfonso/rhino", branch = "main", optional = true }
+tunnr-etcd = { version = "0.3", optional = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 etcd-client.workspace = true
+rustls = { workspace = true, optional = true }
 async-trait.workspace = true
 async-stream.workspace = true
 tracing.workspace = true
 futures.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+# Encryption at rest through a served store (tests/encryption.rs).
+tunnr-etcd = { version = "0.3", features = ["server"] }
+
+[[test]]
+name = "encryption"
+required-features = ["redb"]

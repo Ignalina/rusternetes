@@ -27,6 +27,14 @@ async fn custom_resource_fallback(
 ) -> Result<Response, StatusCode> {
     let path = uri.path();
     debug!("Fallback handler called for path: {}", path);
+    let wants_table = handlers::table::wants_table(
+        req.headers()
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let is_watch_query = uri
+        .query()
+        .is_some_and(|q| q.split('&').any(|kv| kv == "watch=true" || kv == "watch=1"));
 
     // Parse URI to extract custom resource information
     // Expected formats:
@@ -213,7 +221,7 @@ async fn custom_resource_fallback(
     let (group, version, plural, namespace, name, subresource) = match parts.as_slice() {
         // Namespaced: /apis/{group}/{version}/namespaces/{namespace}/{plural}
         [group, version, "namespaces", namespace, plural]
-            if method == Method::GET || method == Method::POST =>
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
         {
             (*group, *version, *plural, Some(*namespace), None, None)
         }
@@ -236,7 +244,9 @@ async fn custom_resource_fallback(
             Some(*subresource),
         ),
         // Cluster-scoped: /apis/{group}/{version}/{plural}
-        [group, version, plural] if method == Method::GET || method == Method::POST => {
+        [group, version, plural]
+            if method == Method::GET || method == Method::POST || method == Method::DELETE =>
+        {
             (*group, *version, *plural, None, None, None)
         }
         // Cluster-scoped resource: /apis/{group}/{version}/{plural}/{name}
@@ -393,6 +403,7 @@ async fn custom_resource_fallback(
                         plural.to_string(),
                         namespace.map(|s| s.to_string()),
                     )),
+                    axum::extract::Query(query_params.clone()),
                 )
                 .await
                 {
@@ -460,6 +471,76 @@ async fn custom_resource_fallback(
                 Ok(json) => json.into_response(),
                 Err(e) => {
                     warn!("Error updating custom resource: {}", e);
+                    e.into_response()
+                }
+            }
+        }
+        // DELETE on the collection = deletecollection: every object the
+        // list (with its labelSelector / fieldSelector) returns, deleted one
+        // by one through the single-object path (finalizers, admission).
+        (Method::DELETE, None, None) => {
+            let query_params: std::collections::HashMap<String, String> = uri
+                .query()
+                .map(|q| {
+                    url::form_urlencoded::parse(q.as_bytes())
+                        .into_owned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let listed = handlers::custom_resource::list_custom_resources(
+                State(state.clone()),
+                Extension(auth_ctx.clone()),
+                axum::extract::Path((
+                    group.to_string(),
+                    version.to_string(),
+                    plural.to_string(),
+                    namespace.map(|s| s.to_string()),
+                )),
+                axum::extract::Query(query_params.clone()),
+            )
+            .await;
+            match listed {
+                Ok(Json(mut list)) => {
+                    let mut failed = None;
+                    for cr in &list.items {
+                        let item_ns = cr
+                            .metadata
+                            .namespace
+                            .clone()
+                            .or(namespace.map(|s| s.to_string()));
+                        if let Err(e) = handlers::custom_resource::delete_custom_resource(
+                            State(state.clone()),
+                            Extension(auth_ctx.clone()),
+                            axum::extract::Path((
+                                group.to_string(),
+                                version.to_string(),
+                                plural.to_string(),
+                                item_ns,
+                                cr.metadata.name.clone(),
+                            )),
+                            axum::extract::Query(query_params.clone()),
+                        )
+                        .await
+                        {
+                            if !matches!(e, rusternetes_common::Error::NotFound(_)) {
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        Some(e) => {
+                            warn!("Error deleting custom resources: {}", e);
+                            e.into_response()
+                        }
+                        None => {
+                            list.items.clear();
+                            Json(list).into_response()
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Error listing custom resources for deletecollection: {}", e);
                     e.into_response()
                 }
             }
@@ -657,6 +738,13 @@ async fn custom_resource_fallback(
         }
     };
 
+    // `kubectl get`: a Table from the CRD's printer columns.
+    if method == Method::GET && subresource.is_none() && wants_table && !is_watch_query {
+        return Ok(handlers::custom_resource::table_response(
+            &state, group, version, plural, response,
+        )
+        .await);
+    }
     Ok(response)
 }
 
@@ -664,11 +752,15 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     let skip_auth = state.skip_auth;
 
     // Routes that don't require authentication
-    let public_routes = Router::new()
+    // Health only: no credentials needed (probes from the node itself).
+    let health_routes = Router::new()
         .route("/healthz", get(handlers::health::healthz))
         .route("/healthz/verbose", get(handlers::health::healthz_verbose))
         .route("/livez", get(handlers::health::healthz))
-        .route("/readyz", get(handlers::health::readyz))
+        .route("/readyz", get(handlers::health::readyz));
+
+    // Any authenticated user: metrics, the issuer documents, discovery, OpenAPI.
+    let public_routes = Router::new()
         .route("/metrics", get(handlers::health::metrics))
         // OIDC discovery endpoints for service account issuer
         .route(
@@ -818,7 +910,13 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             },
         ));
 
-    let public_routes = public_routes.merge(discovery_routes);
+    let mut public_routes = public_routes.merge(discovery_routes);
+    if !skip_auth {
+        public_routes = public_routes
+            .layer(axum_middleware::from_fn(middleware::auth_middleware))
+            .layer(Extension(state.token_manager.clone()))
+            .layer(Extension(state.bootstrap_token_manager.clone()));
+    }
 
     // Routes that require authentication (unless skip_auth is enabled)
     let mut protected_routes = Router::new()
@@ -2381,7 +2479,9 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
             .layer(axum_middleware::from_fn(
                 middleware::normalize_content_type_middleware,
             ))
+            .layer(axum_middleware::from_fn(middleware::authz_middleware))
             .layer(axum_middleware::from_fn(middleware::auth_middleware))
+            .layer(Extension(state.authorizer.clone()))
             .layer(Extension(state.token_manager.clone()))
             .layer(Extension(state.bootstrap_token_manager.clone()));
     }
@@ -2389,7 +2489,10 @@ pub fn build_router(state: Arc<ApiServerState>, console_dir: Option<&Path>) -> R
     // Combine routes and add shared state.
     // K8s (Go) treats /path and /path/ identically. Axum doesn't, so we
     // normalize URIs by stripping trailing slashes before routing.
-    let mut app = Router::new().merge(public_routes).merge(protected_routes);
+    let mut app = Router::new()
+        .merge(health_routes)
+        .merge(public_routes)
+        .merge(protected_routes);
 
     // Serve the console SPA at /console/ when a console directory is configured.
     if let Some(dir) = console_dir {

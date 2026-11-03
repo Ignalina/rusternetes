@@ -2,11 +2,16 @@ use async_trait::async_trait;
 use rusternetes_common::authz::AuthzStorage;
 use rusternetes_common::Result;
 use serde::{de::DeserializeOwned, Serialize};
+use std::borrow::Cow;
 use std::sync::Arc;
+
+pub use rusternetes_common::encryption::EncryptionTransformer;
 
 pub mod concurrency;
 pub mod etcd;
 pub mod memory;
+#[cfg(feature = "redb")]
+pub mod redb;
 #[cfg(any(feature = "sqlite", feature = "redis"))]
 pub mod rhino;
 pub mod workqueue;
@@ -22,6 +27,8 @@ pub use workqueue::{extract_key, WorkQueue, WorkQueueConfig, RECONCILE_ALL_SENTI
 pub type RhinoStorage = rhino::RhinoStorage<::rhino::SqliteBackend>;
 #[cfg(feature = "redis")]
 pub type RhinoRedisStorage = rhino::RhinoStorage<::rhino::RedisBackend>;
+#[cfg(feature = "redb")]
+pub use redb::RedbStorage;
 
 /// Storage trait for persisting Kubernetes resources
 #[async_trait]
@@ -132,12 +139,27 @@ impl<S: Storage> Storage for std::sync::Arc<S> {
     }
 }
 
+/// The PEM files of an etcd client over TLS: the CA the server's
+/// certificate must chain to, and this client's certificate and key.
+#[derive(Clone, Debug)]
+pub struct EtcdClientTls {
+    pub ca_file: String,
+    pub cert_file: String,
+    pub key_file: String,
+}
+
 /// Configuration for selecting a storage backend.
 pub enum StorageConfig {
     /// Use an external etcd cluster.
     Etcd {
         /// Etcd endpoint URLs (e.g. `["http://localhost:2379"]`).
         endpoints: Vec<String>,
+    },
+    /// Use an external etcd cluster over TLS with a client certificate
+    /// (requires the `etcd-tls` feature). Every endpoint must be `https://`.
+    EtcdTls {
+        endpoints: Vec<String>,
+        tls: EtcdClientTls,
     },
     /// Use an embedded SQLite database via rhino (requires `sqlite` feature).
     #[cfg(feature = "sqlite")]
@@ -150,6 +172,13 @@ pub enum StorageConfig {
     Redis {
         /// Redis connection URL (e.g. `"redis://localhost:6379"`).
         url: String,
+    },
+    /// Use the embedded redb store (requires `redb` feature): one file, no
+    /// external process, no rhino.
+    #[cfg(feature = "redb")]
+    Redb {
+        /// Path to the redb database file.
+        path: String,
     },
 }
 
@@ -164,6 +193,8 @@ pub enum StorageBackend {
     Sqlite(RhinoStorage),
     #[cfg(feature = "redis")]
     Redis(RhinoRedisStorage),
+    #[cfg(feature = "redb")]
+    Redb(RedbStorage),
     /// In-memory backend backed by `MemoryStorage`. Intended for unit/integration
     /// tests that need a full `ApiServerState` without an external store.
     Memory(Arc<MemoryStorage>),
@@ -177,6 +208,10 @@ impl StorageBackend {
                 let storage = etcd::EtcdStorage::new(endpoints).await?;
                 Ok(StorageBackend::Etcd(storage))
             }
+            StorageConfig::EtcdTls { endpoints, tls } => {
+                let storage = etcd::EtcdStorage::new_tls(endpoints, &tls).await?;
+                Ok(StorageBackend::Etcd(storage))
+            }
             #[cfg(feature = "sqlite")]
             StorageConfig::Sqlite { path } => {
                 let storage = RhinoStorage::new(&path).await?;
@@ -187,6 +222,11 @@ impl StorageBackend {
                 let storage = RhinoRedisStorage::new_redis(&url).await?;
                 Ok(StorageBackend::Redis(storage))
             }
+            #[cfg(feature = "redb")]
+            StorageConfig::Redb { path } => {
+                let storage = RedbStorage::new(&path).await?;
+                Ok(StorageBackend::Redb(storage))
+            }
         }
     }
 
@@ -196,6 +236,55 @@ impl StorageBackend {
     /// copy.
     pub fn new_memory() -> Self {
         StorageBackend::Memory(Arc::new(MemoryStorage::new()))
+    }
+
+    /// The same store under another encryption config (a second handle; the
+    /// etcd client and the redb store are shared).
+    pub fn clone_with_encryption(&self, t: Arc<EncryptionTransformer>) -> Result<Self> {
+        match self {
+            StorageBackend::Etcd(s) => Ok(StorageBackend::Etcd(s.with_encryption(t))),
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Ok(StorageBackend::Redb(s.with_encryption(t))),
+            _ => Err(rusternetes_common::Error::Storage(
+                "--encryption-provider-config needs the etcd or redb storage backend".into(),
+            )),
+        }
+    }
+
+    /// **Re-encrypt**: every value of the encrypted resources not stored by the
+    /// write provider (a key rotated out of first place, plaintext from before)
+    /// is written again under it, in place, only if nobody changed it meanwhile
+    /// (compare-and-swap on its revision). Idempotent: a pass that is cut short
+    /// (a restart) is resumed by the next one. Progress is logged every 100
+    /// values. Without encryption: an empty report.
+    pub async fn reencrypt(&self) -> Result<ReencryptReport> {
+        match self {
+            StorageBackend::Etcd(s) => s.reencrypt().await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => s.reencrypt().await,
+            _ => Ok(ReencryptReport::default()),
+        }
+    }
+
+    /// Encrypt values at rest (`--encryption-provider-config`): written
+    /// encrypted by the transformer's resources, read back through it. Only
+    /// the etcd and redb backends store encrypted values; the others refuse
+    /// rather than keep the values in plaintext.
+    pub fn with_encryption(self, t: Arc<EncryptionTransformer>) -> Result<Self> {
+        match self {
+            StorageBackend::Etcd(mut s) => {
+                s.set_encryption(t);
+                Ok(StorageBackend::Etcd(s))
+            }
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(mut s) => {
+                s.set_encryption(t);
+                Ok(StorageBackend::Redb(s))
+            }
+            _ => Err(rusternetes_common::Error::Storage(
+                "--encryption-provider-config needs the etcd or redb storage backend".into(),
+            )),
+        }
     }
 }
 
@@ -211,6 +300,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::create(s, key, value).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::create(s, key, value).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::create(s, key, value).await,
             StorageBackend::Memory(s) => Storage::create(s.as_ref(), key, value).await,
         }
     }
@@ -225,6 +316,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::get(s, key).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::get(s, key).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::get(s, key).await,
             StorageBackend::Memory(s) => Storage::get(s.as_ref(), key).await,
         }
     }
@@ -239,6 +332,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::update(s, key, value).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::update(s, key, value).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::update(s, key, value).await,
             StorageBackend::Memory(s) => Storage::update(s.as_ref(), key, value).await,
         }
     }
@@ -250,6 +345,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::update_raw(s, key, value).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::update_raw(s, key, value).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::update_raw(s, key, value).await,
             StorageBackend::Memory(s) => Storage::update_raw(s.as_ref(), key, value).await,
         }
     }
@@ -261,6 +358,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::delete(s, key).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::delete(s, key).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::delete(s, key).await,
             StorageBackend::Memory(s) => Storage::delete(s.as_ref(), key).await,
         }
     }
@@ -275,6 +374,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::list(s, prefix).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::list(s, prefix).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::list(s, prefix).await,
             StorageBackend::Memory(s) => Storage::list(s.as_ref(), prefix).await,
         }
     }
@@ -286,6 +387,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::watch(s, prefix).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::watch(s, prefix).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::watch(s, prefix).await,
             StorageBackend::Memory(s) => Storage::watch(s.as_ref(), prefix).await,
         }
     }
@@ -297,6 +400,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::watch_from_revision(s, prefix, revision).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::watch_from_revision(s, prefix, revision).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::watch_from_revision(s, prefix, revision).await,
             StorageBackend::Memory(s) => {
                 Storage::watch_from_revision(s.as_ref(), prefix, revision).await
             }
@@ -310,6 +415,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::current_revision(s).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::current_revision(s).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::current_revision(s).await,
             StorageBackend::Memory(s) => Storage::current_revision(s.as_ref()).await,
         }
     }
@@ -321,6 +428,8 @@ impl Storage for StorageBackend {
             StorageBackend::Sqlite(s) => Storage::is_revision_compacted(s, revision).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => Storage::is_revision_compacted(s, revision).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => Storage::is_revision_compacted(s, revision).await,
             StorageBackend::Memory(s) => Storage::is_revision_compacted(s.as_ref(), revision).await,
         }
     }
@@ -339,6 +448,8 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Sqlite(s) => AuthzStorage::get(s, key, namespace).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => AuthzStorage::get(s, key, namespace).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => AuthzStorage::get(s, key, namespace).await,
             StorageBackend::Memory(s) => AuthzStorage::get(s.as_ref(), key, namespace).await,
         }
     }
@@ -353,9 +464,94 @@ impl rusternetes_common::authz::AuthzStorage for StorageBackend {
             StorageBackend::Sqlite(s) => AuthzStorage::list(s, namespace).await,
             #[cfg(feature = "redis")]
             StorageBackend::Redis(s) => AuthzStorage::list(s, namespace).await,
+            #[cfg(feature = "redb")]
+            StorageBackend::Redb(s) => AuthzStorage::list(s, namespace).await,
             StorageBackend::Memory(s) => AuthzStorage::list(s.as_ref(), namespace).await,
         }
     }
+}
+
+/// The ConfigMap (kube-system) a re-encrypt pass leaves its census in.
+pub const CENSUS_CONFIGMAP: &str = "rusternetes-encryption-census";
+
+/// What one re-encrypt pass ([`StorageBackend::reencrypt`]) saw and did.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReencryptReport {
+    /// What a write stores now (`aesgcm:<key>`).
+    pub write: String,
+    /// Values of the transformed resources scanned.
+    pub scanned: usize,
+    /// Rewritten under the write provider in this pass.
+    pub rewritten: usize,
+    /// Changed by someone else while this pass read them (the next pass sees them again).
+    pub conflicts: usize,
+    /// How every scanned value is stored after the pass (`aesgcm:k2` -> n, `plaintext` -> n).
+    pub census: std::collections::BTreeMap<String, usize>,
+}
+
+impl ReencryptReport {
+    /// `aesgcm:k2=11 plaintext=1`.
+    pub fn census_line(&self) -> String {
+        self.census
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The census as ConfigMap kube-system/[`CENSUS_CONFIGMAP`]: `write`, `census`, one
+    /// entry per label, `at` and `by` (the control plane that counted).
+    pub fn configmap(&self, by: &str, at: &str) -> serde_json::Value {
+        let mut data = serde_json::Map::new();
+        data.insert("write".into(), self.write.clone().into());
+        data.insert("census".into(), self.census_line().into());
+        for (k, n) in &self.census {
+            data.insert(k.replace(':', "."), n.to_string().into());
+        }
+        data.insert("at".into(), at.into());
+        data.insert("by".into(), by.into());
+        serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": {"name": CENSUS_CONFIGMAP, "namespace": "kube-system"}, "data": data})
+    }
+}
+
+/// Encryption at rest (`--encryption-provider-config`) of a backend: `None`
+/// stores every value as it is.
+pub(crate) type Encryption = Option<Arc<EncryptionTransformer>>;
+
+/// The bytes to store for the serialized value `json` at `key`.
+pub(crate) fn seal(enc: &Encryption, key: &str, json: Vec<u8>) -> Result<Vec<u8>> {
+    match enc {
+        Some(t) if t.applies(key) => t
+            .encode(key, &json)
+            .map_err(|e| rusternetes_common::Error::Storage(format!("encrypting {key}: {e:#}"))),
+        _ => Ok(json),
+    }
+}
+
+/// The serialized value of the bytes stored at `key`.
+pub(crate) fn open<'a>(enc: &Encryption, key: &str, stored: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    match enc {
+        Some(t) => match t.decode_if(key, stored) {
+            Ok(Some(v)) => Ok(Cow::Owned(v)),
+            Ok(None) => Ok(Cow::Borrowed(stored)),
+            Err(e) => Err(rusternetes_common::Error::Storage(format!("decrypting {key}: {e:#}"))),
+        },
+        None if stored.starts_with(rusternetes_common::encryption::ENCRYPTED_PREFIX) => {
+            Err(rusternetes_common::Error::Storage(format!(
+                "{key} is encrypted at rest, but this process runs without --encryption-provider-config"
+            )))
+        }
+        None => Ok(Cow::Borrowed(stored)),
+    }
+}
+
+/// [`open`] as UTF-8 text.
+pub(crate) fn open_str(enc: &Encryption, key: &str, stored: &[u8]) -> Result<String> {
+    let v = open(enc, key, stored)?;
+    String::from_utf8(v.into_owned()).map_err(|e| {
+        rusternetes_common::Error::Storage(format!("Invalid UTF-8 in value at {key}: {e}"))
+    })
 }
 
 /// Helper function to build resource keys

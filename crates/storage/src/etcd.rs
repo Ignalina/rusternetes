@@ -13,26 +13,177 @@ use tracing::{debug, error, info};
 /// cloning the client is cheap and allows fully concurrent access.
 pub struct EtcdStorage {
     client: Client,
+    encryption: crate::Encryption,
 }
 
 impl EtcdStorage {
+    fn connect_options() -> etcd_client::ConnectOptions {
+        etcd_client::ConnectOptions::new()
+            .with_keep_alive(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(3),
+            )
+            .with_keep_alive_while_idle(true)
+    }
+
     /// Create a new EtcdStorage instance
     pub async fn new(endpoints: Vec<String>) -> Result<Self> {
-        let options = Some(
-            etcd_client::ConnectOptions::new()
-                .with_keep_alive(
-                    std::time::Duration::from_secs(10),
-                    std::time::Duration::from_secs(3),
-                )
-                .with_keep_alive_while_idle(true),
+        Self::connect(endpoints, Self::connect_options()).await
+    }
+
+    /// Connect over TLS with a client certificate: every endpoint must be
+    /// `https://` (a plaintext endpoint is refused, not tried).
+    #[cfg(feature = "etcd-tls")]
+    pub async fn new_tls(endpoints: Vec<String>, tls: &crate::EtcdClientTls) -> Result<Self> {
+        if let Some(e) = endpoints.iter().find(|e| !e.starts_with("https://")) {
+            return Err(Error::Storage(format!(
+                "etcd over TLS: the endpoint {e} is not https://"
+            )));
+        }
+        // rustls is built with more than one crypto provider here: name the
+        // process default (the one the API server installs too).
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::aws_lc_rs::default_provider(),
         );
-        let client = Client::connect(endpoints, options)
+        let read = |p: &str| {
+            std::fs::read(p).map_err(|e| Error::Storage(format!("etcd TLS file {p}: {e}")))
+        };
+        let t = etcd_client::TlsOptions::new()
+            .ca_certificate(etcd_client::Certificate::from_pem(read(&tls.ca_file)?))
+            .identity(etcd_client::Identity::from_pem(
+                read(&tls.cert_file)?,
+                read(&tls.key_file)?,
+            ));
+        info!(
+            "Connecting to etcd over TLS (client certificate {})",
+            tls.cert_file
+        );
+        Self::connect(endpoints, Self::connect_options().with_tls(t)).await
+    }
+
+    /// Built without the `etcd-tls` feature: refused, never plaintext.
+    #[cfg(not(feature = "etcd-tls"))]
+    pub async fn new_tls(_endpoints: Vec<String>, _tls: &crate::EtcdClientTls) -> Result<Self> {
+        Err(Error::Storage(
+            "etcd over TLS needs the etcd-tls feature; refusing to connect in plaintext".into(),
+        ))
+    }
+
+    async fn connect(endpoints: Vec<String>, options: etcd_client::ConnectOptions) -> Result<Self> {
+        let client = Client::connect(endpoints, Some(options))
             .await
             .map_err(|e| Error::Storage(format!("Failed to connect to etcd: {}", e)))?;
 
         info!("Connected to etcd successfully");
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            encryption: None,
+        })
+    }
+
+    /// A second handle on the same client, under `t`.
+    pub fn with_encryption(&self, t: std::sync::Arc<crate::EncryptionTransformer>) -> Self {
+        Self {
+            client: self.client.clone(),
+            encryption: Some(t),
+        }
+    }
+
+    /// See [`crate::StorageBackend::reencrypt`].
+    pub async fn reencrypt(&self) -> Result<crate::ReencryptReport> {
+        let mut rep = crate::ReencryptReport::default();
+        let Some(t) = &self.encryption else {
+            return Ok(rep);
+        };
+        let mut client = self.client.clone();
+        for prefix in t.prefixes() {
+            rep.write = t.write_label(&format!("{prefix}x/y"));
+            let mut end = prefix.as_bytes().to_vec();
+            if let Some(last) = end.last_mut() {
+                *last += 1;
+            }
+            let mut from = prefix.as_bytes().to_vec();
+            loop {
+                let resp = client
+                    .get(
+                        from.clone(),
+                        Some(GetOptions::new().with_range(end.clone()).with_limit(500)),
+                    )
+                    .await
+                    .map_err(|e| Error::Storage(format!("re-encrypt: range {prefix}: {e}")))?;
+                for kv in resp.kvs() {
+                    let key = kv
+                        .key_str()
+                        .map_err(|e| Error::Storage(format!("re-encrypt: key: {e}")))?
+                        .to_string();
+                    rep.scanned += 1;
+                    let stored = kv.value();
+                    if t.is_current(&key, stored) {
+                        *rep.census
+                            .entry(crate::EncryptionTransformer::label(stored))
+                            .or_default() += 1;
+                        continue;
+                    }
+                    let new = match t.decode(&key, stored).and_then(|p| t.encode(&key, &p)) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::warn!("re-encrypt: {key}: {e:#}");
+                            *rep.census.entry("unreadable".into()).or_default() += 1;
+                            continue;
+                        }
+                    };
+                    let txn = etcd_client::Txn::new()
+                        .when(vec![Compare::mod_revision(
+                            key.as_str(),
+                            CompareOp::Equal,
+                            kv.mod_revision(),
+                        )])
+                        .and_then(vec![TxnOp::put(key.as_str(), new.clone(), None)]);
+                    let ok = client
+                        .txn(txn)
+                        .await
+                        .map_err(|e| Error::Storage(format!("re-encrypt: {key}: {e}")))?
+                        .succeeded();
+                    if ok {
+                        rep.rewritten += 1;
+                        *rep.census
+                            .entry(crate::EncryptionTransformer::label(&new))
+                            .or_default() += 1;
+                        if rep.rewritten % 100 == 0 {
+                            info!(
+                                "re-encrypt: {} rewritten under {} so far ({} scanned)",
+                                rep.rewritten, rep.write, rep.scanned
+                            );
+                        }
+                    } else {
+                        rep.conflicts += 1;
+                        *rep.census
+                            .entry(crate::EncryptionTransformer::label(stored))
+                            .or_default() += 1;
+                    }
+                }
+                match resp.kvs().last() {
+                    Some(last) if resp.more() => {
+                        from = last.key().to_vec();
+                        from.push(0);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        Ok(rep)
+    }
+
+    /// Encrypt values at rest with `t` (`--encryption-provider-config`).
+    pub fn set_encryption(&mut self, t: std::sync::Arc<crate::EncryptionTransformer>) {
+        self.encryption = Some(t);
+    }
+
+    /// The etcd client (cheap to clone), for leader election on the same
+    /// connection settings (TLS included).
+    pub fn client(&self) -> Client {
+        self.client.clone()
     }
 
     /// Helper to serialize a value to JSON
@@ -90,7 +241,11 @@ impl Storage for EtcdStorage {
         let txn = etcd_client::Txn::new()
             .when(vec![Compare::version(key, CompareOp::Equal, 0)])
             .and_then(vec![
-                TxnOp::put(key, json.clone(), None),
+                TxnOp::put(
+                    key,
+                    crate::seal(&self.encryption, key, json.clone().into_bytes())?,
+                    None,
+                ),
                 TxnOp::get(key, None),
             ])
             .or_else(vec![]);
@@ -136,12 +291,10 @@ impl Storage for EtcdStorage {
             .map_err(|e| Error::Storage(format!("Failed to get resource: {}", e)))?;
 
         if let Some(kv) = resp.kvs().first() {
-            let json = kv
-                .value_str()
-                .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+            let json = crate::open_str(&self.encryption, key, kv.value())?;
 
             let mod_revision = kv.mod_revision();
-            let json_with_rv = Self::inject_resource_version(json, mod_revision);
+            let json_with_rv = Self::inject_resource_version(&json, mod_revision);
             serde_json::from_str(&json_with_rv).map_err(Error::Serialization)
         } else {
             Err(Error::NotFound(key.to_string()))
@@ -178,7 +331,11 @@ impl Storage for EtcdStorage {
                     expected_mod_revision,
                 )])
                 .and_then(vec![
-                    TxnOp::put(key, json.clone(), None),
+                    TxnOp::put(
+                        key,
+                        crate::seal(&self.encryption, key, json.clone().into_bytes())?,
+                        None,
+                    ),
                     TxnOp::get(key, None),
                 ])
                 .or_else(vec![TxnOp::get(key, None)]);
@@ -240,7 +397,11 @@ impl Storage for EtcdStorage {
             }
 
             client
-                .put(key, json.clone(), None)
+                .put(
+                    key,
+                    crate::seal(&self.encryption, key, json.clone().into_bytes())?,
+                    None,
+                )
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
 
@@ -278,7 +439,11 @@ impl Storage for EtcdStorage {
         }
 
         client
-            .put(key, json, None)
+            .put(
+                key,
+                crate::seal(&self.encryption, key, json.into_bytes())?,
+                None,
+            )
             .await
             .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
 
@@ -358,13 +523,17 @@ impl Storage for EtcdStorage {
                     return Ok(results);
                 }
 
-                let json = kv
-                    .value_str()
-                    .map_err(|e| Error::Storage(format!("Invalid UTF-8 in value: {}", e)))?;
+                let json = match crate::open_str(&self.encryption, key_str, kv.value()) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        error!("Failed to read value at {}: {}", key_str, e);
+                        continue;
+                    }
+                };
                 let mod_revision = kv.mod_revision();
 
                 // Inject resourceVersion and deserialize in one step
-                let json_with_rv = Self::inject_resource_version(json, mod_revision);
+                let json_with_rv = Self::inject_resource_version(&json, mod_revision);
                 match serde_json::from_str::<T>(&json_with_rv) {
                     Ok(value) => {
                         results.push(value);
@@ -423,6 +592,7 @@ impl Storage for EtcdStorage {
         // emit all of them — not just the first one.
         // IMPORTANT: Move `watcher` into the closure to keep the watch alive.
         // Dropping it closes the gRPC stream, which terminates the watch.
+        let enc = self.encryption.clone();
         let watch_stream = stream.flat_map(move |watch_resp| {
             let _ = &watcher;
             let events: Vec<Result<WatchEvent>> = match watch_resp {
@@ -434,10 +604,11 @@ impl Storage for EtcdStorage {
                             .unwrap_or_default();
                         match event.event_type() {
                             etcd_client::EventType::Put => {
-                                let raw_value = event
-                                    .kv()
-                                    .map(|kv| String::from_utf8_lossy(kv.value()).to_string())
-                                    .unwrap_or_default();
+                                let raw_value = match event.kv() {
+                                    Some(kv) => crate::open(&enc, &key, kv.value())
+                                        .map(|v| String::from_utf8_lossy(&v).to_string())?,
+                                    None => String::new(),
+                                };
                                 let mod_revision = event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
                                 let value = Self::inject_resource_version(&raw_value, mod_revision);
                                 // Use etcd key version to distinguish create vs update:
@@ -461,7 +632,8 @@ impl Storage for EtcdStorage {
                                 // minimal JSON object with just metadata so watchers
                                 // can still deliver the DELETE event.
                                 let prev_value = if let Some(prev_kv) = event.prev_kv() {
-                                    let raw = String::from_utf8_lossy(prev_kv.value()).to_string();
+                                    let raw = crate::open(&enc, &key, prev_kv.value())
+                                        .map(|v| String::from_utf8_lossy(&v).to_string())?;
                                     Self::inject_resource_version(&raw, mod_revision)
                                 } else {
                                     // Extract name from key: /registry/{type}/{ns}/{name}
@@ -501,6 +673,7 @@ impl Storage for EtcdStorage {
         // Use flat_map to handle multiple events per etcd watch response.
         // IMPORTANT: Move `watcher` into the closure to keep the watch alive.
         // Dropping it closes the gRPC stream, which terminates the watch.
+        let enc = self.encryption.clone();
         let watch_stream = stream.flat_map(move |watch_resp| {
             let _ = &watcher;
             let events: Vec<Result<WatchEvent>> = match watch_resp {
@@ -515,11 +688,10 @@ impl Storage for EtcdStorage {
 
                         match event.event_type() {
                             etcd_client::EventType::Put => {
-                                let raw_value = event
-                                    .kv()
-                                    .and_then(|kv| kv.value_str().ok())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let raw_value = match event.kv() {
+                                    Some(kv) => crate::open_str(&enc, &key, kv.value())?,
+                                    None => String::new(),
+                                };
 
                                 let mod_revision =
                                     event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
@@ -532,11 +704,10 @@ impl Storage for EtcdStorage {
                                 }
                             }
                             etcd_client::EventType::Delete => {
-                                let raw_prev = event
-                                    .prev_kv()
-                                    .and_then(|kv| kv.value_str().ok())
-                                    .unwrap_or("")
-                                    .to_string();
+                                let raw_prev = match event.prev_kv() {
+                                    Some(kv) => crate::open_str(&enc, &key, kv.value())?,
+                                    None => String::new(),
+                                };
                                 let mod_revision =
                                     event.kv().map(|kv| kv.mod_revision()).unwrap_or(0);
                                 let prev_value =

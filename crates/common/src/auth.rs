@@ -9,7 +9,7 @@ use std::collections::HashMap;
 /// Nested kubernetes.io claim in JWT tokens (matches K8s pkg/serviceaccount/claims.go)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KubernetesClaims {
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub namespace: String,
     #[serde(rename = "serviceaccount")]
     pub svcacct: KubeRef,
@@ -22,9 +22,10 @@ pub struct KubernetesClaims {
 /// Name+UID reference used in kubernetes.io JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KubeRef {
-    #[serde(skip_serializing_if = "String::is_empty")]
+    // An empty field is left out when signing, so it must read back as empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub uid: String,
 }
 
@@ -110,8 +111,25 @@ impl ServiceAccountClaims {
 pub struct TokenManager {
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
-    /// Whether we're using RS256 (true) or HS256 (false) signing
-    use_rsa: bool,
+    /// RS256 or ES256 (the cluster's key pair), HS256 (a shared secret)
+    algorithm: Algorithm,
+}
+
+/// The cluster's service-account TokenManager, installed once at start by the
+/// all-in-one binary from `--service-account-signing-key-file` and
+/// `--service-account-key-file`; the API server, the kubelet and the
+/// controller manager in this process sign and check with it.
+static CLUSTER_TOKEN_MANAGER: std::sync::OnceLock<std::sync::Arc<TokenManager>> =
+    std::sync::OnceLock::new();
+
+/// Install the cluster's TokenManager (false: one was already installed).
+pub fn install_cluster_token_manager(tm: std::sync::Arc<TokenManager>) -> bool {
+    CLUSTER_TOKEN_MANAGER.set(tm).is_ok()
+}
+
+/// The cluster's TokenManager, when this process holds the cluster's key.
+pub fn cluster_token_manager() -> Option<std::sync::Arc<TokenManager>> {
+    CLUSTER_TOKEN_MANAGER.get().cloned()
 }
 
 impl TokenManager {
@@ -120,7 +138,7 @@ impl TokenManager {
         Self {
             encoding_key: EncodingKey::from_secret(secret),
             decoding_key: DecodingKey::from_secret(secret),
-            use_rsa: false,
+            algorithm: Algorithm::HS256,
         }
     }
 
@@ -135,7 +153,7 @@ impl TokenManager {
         Ok(Self {
             encoding_key,
             decoding_key,
-            use_rsa: true,
+            algorithm: Algorithm::RS256,
         })
     }
 
@@ -175,13 +193,54 @@ impl TokenManager {
         Self::new(secret)
     }
 
+    /// The cluster's service-account key pair (`--service-account-signing-key-file`,
+    /// `--service-account-key-file`): RSA (RS256) or ECDSA P-256 (ES256) PEM files.
+    pub fn from_key_files(signing_key_file: &str, key_file: &str) -> Result<Self> {
+        let read = |f: &str| {
+            std::fs::read(f).map_err(|e| Error::Internal(format!("service-account key {f}: {e}")))
+        };
+        let (private, public) = (read(signing_key_file)?, read(key_file)?);
+        if let (Ok(encoding_key), Ok(decoding_key)) = (
+            EncodingKey::from_rsa_pem(&private),
+            DecodingKey::from_rsa_pem(&public),
+        ) {
+            return Ok(Self {
+                encoding_key,
+                decoding_key,
+                algorithm: Algorithm::RS256,
+            });
+        }
+        let encoding_key = EncodingKey::from_ec_pem(&private).map_err(|e| {
+            Error::Internal(format!(
+                "{signing_key_file}: neither an RSA nor an ECDSA P-256 private key: {e}"
+            ))
+        })?;
+        let decoding_key = DecodingKey::from_ec_pem(&public).map_err(|e| {
+            Error::Internal(format!(
+                "{key_file}: neither an RSA nor an ECDSA P-256 public key: {e}"
+            ))
+        })?;
+        Ok(Self {
+            encoding_key,
+            decoding_key,
+            algorithm: Algorithm::ES256,
+        })
+    }
+
+    /// A TokenManager with a random HMAC secret: tokens it signs are good in
+    /// this process only. Never the well-known default secret.
+    pub fn new_random() -> Self {
+        let secret = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        Self::new(secret.as_bytes())
+    }
+
     /// Generate a JWT token for a service account
     pub fn generate_token(&self, claims: ServiceAccountClaims) -> Result<String> {
-        let header = if self.use_rsa {
-            Header::new(Algorithm::RS256)
-        } else {
-            Header::default() // HS256
-        };
+        let header = Header::new(self.algorithm);
         encode(&header, &claims, &self.encoding_key)
             .map_err(|e| Error::Internal(format!("Failed to generate token: {}", e)))
     }
@@ -189,11 +248,7 @@ impl TokenManager {
     /// Validate and decode a JWT token
     pub fn validate_token(&self, token: &str) -> Result<ServiceAccountClaims> {
         // First try with standard audience
-        let algo = if self.use_rsa {
-            Algorithm::RS256
-        } else {
-            Algorithm::HS256
-        };
+        let algo = self.algorithm;
         let mut validation = Validation::new(algo);
         validation.set_audience(&["rusternetes"]);
         validation.set_issuer(&[
@@ -225,11 +280,7 @@ impl TokenManager {
         token: &str,
         audiences: &[String],
     ) -> Result<ServiceAccountClaims> {
-        let algo = if self.use_rsa {
-            Algorithm::RS256
-        } else {
-            Algorithm::HS256
-        };
+        let algo = self.algorithm;
         let mut validation = Validation::new(algo);
         if !audiences.is_empty() {
             validation.set_audience(audiences);
@@ -860,6 +911,82 @@ impl WebhookTokenAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A per-cluster ES256 key pair (what `cargo xtask rusternetes pki` writes as sa.key / sa.pub).
+    fn cluster_key_files(dir: &std::path::Path) -> (String, String) {
+        let kp = rcgen::KeyPair::generate().unwrap();
+        let (k, p) = (dir.join("sa.key"), dir.join("sa.pub"));
+        std::fs::write(&k, kp.serialize_pem()).unwrap();
+        std::fs::write(&p, kp.public_key_pem()).unwrap();
+        (k.display().to_string(), p.display().to_string())
+    }
+
+    #[test]
+    fn cluster_key_signs_and_refuses_default_secret_and_unsigned_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, p) = cluster_key_files(dir.path());
+        let tm = TokenManager::from_key_files(&k, &p).unwrap();
+        let claims =
+            ServiceAccountClaims::new("cilium".into(), "kube-system".into(), "u1".into(), 1);
+        let good = tm.generate_token(claims.clone()).unwrap();
+        assert_eq!(
+            tm.validate_token(&good).unwrap().sub,
+            "system:serviceaccount:kube-system:cilium"
+        );
+        // A token signed with the well-known default secret is refused.
+        let forged = TokenManager::new(b"rusternetes-secret-change-in-production")
+            .generate_token(claims.clone())
+            .unwrap();
+        assert!(tm.validate_token(&forged).is_err());
+        // An unsigned token (alg none) is refused.
+        let b64 = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let unsigned = format!(
+            "{}.{}.",
+            b64(br#"{"alg":"none","typ":"JWT"}"#),
+            b64(&serde_json::to_vec(&claims).unwrap())
+        );
+        assert!(tm.validate_token(&unsigned).is_err());
+        // Another cluster's key is refused.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (k2, p2) = cluster_key_files(dir2.path());
+        let other = TokenManager::from_key_files(&k2, &p2).unwrap();
+        assert!(tm
+            .validate_token(&other.generate_token(claims).unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn a_token_for_a_serviceaccount_without_a_uid_validates() {
+        // The controller manager's default ServiceAccounts carry no uid; the
+        // empty uid is left out of the token and must read back.
+        let tm = TokenManager::new_random();
+        let t = tm
+            .generate_token(ServiceAccountClaims::new(
+                "default".into(),
+                "default".into(),
+                String::new(),
+                1,
+            ))
+            .unwrap();
+        assert_eq!(
+            tm.validate_token(&t).unwrap().sub,
+            "system:serviceaccount:default:default"
+        );
+    }
+
+    #[test]
+    fn without_a_key_the_secret_is_random_never_the_default() {
+        let claims = ServiceAccountClaims::new("default".into(), "default".into(), "u".into(), 1);
+        let forged = TokenManager::new(b"rusternetes-secret-change-in-production")
+            .generate_token(claims.clone())
+            .unwrap();
+        let a = TokenManager::new_random();
+        let b = TokenManager::new_random();
+        assert!(a.validate_token(&forged).is_err());
+        assert!(b
+            .validate_token(&a.generate_token(claims).unwrap())
+            .is_err());
+    }
 
     #[test]
     fn test_token_generation_and_validation() {

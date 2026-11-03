@@ -538,26 +538,29 @@ async fn test_field_validation_default_pod_clean_body_accepted() {
 }
 
 #[tokio::test]
-async fn test_field_validation_default_pod_unknown_field_rejected_k8s_1_35() {
+async fn test_field_validation_default_pod_unknown_field_warns() {
+    // No ?fieldValidation= param: the API server's default since 1.23 is
+    // Warn (KEP-2885; kubectl asks Strict explicitly, client-go asks
+    // nothing). The object is accepted and each unknown field comes back
+    // as a `Warning:` header.
     let (_mem, router) = spawn_router();
-    let mut stub = pod_stub("pod-default-strict");
+    let mut stub = pod_stub("pod-default-warn");
     stub["spec"]["bogusField"] = json!("nope");
     let uri = pod_uri();
 
-    let (status, _hdrs, body) = send_json(router, Method::POST, &uri, &stub).await;
+    let (status, headers, body) = send_json(router, Method::POST, &uri, &stub).await;
 
     assert!(
-        status.is_client_error(),
-        "K8s 1.35 default must reject unknown fields without explicit param; \
-         got {}: body={}",
+        status.is_success(),
+        "the default (Warn) must accept unknown fields; got {}: body={}",
         status,
         body
     );
-    let message = body["message"].as_str().unwrap_or_default();
+    let warnings = warning_headers(&headers);
     assert!(
-        message.contains("strict decoding error"),
-        "default rejection should match strict decoder format: {}",
-        message
+        warnings.iter().any(|w| w.contains("bogusField")),
+        "the default must warn about the unknown field: {:?}",
+        warnings
     );
 }
 

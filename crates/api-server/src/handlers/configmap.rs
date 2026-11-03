@@ -38,7 +38,8 @@ pub async fn create(
     let user_for_webhook = auth_ctx.user.clone();
     let attrs = RequestAttributes::new(auth_ctx.user, "create", "configmaps")
         .with_api_group("")
-        .with_namespace(&namespace);
+        .with_namespace(&namespace)
+        .with_name(&configmap.metadata.name);
 
     match state.authorizer.authorize(&attrs).await? {
         Decision::Allow => {}

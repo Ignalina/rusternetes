@@ -105,6 +105,9 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// PEM bytes of the CA, the client certificate and its key, each if configured.
+pub type TlsPem = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+
 impl KubeConfig {
     /// Load kubeconfig from the default location or KUBECONFIG environment variable
     pub fn load_default() -> Result<Self> {
@@ -196,6 +199,35 @@ impl KubeConfig {
         let context = self.get_current_context()?;
         let user = self.get_user(context)?;
         Ok(user.token.clone())
+    }
+
+    /// The TLS material of the current context, PEM: the cluster CA, the
+    /// client certificate and its key (`*-data` inline, or the file the
+    /// plain field names).
+    pub fn get_tls_pem(&self) -> Result<TlsPem> {
+        use base64::Engine as _;
+        let context = self.get_current_context()?;
+        let cluster = self.get_cluster(context)?;
+        let user = self.get_user(context)?;
+        let pick = |data: &Option<String>, file: &Option<String>| -> Result<Option<Vec<u8>>> {
+            if let Some(d) = data {
+                return Ok(Some(
+                    base64::engine::general_purpose::STANDARD.decode(d.trim())?,
+                ));
+            }
+            if let Some(f) = file {
+                return Ok(Some(std::fs::read(f)?));
+            }
+            Ok(None)
+        };
+        Ok((
+            pick(
+                &cluster.certificate_authority_data,
+                &cluster.certificate_authority,
+            )?,
+            pick(&user.client_certificate_data, &user.client_certificate)?,
+            pick(&user.client_key_data, &user.client_key)?,
+        ))
     }
 
     /// Get client certificate data if available (base64 encoded)

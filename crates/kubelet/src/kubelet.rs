@@ -42,6 +42,8 @@ pub enum PodWorkerState {
 
 pub struct Kubelet {
     node_name: String,
+    /// `--pod-cidr`: the Node's `spec.podCIDR`.
+    pod_cidr: Option<String>,
     storage: Arc<StorageBackend>,
     runtime: Arc<ContainerRuntime>,
     sync_interval: Duration,
@@ -61,6 +63,58 @@ pub struct Kubelet {
     /// When a watch event arrives for a pod, we signal its channel to
     /// trigger an immediate reconciliation without a full sync_loop.
     pod_workers: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
+    /// Back-off between failed starts of a pending pod.
+    start_backoff: Mutex<StartBackoff>,
+}
+
+/// Back-off between failed starts of a pending pod: 5 s, doubling, at most
+/// 5 min (the upstream kubelet's cap); a changed pod spec (the cause
+/// fixed, e.g. a new image) starts again at once. Without it a pod whose
+/// start fails was tried again on every sync and every watch event.
+#[derive(Default)]
+pub(crate) struct StartBackoff {
+    /// By pod UID: (spec hash, failures, not before).
+    entries: HashMap<String, (u64, u32, std::time::Instant)>,
+}
+
+impl StartBackoff {
+    const BASE: Duration = Duration::from_secs(5);
+    const MAX: Duration = Duration::from_secs(300);
+
+    /// A hash of the pod's spec.
+    pub(crate) fn spec_hash(pod: &Pod) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_string(&pod.spec)
+            .unwrap_or_default()
+            .hash(&mut h);
+        h.finish()
+    }
+
+    /// The time left before the next try, if the pod is backing off.
+    pub(crate) fn wait(&self, uid: &str, spec: u64, now: std::time::Instant) -> Option<Duration> {
+        match self.entries.get(uid) {
+            Some((h, _, at)) if *h == spec && *at > now => Some(*at - now),
+            _ => None,
+        }
+    }
+
+    /// Record a failed start; returns the delay before the next try.
+    pub(crate) fn failed(&mut self, uid: &str, spec: u64, now: std::time::Instant) -> Duration {
+        let n = match self.entries.get(uid) {
+            Some((h, n, _)) if *h == spec => n + 1,
+            _ => 1,
+        };
+        let delay = Self::BASE
+            .saturating_mul(1u32 << (n - 1).min(16))
+            .min(Self::MAX);
+        self.entries.insert(uid.to_string(), (spec, n, now + delay));
+        delay
+    }
+
+    pub(crate) fn succeeded(&mut self, uid: &str) {
+        self.entries.remove(uid);
+    }
 }
 
 // Kubelet needs Send+Sync for Arc<Kubelet> in spawned tasks
@@ -79,6 +133,12 @@ pub fn pod_status_equal(a: &Pod, b: &Pod) -> bool {
 }
 
 impl Kubelet {
+    /// The container backend this kubelet's runtime drives.
+    #[allow(dead_code)] // used by the library (lib.rs); the kubelet binary compiles this module again
+    pub fn backend(&self) -> Arc<dyn crate::backend::ContainerBackend> {
+        self.runtime.backend().clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         node_name: String,
@@ -112,7 +172,16 @@ impl Kubelet {
             pod_sync_locks: Mutex::new(HashSet::new()),
             recently_deleted: Arc::new(Mutex::new(HashMap::new())),
             pod_workers: Arc::new(Mutex::new(HashMap::new())),
+            start_backoff: Mutex::new(StartBackoff::default()),
+            pod_cidr: None,
         })
+    }
+
+    /// Register the node with this pod CIDR (`spec.podCIDR` + `spec.podCIDRs`).
+    #[allow(dead_code)] // used by the library (lib.rs); the kubelet binary compiles this module again
+    pub fn with_pod_cidr(mut self, pod_cidr: Option<String>) -> Self {
+        self.pod_cidr = pod_cidr.filter(|c| !c.is_empty());
+        self
     }
 
     pub async fn run(self: &Arc<Self>) -> Result<()> {
@@ -120,6 +189,14 @@ impl Kubelet {
 
         // Register the node
         self.register_node().await?;
+
+        // CSI plugin registration (node-driver-registrar sockets).
+        let csi_watcher = self
+            .runtime
+            .csi()
+            .plugin_watcher()
+            .with_csinode(self.storage.clone(), self.node_name.clone());
+        tokio::spawn(csi_watcher.run(Duration::from_secs(2)));
 
         // Startup cleanup: immediately remove any containers from previous runs
         // that don't correspond to pods in etcd. K8s kubelet does a full
@@ -389,8 +466,8 @@ impl Kubelet {
 
         // Set node spec to mark it as schedulable
         node.spec = Some(NodeSpec {
-            pod_cidr: None,
-            pod_cidrs: None,
+            pod_cidr: self.pod_cidr.clone(),
+            pod_cidrs: self.pod_cidr.clone().map(|c| vec![c]),
             provider_id: None,
             unschedulable: Some(false),
             taints: None,
@@ -428,19 +505,7 @@ impl Kubelet {
                     address: self.node_name.clone(),
                 },
             ]),
-            node_info: Some(rusternetes_common::resources::NodeSystemInfo {
-                machine_id: format!("rusternetes-{}", self.node_name),
-                system_uuid: format!("rusternetes-{}", self.node_name),
-                boot_id: format!("rusternetes-{}", self.node_name),
-                kernel_version: "6.1.0-rusternetes".to_string(),
-                os_image: "Rusternetes OS".to_string(),
-                container_runtime_version: "containerd://1.7.0".to_string(),
-                kubelet_version: "v1.35.0-rusternetes".to_string(),
-                kube_proxy_version: "v1.35.0-rusternetes".to_string(),
-                operating_system: "linux".to_string(),
-                architecture: "amd64".to_string(),
-                swap: None,
-            }),
+            node_info: Some(node_system_info(&self.node_name)),
             images: None,
             volumes_in_use: None,
             volumes_attached: None,
@@ -479,7 +544,14 @@ impl Kubelet {
     /// Detect the node's internal IP address.
     /// In Docker, resolves the container hostname to get the network IP.
     /// Falls back to 127.0.0.1 if detection fails.
+    /// The node's InternalIP, found once: the `hostname -i` fallback is a
+    /// fork+exec, and this ran on every heartbeat (10 s) and every sync.
     fn detect_internal_ip() -> String {
+        static IP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        IP.get_or_init(Self::detect_internal_ip_uncached).clone()
+    }
+
+    fn detect_internal_ip_uncached() -> String {
         // Try to resolve our own hostname to get the Docker network IP
         if let Ok(hostname) = std::env::var("HOSTNAME") {
             if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname.as_str(), 0u16))
@@ -563,26 +635,9 @@ impl Kubelet {
                     ("ephemeral-storage".to_string(), "100Gi".to_string()),
                 ]));
             }
-            // Ensure nodeInfo is populated (may have been lost during updates)
-            if status
-                .node_info
-                .as_ref()
-                .is_none_or(|ni| ni.machine_id.is_empty())
-            {
-                status.node_info = Some(rusternetes_common::resources::NodeSystemInfo {
-                    machine_id: format!("rusternetes-{}", self.node_name),
-                    system_uuid: format!("rusternetes-{}", self.node_name),
-                    boot_id: format!("rusternetes-{}", self.node_name),
-                    kernel_version: "6.1.0-rusternetes".to_string(),
-                    os_image: "Rusternetes OS".to_string(),
-                    container_runtime_version: "containerd://1.7.0".to_string(),
-                    kubelet_version: "v1.35.0-rusternetes".to_string(),
-                    kube_proxy_version: "v1.35.0-rusternetes".to_string(),
-                    operating_system: "linux".to_string(),
-                    architecture: "amd64".to_string(),
-                    swap: None,
-                });
-            }
+            // nodeInfo is read from the machine on every status update (a
+            // node upgraded to another kernel or runtime shows it at once).
+            status.node_info = Some(node_system_info(&self.node_name));
         }
 
         // Ensure node addresses are populated (may have failed during initial registration)
@@ -607,6 +662,17 @@ impl Kubelet {
         // Only write to storage if the heartbeat is stale (>10s old) or status changed.
         // This prevents rv churn that causes PATCH conflicts for external node updates.
         let mut needs_write = false;
+        // The node's own facts (RUSTERNETES_NODE_ANNOTATIONS_FILE, a JSON
+        // object of strings that the node's init keeps current) as annotations.
+        if let Some(facts) = node_facts() {
+            let ann = node.metadata.annotations.get_or_insert_with(HashMap::new);
+            for (k, v) in facts {
+                if ann.get(&k) != Some(&v) {
+                    ann.insert(k, v);
+                    needs_write = true;
+                }
+            }
+        }
         if let Some(ref mut status) = node.status {
             if let Some(ref mut conditions) = status.conditions {
                 for condition in conditions.iter_mut() {
@@ -635,6 +701,7 @@ impl Kubelet {
         if needs_write {
             self.storage.update(&key, &node).await?;
         }
+        write_node_status_file(&node);
 
         // Collect and publish node metrics to storage
         self.publish_node_metrics().await;
@@ -1198,14 +1265,16 @@ impl Kubelet {
         let node_name = self.node_name.clone();
 
         tokio::spawn(async move {
+            // The periodic fallback re-sync. While a readiness probe still
+            // has to pass, the worker looks again sooner (readiness_timing),
+            // so Ready is set when the probe passes, not on the next tick.
+            const FALLBACK: Duration = Duration::from_secs(5);
+            let mut next_wait = FALLBACK;
+            let mut fast_attempt = 0u32;
             // Per-pod worker loop — stays alive for the lifetime of the pod
             loop {
                 // Wait for signal (or timeout for periodic re-check)
-                let signaled = tokio::time::timeout(
-                    Duration::from_secs(5), // periodic fallback re-sync
-                    rx.recv(),
-                )
-                .await;
+                let signaled = tokio::time::timeout(next_wait, rx.recv()).await;
 
                 // If channel closed, pod worker is being removed
                 if matches!(signaled, Ok(None)) {
@@ -1239,6 +1308,17 @@ impl Kubelet {
 
                 match pod {
                     Some(pod) => {
+                        next_wait = crate::readiness_timing::readiness_wait(
+                            &pod,
+                            fast_attempt,
+                            FALLBACK,
+                            chrono::Utc::now(),
+                        );
+                        fast_attempt = if next_wait < FALLBACK {
+                            fast_attempt + 1
+                        } else {
+                            0
+                        };
                         // Use a longer timeout for pods being deleted — preStop hooks
                         // plus container stop grace period can exceed 30s.
                         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_container.go:860
@@ -1720,6 +1800,21 @@ impl Kubelet {
         match current_phase {
             // If pod is Pending and has been scheduled to this node, start it
             Phase::Pending if !is_running => {
+                let pod_uid = pod.metadata.uid.clone();
+                let spec_hash = StartBackoff::spec_hash(pod);
+                if let Some(left) = self.start_backoff.lock().unwrap().wait(
+                    &pod_uid,
+                    spec_hash,
+                    std::time::Instant::now(),
+                ) {
+                    debug!(
+                        "Pod {}/{} start backing off ({}s left)",
+                        namespace,
+                        pod_name,
+                        left.as_secs()
+                    );
+                    return Ok(());
+                }
                 // Don't overwrite error status — the test needs to observe it.
                 // For ErrImagePull, skip retry for this sync cycle to prevent
                 // blocking the sync loop with repeated pull failures.
@@ -1885,6 +1980,7 @@ impl Kubelet {
                     Ok(result) => match result {
                         Ok(_) => {
                             info!("Pod {}/{} started successfully", namespace, pod_name);
+                            self.start_backoff.lock().unwrap().succeeded(&pod_uid);
 
                             // Re-fetch the pod from etcd to get the latest resourceVersion.
                             // Between start_pod being called and now, the admission controller or
@@ -1992,6 +2088,17 @@ impl Kubelet {
                         }
                         Err(e) => {
                             let err_msg = e.to_string();
+                            let delay = self.start_backoff.lock().unwrap().failed(
+                                &pod_uid,
+                                spec_hash,
+                                std::time::Instant::now(),
+                            );
+                            info!(
+                                "Pod {}/{} start failed; next try in {}s",
+                                namespace,
+                                pod_name,
+                                delay.as_secs()
+                            );
 
                             // K8s retries volume mounting when secrets/configmaps
                             // aren't available yet. The pod stays Pending with
@@ -2083,6 +2190,7 @@ impl Kubelet {
                                     Ok(p) => p,
                                     _ => pod.clone(),
                                 };
+                                let old_status = fresh_pod.status.clone();
                                 let mut new_pod = fresh_pod;
 
                                 // Build container statuses with the failed container
@@ -2143,10 +2251,21 @@ impl Kubelet {
                                     pod_i_ps: None,
                                     nominated_node_name: None,
                                     qos_class: Some(qos),
-                                    start_time: Some(chrono::Utc::now()),
+                                    // The first attempt's time: a retry that fails the
+                                    // same way writes nothing (each write is a watch
+                                    // event that started the next retry at once).
+                                    start_time: old_status
+                                        .as_ref()
+                                        .and_then(|s| s.start_time)
+                                        .or_else(|| Some(chrono::Utc::now())),
                                 });
 
-                                if let Err(e) = self.storage.update(&key, &new_pod).await {
+                                if same_status(old_status.as_ref(), new_pod.status.as_ref()) {
+                                    debug!(
+                                        "pod {}/{}: the same container error again, status unchanged",
+                                        namespace, pod_name
+                                    );
+                                } else if let Err(e) = self.storage.update(&key, &new_pod).await {
                                     warn!(
                                     "Failed to update pod {}/{} status to container error: {}, retrying",
                                     namespace, pod_name, e
@@ -4010,7 +4129,7 @@ impl Kubelet {
             .collect();
 
         // Get pod resource usage statistics
-        let pod_stats = get_pod_stats(&node_pods).await;
+        let pod_stats = get_pod_stats(self.runtime.backend().as_ref(), &node_pods).await;
 
         // For each active signal, select pods for eviction
         for signal in signals {
@@ -4071,6 +4190,104 @@ impl Kubelet {
         }
 
         Ok(())
+    }
+}
+
+/// The node's facts for its annotations: the JSON object (string values) in
+/// the file `RUSTERNETES_NODE_ANNOTATIONS_FILE` names; `None` without one.
+fn node_facts() -> Option<Vec<(String, String)>> {
+    let path = std::env::var("RUSTERNETES_NODE_ANNOTATIONS_FILE")
+        .ok()
+        .filter(|p| !p.is_empty())?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(
+        v.as_object()?
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+            .collect(),
+    )
+}
+
+/// After each status round the kubelet posted: `ready=<the Ready condition's
+/// status>`, `unschedulable=<bool>` and `at=<unix seconds>` into the file
+/// `RUSTERNETES_NODE_STATUS_FILE` names (the node's console reads it).
+fn write_node_status_file(node: &Node) {
+    let Ok(path) = std::env::var("RUSTERNETES_NODE_STATUS_FILE") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let ready = node
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .and_then(|c| c.iter().find(|c| c.condition_type == "Ready"))
+        .map_or("Unknown", |c| c.status.as_str());
+    let unsched = node
+        .spec
+        .as_ref()
+        .and_then(|s| s.unschedulable)
+        .unwrap_or(false);
+    let text = format!(
+        "ready={ready}\nunschedulable={unsched}\nat={}\n",
+        chrono::Utc::now().timestamp()
+    );
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// The Node's `status.nodeInfo`, read from the machine (upstream: cAdvisor's
+/// machine info and the container runtime's version): the kernel release
+/// (`uname -r`), the boot id, the machine id, the OS image
+/// (`KUBELET_OS_IMAGE`, else `/etc/os-release`'s PRETTY_NAME), the
+/// container runtime (`youki://<libcontainer version>` with the youki
+/// backend) and the architecture.
+pub fn node_system_info(node_name: &str) -> rusternetes_common::resources::NodeSystemInfo {
+    let read = |p: &str| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let os_image = std::env::var("KUBELET_OS_IMAGE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            read("/etc/os-release").and_then(|r| {
+                r.lines()
+                    .find_map(|l| l.strip_prefix("PRETTY_NAME="))
+                    .map(|v| v.trim_matches('"').to_string())
+            })
+        })
+        .unwrap_or_else(|| "Linux".to_string());
+    let runtime = if std::env::var("KUBELET_CONTAINER_BACKEND").as_deref() == Ok("youki") {
+        format!("youki://{}", env!("RUSTERNETES_YOUKI_VERSION"))
+    } else {
+        "docker://unknown".to_string()
+    };
+    let architecture = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    rusternetes_common::resources::NodeSystemInfo {
+        machine_id: read("/etc/machine-id").unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        system_uuid: read("/sys/class/dmi/id/product_uuid")
+            .unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        boot_id: read("/proc/sys/kernel/random/boot_id")
+            .unwrap_or_else(|| format!("rusternetes-{node_name}")),
+        kernel_version: read("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".to_string()),
+        os_image,
+        container_runtime_version: runtime,
+        kubelet_version: "v1.35.0-rusternetes".to_string(),
+        kube_proxy_version: "v1.35.0-rusternetes".to_string(),
+        operating_system: std::env::consts::OS.to_string(),
+        architecture: architecture.to_string(),
+        swap: None,
     }
 }
 
@@ -4667,5 +4884,88 @@ mod tests {
         // Step 3: Kubelet completes resize, sets to ""
         pod.status.as_mut().unwrap().resize = Some(String::new());
         assert_eq!(pod.status.as_ref().unwrap().resize.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn node_info_is_read_from_the_machine() {
+        let i = super::node_system_info("n1");
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        assert_eq!(i.kernel_version, release.trim(), "uname -r");
+        assert_ne!(i.kernel_version, "6.1.0-rusternetes");
+        assert!(!i
+            .container_runtime_version
+            .starts_with("containerd://1.7.0"));
+        assert!(!env!("RUSTERNETES_YOUKI_VERSION").is_empty());
+        assert_eq!(i.operating_system, "linux");
+    }
+}
+
+/// Two pod statuses are the same as the API would serve them.
+fn same_status(a: Option<&PodStatus>, b: Option<&PodStatus>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod same_status_tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_container_error_is_the_same_status_and_a_new_one_is_not() {
+        let st = |msg: &str| PodStatus {
+            phase: Some(Phase::Pending),
+            message: Some(msg.to_string()),
+            reason: Some("CreateContainerError".into()),
+            ..Default::default()
+        };
+        assert!(same_status(Some(&st("a")), Some(&st("a"))));
+        assert!(!same_status(Some(&st("a")), Some(&st("b"))));
+        assert!(!same_status(None, Some(&st("a"))));
+    }
+}
+
+#[cfg(test)]
+mod start_backoff_tests {
+    use super::StartBackoff;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn failed_starts_back_off_doubling_to_five_minutes() {
+        let mut b = StartBackoff::default();
+        let t = Instant::now();
+        assert_eq!(b.wait("u", 1, t), None, "a new pod starts at once");
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(5));
+        assert_eq!(
+            b.wait("u", 1, t + Duration::from_secs(4)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(b.wait("u", 1, t + Duration::from_secs(5)), None);
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(10));
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(20));
+        for _ in 0..20 {
+            b.failed("u", 1, t);
+        }
+        assert_eq!(b.failed("u", 1, t), Duration::from_secs(300));
+        assert_eq!(b.wait("other", 1, t), None, "per pod");
+    }
+
+    #[test]
+    fn a_changed_spec_or_a_success_starts_over() {
+        let mut b = StartBackoff::default();
+        let t = Instant::now();
+        b.failed("u", 1, t);
+        b.failed("u", 1, t);
+        assert_eq!(
+            b.wait("u", 2, t),
+            None,
+            "the cause fixed in the spec: try now"
+        );
+        assert_eq!(b.failed("u", 2, t), Duration::from_secs(5));
+        b.succeeded("u");
+        assert_eq!(b.wait("u", 2, t), None);
+        assert_eq!(b.failed("u", 2, t), Duration::from_secs(5));
     }
 }

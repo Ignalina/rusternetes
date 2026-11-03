@@ -1,4 +1,5 @@
 use crate::client::{ApiClient, GetError};
+use crate::printers;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::StreamExt;
@@ -441,6 +442,21 @@ pub async fn execute_with_query(
         .transpose()?
         .unwrap_or(OutputFormat::Table);
 
+    if let Some(kind) = printers::Kind::parse(resource_type) {
+        return print_kind(
+            client,
+            kind,
+            name,
+            namespace,
+            &format,
+            no_headers,
+            query,
+            show_labels,
+            sort_by,
+        )
+        .await;
+    }
+
     // Helper macro to reduce code duplication
     macro_rules! get_resources {
         ($path:expr, $type:ty, $print_fn:expr) => {{
@@ -574,6 +590,104 @@ pub async fn execute_with_query(
         }
     }
 
+    Ok(())
+}
+
+/// `get` for the kinds [`printers`] knows: upstream's columns and wording,
+/// `-o wide|yaml|json|name|jsonpath`, `-A` (NAMESPACE column).
+#[allow(clippy::too_many_arguments)]
+async fn print_kind(
+    client: &ApiClient,
+    kind: printers::Kind,
+    name: Option<&str>,
+    namespace: Option<&str>,
+    format: &OutputFormat,
+    no_headers: bool,
+    query: &str,
+    show_labels: bool,
+    sort_by: Option<&str>,
+) -> Result<()> {
+    let base = kind.list_path(namespace);
+    let items: Vec<serde_json::Value> = match name {
+        Some(n) => {
+            let path = format!("{}/{}", base, n);
+            match client.get::<serde_json::Value>(&path).await {
+                Ok(v) => vec![v],
+                Err(GetError::NotFound) => {
+                    let plural = base.rsplit('/').next().unwrap_or("");
+                    let group = if kind == printers::Kind::Deployment {
+                        ".apps"
+                    } else {
+                        ""
+                    };
+                    anyhow::bail!(
+                        "Error from server (NotFound): {}{} \"{}\" not found",
+                        plural,
+                        group,
+                        n
+                    );
+                }
+                Err(e) => return Err(map_get_error(e)),
+            }
+        }
+        None => {
+            let list: serde_json::Value = client
+                .get(&format!("{}{}", base, query))
+                .await
+                .map_err(map_get_error)?;
+            let mut items = list["items"].as_array().cloned().unwrap_or_default();
+            if let Some(expr) = sort_by {
+                sort_by_jsonpath(&mut items, expr);
+            }
+            items
+        }
+    };
+    let api_version = kind.api_version();
+    let with_type = |mut o: serde_json::Value| {
+        if let Some(m) = o.as_object_mut() {
+            m.entry("kind").or_insert_with(|| kind.kind_name().into());
+            m.entry("apiVersion").or_insert_with(|| api_version.into());
+        }
+        o
+    };
+    match format {
+        OutputFormat::Table | OutputFormat::Wide => {
+            if items.is_empty() {
+                eprintln!("{}", printers::no_resources(kind, namespace));
+                return Ok(());
+            }
+            let opts = printers::PrintOptions {
+                wide: *format == OutputFormat::Wide,
+                show_labels,
+                with_namespace: namespace.is_none() && kind.namespaced(),
+            };
+            print!(
+                "{}",
+                printers::render(
+                    &printers::table(kind, &items, &opts, Utc::now()),
+                    no_headers
+                )
+            );
+        }
+        OutputFormat::Name => {
+            for o in items {
+                println!("{}", printers::object_ref(&with_type(o)));
+            }
+        }
+        OutputFormat::Json | OutputFormat::Yaml | OutputFormat::JsonPath(_) => {
+            let obj = if name.is_some() {
+                with_type(items.into_iter().next().unwrap_or_default())
+            } else {
+                printers::list_object(kind, &items)
+            };
+            match format {
+                OutputFormat::Json => println!("{}", printers::to_json(&obj)),
+                OutputFormat::Yaml => print!("{}", serde_yaml::to_string(&obj)?),
+                OutputFormat::JsonPath(expr) => print!("{}", evaluate_jsonpath(&obj, expr)?),
+                _ => unreachable!(),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1243,9 +1357,169 @@ pub async fn execute(
                 format_output(&vpas, &format)?;
             }
         }
-        _ => anyhow::bail!("Unknown resource type: {}", resource_type),
+        _ => {
+            return custom_resources(client, resource_type, name, namespace, &format, no_headers)
+                .await
+        }
     }
 
+    Ok(())
+}
+
+/// The CRD serving `rtype` (its plural, singular, kind, a short name, or
+/// `<plural>.<group>`), from a list of CRDs as JSON.
+pub(crate) fn find_crd<'a>(
+    crds: &'a [serde_json::Value],
+    rtype: &str,
+) -> Option<&'a serde_json::Value> {
+    let r = rtype.to_ascii_lowercase();
+    crds.iter().find(|c| {
+        let n = &c["spec"]["names"];
+        let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_ascii_lowercase();
+        let group = s(&c["spec"]["group"]);
+        let plural = s(&n["plural"]);
+        r == plural
+            || r == s(&n["singular"])
+            || r == s(&n["kind"])
+            || r == format!("{plural}.{group}")
+            || n["shortNames"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|x| s(x) == r))
+    })
+}
+
+/// A server Table as kubectl prints it: upper-case headers, priority > 0
+/// columns only with `-o wide`, an empty cell `<none>`.
+pub(crate) fn table_from_server(t: &serde_json::Value, wide: bool) -> printers::Table {
+    let defs = t["columnDefinitions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let keep: Vec<usize> = defs
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| wide || d["priority"].as_i64().unwrap_or(0) == 0)
+        .map(|(i, _)| i)
+        .collect();
+    let headers = keep
+        .iter()
+        .map(|i| defs[*i]["name"].as_str().unwrap_or("").to_ascii_uppercase())
+        .collect();
+    let rows = t["rows"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    keep.iter()
+                        .map(|i| match &r["cells"][*i] {
+                            serde_json::Value::Null => "<none>".to_string(),
+                            serde_json::Value::String(s) if s.is_empty() => "<none>".to_string(),
+                            serde_json::Value::String(s) => s.clone(),
+                            v => v.to_string(),
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    printers::Table { headers, rows }
+}
+
+/// `get` for a custom resource: the CRD found by any of its names, the
+/// server's Table for the table formats, the objects for the others.
+async fn custom_resources(
+    client: &ApiClient,
+    rtype: &str,
+    name: Option<&str>,
+    namespace: Option<&str>,
+    format: &OutputFormat,
+    no_headers: bool,
+) -> Result<()> {
+    let list: serde_json::Value = client
+        .get("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
+        .await
+        .map_err(map_get_error)?;
+    let crds = list["items"].as_array().cloned().unwrap_or_default();
+    let Some(crd) = find_crd(&crds, rtype) else {
+        anyhow::bail!(
+            "error: the server doesn't have a resource type \"{}\"",
+            rtype
+        );
+    };
+    let group = crd["spec"]["group"].as_str().unwrap_or("");
+    let plural = crd["spec"]["names"]["plural"].as_str().unwrap_or("");
+    let version = crd["spec"]["versions"]
+        .as_array()
+        .and_then(|v| {
+            v.iter()
+                .find(|x| x["storage"] == true)
+                .or_else(|| v.first())
+        })
+        .and_then(|v| v["name"].as_str())
+        .unwrap_or("v1");
+    let namespaced = crd["spec"]["scope"] == "Namespaced";
+    let mut path = format!("/apis/{group}/{version}");
+    if namespaced {
+        path.push_str(&format!("/namespaces/{}", namespace.unwrap_or("default")));
+    }
+    path.push_str(&format!("/{plural}"));
+    if let Some(n) = name {
+        path.push_str(&format!("/{n}"));
+    }
+    let not_found = |n: &str| {
+        anyhow::anyhow!("Error from server (NotFound): {plural}.{group} \"{n}\" not found")
+    };
+    match format {
+        OutputFormat::Table | OutputFormat::Wide => {
+            let t = match client.get_table(&path).await {
+                Err(GetError::NotFound) => return Err(not_found(name.unwrap_or(""))),
+                r => r.map_err(map_get_error)?,
+            };
+            if t["rows"].as_array().is_none_or(|r| r.is_empty()) {
+                if namespaced {
+                    eprintln!(
+                        "No resources found in {} namespace.",
+                        namespace.unwrap_or("default")
+                    );
+                } else {
+                    eprintln!("No resources found");
+                }
+                return Ok(());
+            }
+            print!(
+                "{}",
+                printers::render(
+                    &table_from_server(&t, *format == OutputFormat::Wide),
+                    no_headers
+                )
+            );
+        }
+        _ => {
+            let v: serde_json::Value = match client.get(&path).await {
+                Err(GetError::NotFound) => return Err(not_found(name.unwrap_or(""))),
+                r => r.map_err(map_get_error)?,
+            };
+            match format {
+                OutputFormat::Name => {
+                    let kind = crd["spec"]["names"]["kind"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let items = v["items"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| vec![v.clone()]);
+                    for o in items {
+                        println!(
+                            "{kind}.{group}/{}",
+                            o["metadata"]["name"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+                f => format_output(&v, f)?,
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1566,6 +1840,45 @@ fn print_cronjobs(cronjobs: &[CronJob], no_headers: bool, _show_labels: bool) {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn custom_resources_are_found_by_any_name_and_printed_from_the_servers_table() {
+        let crds = vec![
+            serde_json::json!({"spec": {"group": "disks.tunnr.io", "scope": "Cluster",
+            "names": {"plural": "tunnrdisks", "singular": "tunnrdisk", "kind": "TunnrDisk", "shortNames": ["td"]}}}),
+        ];
+        for n in [
+            "tunnrdisks",
+            "tunnrdisk",
+            "TunnrDisk",
+            "td",
+            "tunnrdisks.disks.tunnr.io",
+        ] {
+            assert!(find_crd(&crds, n).is_some(), "{n}");
+        }
+        assert!(find_crd(&crds, "pods").is_none());
+        let t = serde_json::json!({"kind": "Table",
+            "columnDefinitions": [{"name": "Name", "priority": 0}, {"name": "Node", "priority": 0}, {"name": "State", "priority": 0},
+                                  {"name": "Volumes", "priority": 0}, {"name": "Model", "priority": 1}, {"name": "Reason", "priority": 0}],
+            "rows": [{"cells": ["w1.td-drv-a", "w1", "in-use", 1, "QEMU NVMe Ctrl", ""]},
+                     {"cells": ["w3.td-foreign", "w3", "refused", 0, null, "foreign-cluster"]}]});
+        let narrow = table_from_server(&t, false);
+        assert_eq!(
+            narrow.headers,
+            ["NAME", "NODE", "STATE", "VOLUMES", "REASON"]
+        );
+        assert_eq!(
+            narrow.rows[0],
+            ["w1.td-drv-a", "w1", "in-use", "1", "<none>"]
+        );
+        assert_eq!(narrow.rows[1][4], "foreign-cluster");
+        let wide = table_from_server(&t, true);
+        assert_eq!(wide.headers.len(), 6);
+        assert_eq!(wide.rows[1][4], "<none>");
+        let out = printers::render(&narrow, false);
+        assert!(out.starts_with("NAME"), "{out}");
+        assert!(out.lines().nth(2).unwrap().contains("refused"), "{out}");
+    }
 
     #[test]
     fn test_parse_resource_slash_with_name() {

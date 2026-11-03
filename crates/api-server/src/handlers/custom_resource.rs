@@ -175,12 +175,17 @@ pub async fn create_custom_resource(
     validate_custom_resource(&crd, &version, &cr)?;
 
     // Check authorization
+    // With the object's name: a node may create only objects named for it
+    // (node_authz `--node-named-resource`).
     let attrs = if let Some(ref ns) = namespace {
         RequestAttributes::new(auth_ctx.user.clone(), "create", &plural)
             .with_api_group(&group)
             .with_namespace(ns)
+            .with_name(&cr_name)
     } else {
-        RequestAttributes::new(auth_ctx.user.clone(), "create", &plural).with_api_group(&group)
+        RequestAttributes::new(auth_ctx.user.clone(), "create", &plural)
+            .with_api_group(&group)
+            .with_name(&cr_name)
     };
 
     match state.authorizer.authorize(&attrs).await? {
@@ -354,6 +359,7 @@ pub async fn list_custom_resources(
     State(state): State<Arc<ApiServerState>>,
     Extension(auth_ctx): Extension<AuthContext>,
     Path((group, version, plural, namespace)): Path<(String, String, String, Option<String>)>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> Result<Json<List<CustomResource>>> {
     debug!("Listing custom resources {}/{}/{}", group, version, plural);
 
@@ -391,8 +397,19 @@ pub async fn list_custom_resources(
     for cr in &mut crs {
         apply_schema_defaults(&crd, &version, cr);
     }
+    // labelSelector / fieldSelector (metadata.name, metadata.namespace, …),
+    // as for the built-in kinds: an informer on one object (e.g. a node's own
+    // CiliumNode, `fieldSelector=metadata.name=<node>`) must see only it.
+    crate::handlers::filtering::apply_selectors(&mut crs, &params)?;
 
-    let list = List::new("List", "v1", crs);
+    // A custom resource list is `<Kind>List` in the CRD's group/version, as the
+    // upstream apiextensions-apiserver serves it; typed clients (client-go
+    // generated clientsets) refuse a bare `v1 List`.
+    let list = List::new(
+        format!("{}List", crd.spec.names.kind),
+        format!("{}/{}", group, version),
+        crs,
+    );
     Ok(Json(list))
 }
 
@@ -2131,5 +2148,218 @@ mod status_subresource_tests {
         let object = json!({"metadata": {"name": "daemon"}, "status": {"phase": "Ready"}});
         assert_eq!(status_from_object(&object), Some(json!({"phase": "Ready"})));
         assert_eq!(status_from_object(&json!({"metadata": {}})), None);
+    }
+}
+
+// ---- Table (kubectl get) from the CRD's additionalPrinterColumns ----------------------------
+
+/// A duration as upstream's `duration.HumanDuration` prints it.
+pub fn human_duration(secs: i64) -> String {
+    let s = secs.max(0);
+    let (m, h, d) = (s / 60, s / 3600, s / 86400);
+    if s < 120 {
+        format!("{s}s")
+    } else if m < 10 {
+        if s % 60 == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{}s", s % 60)
+        }
+    } else if m < 180 {
+        format!("{m}m")
+    } else if h < 8 {
+        if m % 60 == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{}m", m % 60)
+        }
+    } else if h < 48 {
+        format!("{h}h")
+    } else if h < 192 {
+        if h % 24 == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d{}h", h % 24)
+        }
+    } else if d < 730 {
+        format!("{d}d")
+    } else {
+        format!("{}y", d / 365)
+    }
+}
+
+/// A printer column's simple JSONPath (`.status.a.b`, `{.status.a}`).
+fn column_value(obj: &serde_json::Value, path: &str) -> serde_json::Value {
+    let p = path
+        .trim()
+        .trim_start_matches('{')
+        .trim_end_matches('}')
+        .trim_start_matches('.');
+    let mut at = obj;
+    for part in p.split('.').filter(|s| !s.is_empty()) {
+        let (key, idx) = match part.split_once('[') {
+            Some((k, rest)) => (k, rest.trim_end_matches(']').parse::<usize>().ok()),
+            None => (part, None),
+        };
+        at = match at.get(key) {
+            Some(v) => v,
+            None => return serde_json::Value::Null,
+        };
+        if let Some(i) = idx {
+            at = match at.get(i) {
+                Some(v) => v,
+                None => return serde_json::Value::Null,
+            };
+        }
+    }
+    at.clone()
+}
+
+fn cell(v: serde_json::Value, ty: &str, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    use serde_json::Value;
+    match (ty, v) {
+        (_, Value::Null) => Value::Null,
+        ("date", Value::String(t)) => match chrono::DateTime::parse_from_rfc3339(&t) {
+            Ok(at) => Value::String(human_duration(
+                (now - at.with_timezone(&chrono::Utc)).num_seconds(),
+            )),
+            Err(_) => Value::String(t),
+        },
+        (_, Value::Array(a)) => Value::String(
+            a.iter()
+                .map(|x| {
+                    x.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| x.to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        ("string", Value::Bool(b)) => Value::String(b.to_string()),
+        ("string", Value::Number(n)) => Value::String(n.to_string()),
+        (_, v) => v,
+    }
+}
+
+/// One object or a list of custom resources as a `meta.k8s.io/v1` Table:
+/// `Name`, then the CRD version's `additionalPrinterColumns` (upstream's
+/// default `Age` when it has none), each row with its object's metadata.
+pub fn cr_table(
+    crd: &CustomResourceDefinition,
+    version: &str,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let columns: Vec<Value> = crd
+        .spec
+        .versions
+        .iter()
+        .find(|v| v.name == version)
+        .and_then(|v| v.additional_printer_columns.as_ref())
+        .and_then(|c| serde_json::to_value(c).ok())
+        .and_then(|v| v.as_array().cloned())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| {
+            vec![json!({"name": "Age", "type": "date", "jsonPath": ".metadata.creationTimestamp"})]
+        });
+    let mut defs = vec![
+        json!({"name": "Name", "type": "string", "format": "name", "description": "Name must be unique within a namespace.", "priority": 0}),
+    ];
+    for c in &columns {
+        defs.push(json!({
+            "name": c.get("name").cloned().unwrap_or(Value::Null),
+            "type": c.get("type").cloned().unwrap_or(json!("string")),
+            "format": c.get("format").cloned().unwrap_or(json!("")),
+            "description": c.get("description").cloned().unwrap_or(json!("")),
+            "priority": c.get("priority").cloned().unwrap_or(json!(0)),
+        }));
+    }
+    let items: Vec<Value> = match value.get("items").and_then(Value::as_array) {
+        Some(a) => a.clone(),
+        None => vec![value.clone()],
+    };
+    let now = chrono::Utc::now();
+    let rows: Vec<Value> = items
+        .iter()
+        .map(|o| {
+            let mut cells = vec![o.pointer("/metadata/name").cloned().unwrap_or(Value::Null)];
+            for c in &columns {
+                let ty = c.get("type").and_then(Value::as_str).unwrap_or("string");
+                let path = c.get("jsonPath").and_then(Value::as_str).unwrap_or("");
+                cells.push(cell(column_value(o, path), ty, now));
+            }
+            json!({"cells": cells, "object": {"kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1", "metadata": o.get("metadata").cloned().unwrap_or(json!({}))}})
+        })
+        .collect();
+    json!({
+        "kind": "Table", "apiVersion": "meta.k8s.io/v1",
+        "metadata": {"resourceVersion": value.pointer("/metadata/resourceVersion").cloned().unwrap_or(json!(""))},
+        "columnDefinitions": defs, "rows": rows,
+    })
+}
+
+/// [`cr_table`] for a handler's JSON answer (an error passes unchanged).
+pub async fn table_response(
+    state: &ApiServerState,
+    group: &str,
+    version: &str,
+    plural: &str,
+    resp: axum::response::Response,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !resp.status().is_success() {
+        return resp;
+    }
+    let Ok(crd) = get_crd_for_resource(state, &format!("{plural}.{group}")).await else {
+        return resp;
+    };
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 64 << 20).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(v) => (parts.status, Json(cr_table(&crd, version, &v))).into_response(),
+        Err(_) => axum::response::Response::from_parts(parts, axum::body::Body::from(bytes)),
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+
+    #[test]
+    fn ages_read_like_upstream() {
+        assert_eq!(human_duration(45), "45s");
+        assert_eq!(human_duration(125), "2m5s");
+        assert_eq!(human_duration(3600), "60m");
+        assert_eq!(human_duration(5 * 3600 + 120), "5h2m");
+        assert_eq!(human_duration(30 * 3600), "30h");
+        assert_eq!(human_duration(3 * 86400 + 3600), "3d1h");
+        assert_eq!(human_duration(40 * 86400), "40d");
+        assert_eq!(human_duration(-5), "0s");
+    }
+
+    #[test]
+    fn printer_columns_follow_simple_json_paths() {
+        let o = serde_json::json!({"status": {"a": {"b": true}, "list": ["x", "y"], "arr": [{"n": 1}]}});
+        assert_eq!(column_value(&o, ".status.a.b"), serde_json::json!(true));
+        assert_eq!(column_value(&o, "{.status.arr[0].n}"), serde_json::json!(1));
+        assert_eq!(
+            column_value(&o, ".status.missing.x"),
+            serde_json::Value::Null
+        );
+        let now = chrono::Utc::now();
+        assert_eq!(
+            cell(column_value(&o, ".status.list"), "string", now),
+            serde_json::json!("x,y")
+        );
+        assert_eq!(
+            cell(serde_json::json!(true), "string", now),
+            serde_json::json!("true")
+        );
+        assert_eq!(
+            cell(serde_json::json!(true), "boolean", now),
+            serde_json::json!(true)
+        );
     }
 }

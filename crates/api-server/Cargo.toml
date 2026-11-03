@@ -17,6 +17,7 @@ path = "src/main.rs"
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
+redb = ["rusternetes-storage/redb"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "integration-tests"))'] }
@@ -24,6 +25,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pprof", "
 [dependencies]
 rusternetes-common = { path = "../common", features = ["axum-support"] }
 rusternetes-storage = { path = "../storage" }
+x509-parser = "0.18"
+async-trait.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,6 +38,9 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 axum = { workspace = true, features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# The kubelets' node servers over mutual TLS (kubelet_client.rs).
+rustls.workspace = true
+tokio-rustls.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
@@ -44,7 +50,7 @@ chrono.workspace = true
 futures.workspace = true
 async-stream = "0.3"
 tokio-stream = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 base64 = "0.23"
 openapiv3 = "2.2.0"
 indexmap = "2.14"
@@ -52,7 +58,7 @@ tokio-tungstenite = "0.21"
 bollard.workspace = true
 bytes = "1.5"
 get_if_addrs = "0.5"
-prometheus-http-query = "0.8"
+prometheus-http-query = { version = "0.8", default-features = false, features = ["rustls-tls"] }
 url = "2.5.8"
 cel.workspace = true
 sha2 = "0.11"
@@ -63,6 +69,7 @@ prost-types = "0.13"
 prost-build = "0.13"
 
 [dev-dependencies]
+rcgen.workspace = true
 tokio-test = "0.4"
 rusternetes-controller-manager = { path = "../controller-manager" }
 warp.workspace = true

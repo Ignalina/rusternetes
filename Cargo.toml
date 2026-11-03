@@ -12,6 +12,8 @@ members = [
     "crates/cloud-providers",
     "crates/rusternetes",
 ]
+# vendor/libcontainer: a patched crates.io crate, not a member.
+exclude = ["vendor/libcontainer"]
 
 [workspace.package]
 version = "0.1.0"
@@ -73,3 +75,9 @@ lto = "thin"
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
+
+[patch.crates-io]
+# youki's libcontainer 0.7.0 plus a pure-Rust seccomp backend (feature
+# `seccomp-bpf`: seccompiler + syscalls, no libseccomp C library) and the
+# noNewPrivileges=false fix (node/rtclass; candidate upstream youki PRs).
+libcontainer = { path = "vendor/libcontainer" }

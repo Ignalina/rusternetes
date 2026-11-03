@@ -9,6 +9,14 @@ use rusternetes_controller_manager::controllers::serviceaccount::ServiceAccountC
 use rusternetes_storage::{build_key, memory::MemoryStorage, Storage};
 use std::sync::Arc;
 
+/// The cluster's service-account key in this process (the controller signs
+/// token Secrets with it; without one it makes none).
+fn with_cluster_key() {
+    rusternetes_common::auth::install_cluster_token_manager(Arc::new(
+        rusternetes_common::auth::TokenManager::new_random(),
+    ));
+}
+
 #[tokio::test]
 async fn test_serviceaccount_controller_creation() {
     let storage = Arc::new(MemoryStorage::new());
@@ -17,6 +25,7 @@ async fn test_serviceaccount_controller_creation() {
 
 #[tokio::test]
 async fn test_serviceaccount_creates_default_in_namespace() {
+    with_cluster_key();
     let storage = Arc::new(MemoryStorage::new());
     let controller = ServiceAccountController::new(storage.clone());
 
@@ -157,6 +166,7 @@ async fn test_serviceaccount_does_not_recreate_existing() {
 
 #[tokio::test]
 async fn test_serviceaccount_token_contains_required_fields() {
+    with_cluster_key();
     let storage = Arc::new(MemoryStorage::new());
     let controller = ServiceAccountController::new(storage.clone());
 
@@ -208,9 +218,16 @@ async fn test_serviceaccount_token_contains_required_fields() {
     assert!(data.contains_key("namespace"));
     assert!(data.contains_key("ca.crt"));
 
-    // Token should not be empty
+    // The token is signed with the cluster's key.
     let token = data.get("token").unwrap();
-    assert!(!token.is_empty());
+    let tm = rusternetes_common::auth::cluster_token_manager().unwrap();
+    let claims = tm
+        .validate_token(std::str::from_utf8(token).unwrap())
+        .unwrap();
+    assert_eq!(
+        claims.sub,
+        "system:serviceaccount:test-token-fields:default"
+    );
 
     // Namespace should match
     let namespace_bytes = data.get("namespace").unwrap();

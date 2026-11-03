@@ -9,6 +9,11 @@ license.workspace = true
 name = "kubelet"
 path = "src/main.rs"
 
+[[bin]]
+name = "rusternetes-youki-shim"
+path = "src/bin/youki_shim.rs"
+required-features = ["youki"]
+
 [lib]
 name = "rusternetes_kubelet"
 path = "src/lib.rs"
@@ -17,6 +22,9 @@ path = "src/lib.rs"
 default = []
 sqlite = ["rusternetes-storage/sqlite"]
 redis = ["rusternetes-storage/redis"]
+redb = ["rusternetes-storage/redb"]
+# Daemonless container backend on youki's libcontainer (Linux, root, cgroup v2).
+youki = ["dep:libcontainer", "dep:oci-spec", "dep:nix", "dep:oci-image", "dep:uuid"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
@@ -30,16 +38,41 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 bollard.workspace = true
 chrono.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
+url = "2"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tonic.workspace = true
 prost.workspace = true
+prost-types.workspace = true
 http = "1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+# The node server (:10250) over mutual TLS: a serving certificate from the
+# cluster CA, control-plane client certificates only (serving_tls.rs).
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls.workspace = true
+x509-parser = "0.18"
+tower = { workspace = true, features = ["util"] }
 tar = "0.4"
 sysinfo = "0.32"
+libc = "0.2"
+# seccomp-bpf: securityContext.seccompProfile enforced in pure Rust (vendor/libcontainer).
+libcontainer = { version = "0.7", default-features = false, features = ["v2", "seccomp-bpf"], optional = true }
+oci-spec = { version = "0.10", default-features = false, features = ["runtime"], optional = true }
+nix = { version = "0.29", features = ["mount", "sched", "signal", "process", "net", "fs"], optional = true }
+sha2 = "0.10"
+# The image store: references, digests, one-pass layer unpack (crates.io).
+oci-image = { version = "0.1.0", features = ["pull"], optional = true }
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = "0.24"
+
+[build-dependencies]
+tonic-build = "0.12"

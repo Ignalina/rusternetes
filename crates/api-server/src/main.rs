@@ -1,5 +1,8 @@
 mod admission;
 mod admission_webhook;
+// The library's serve path uses this module; this binary compiles it again.
+#[allow(dead_code)]
+mod authn;
 mod bootstrap;
 mod conversion;
 mod dynamic_routes;
@@ -8,7 +11,13 @@ mod flow_control;
 mod gnostic;
 mod handlers;
 mod ip_allocator;
+// The library's serve path uses this module; this binary compiles it again.
+#[allow(dead_code)]
+mod kubelet_client;
 mod middleware;
+// The library's serve path uses this module; this binary compiles it again.
+#[allow(dead_code)]
+mod node_authz;
 mod openapi;
 mod patch;
 mod prometheus_client;
@@ -50,6 +59,11 @@ struct Args {
     /// Etcd endpoints (comma-separated)
     #[arg(long, default_value = "http://localhost:2379")]
     etcd_servers: String,
+
+    /// Encryption at rest: an EncryptionConfiguration file
+    /// (apiserver.config.k8s.io/v1), as kube-apiserver takes it.
+    #[arg(long)]
+    encryption_provider_config: Option<String>,
 
     /// Log level
     #[arg(long, default_value = "info")]
@@ -124,6 +138,13 @@ async fn main() -> Result<()> {
 
     // Initialize storage
     let storage_config = match args.storage_backend.as_str() {
+        #[cfg(feature = "redb")]
+        "redb" => {
+            info!("Using embedded redb storage at: {}", args.data_dir);
+            StorageConfig::Redb {
+                path: args.data_dir.clone(),
+            }
+        }
         #[cfg(feature = "sqlite")]
         "sqlite" => {
             info!("Using SQLite storage backend at: {}", args.data_dir);
@@ -143,7 +164,14 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let storage = Arc::new(StorageBackend::new(storage_config).await?);
+    let mut backend = StorageBackend::new(storage_config).await?;
+    if let Some(p) = &args.encryption_provider_config {
+        let t = rusternetes_storage::EncryptionTransformer::from_file(p)
+            .map_err(|e| anyhow::anyhow!("--encryption-provider-config {p}: {e:#}"))?;
+        backend = backend.with_encryption(Arc::new(t))?;
+        info!("Encryption at rest on ({})", p);
+    }
+    let storage = Arc::new(backend);
 
     // Initialize TokenManager — prefer RSA keys for RS256 (K8s OIDC compatible),
     // fall back to HMAC HS256 if no RSA keys found.
@@ -203,6 +231,12 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6443);
 
+    if let Err(e) = bootstrap::bootstrap_system_namespaces(storage.clone()).await {
+        warn!(
+            "Failed to bootstrap the system namespaces: {}. Continuing anyway.",
+            e
+        );
+    }
     if let Err(e) = bootstrap::bootstrap_kubernetes_service(storage.clone(), api_port).await {
         warn!(
             "Failed to bootstrap kubernetes Service Endpoints: {}. Continuing anyway.",

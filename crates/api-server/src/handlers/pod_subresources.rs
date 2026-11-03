@@ -190,14 +190,60 @@ pub async fn get_logs(
         )));
     }
 
-    // Get logs from the container runtime
+    // Followed logs of a pod whose runtime this API server cannot reach
+    // stream from its node's kubelet until the container stops.
+    if query.follow && ws.is_none() && !streaming::local_runtime_reachable().await {
+        let addr = streaming::node_kubelet_addr(&state, &pod)
+            .await
+            .map_err(|e| Error::Internal(format!("logs: {}", e)))?;
+        let mut url = format!(
+            "{}://{}/containerLogs/{}/{}/{}?follow=true",
+            crate::kubelet_client::http_scheme(),
+            addr,
+            namespace,
+            name,
+            container_name
+        );
+        if let Some(t) = query.tail_lines {
+            url.push_str(&format!("&tailLines={}", t));
+        }
+        let resp = crate::kubelet_client::http_client(None)
+            .map_err(|e| Error::Internal(format!("logs: {}", e)))?
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("logs from {}: {}", addr, e)))?;
+        if !resp.status().is_success() {
+            return Err(Error::NotFound(format!(
+                "container {} in pod {}/{}: {}",
+                container_name,
+                namespace,
+                name,
+                resp.text().await.unwrap_or_default()
+            )));
+        }
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(Body::from_stream(resp.bytes_stream()))
+            .unwrap());
+    }
+
+    // The container's logs, from the runtime here or from the pod's node.
+    // Neither answering is an error: a made-up log (this used to return
+    // seven canned lines, "Application ready to serve traffic" for a pod
+    // that had failed) is worse than none.
     let logs = match get_container_logs(&pod, &container_name, &query).await {
         Ok(logs) => logs,
-        Err(e) => {
-            info!("Failed to get real container logs, using fallback: {}", e);
-            // Fallback to synthetic logs if container runtime is not available
-            generate_pod_logs(&pod, &container_name, &query)
-        }
+        Err(e) => match get_node_container_logs(&state, &pod, &container_name, &query).await {
+            Ok(logs) => logs,
+            Err(e2) => {
+                return Err(Error::Internal(format!(
+                    "logs of {}/{} container {}: the container runtime: {}; the node: {}",
+                    namespace, name, container_name, e, e2
+                )));
+            }
+        },
     };
 
     // If WebSocket upgrade requested, send logs over WebSocket
@@ -219,6 +265,51 @@ pub async fn get_logs(
             .body(Body::from(logs))
             .unwrap())
     }
+}
+
+/// Logs from the kubelet of the pod's node (`GET http://<InternalIP>:10250/
+/// containerLogs/...`), for a pod whose runtime this API server cannot reach.
+async fn get_node_container_logs(
+    state: &ApiServerState,
+    pod: &rusternetes_common::resources::Pod,
+    container_name: &str,
+    query: &LogsQuery,
+) -> anyhow::Result<String> {
+    let node_name = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.clone())
+        .ok_or_else(|| anyhow::anyhow!("pod is not on a node"))?;
+    let node: rusternetes_common::resources::Node = state
+        .storage
+        .get(&rusternetes_storage::build_key("nodes", None, &node_name))
+        .await?;
+    let ip = node
+        .status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .and_then(|a| a.iter().find(|a| a.address_type == "InternalIP"))
+        .map(|a| a.address.clone())
+        .ok_or_else(|| anyhow::anyhow!("node {} has no InternalIP", node_name))?;
+    let mut url = format!(
+        "{}://{}:10250/containerLogs/{}/{}/{}",
+        crate::kubelet_client::http_scheme(),
+        ip,
+        pod.metadata.namespace.as_deref().unwrap_or("default"),
+        pod.metadata.name,
+        container_name
+    );
+    if let Some(t) = query.tail_lines {
+        url.push_str(&format!("?tailLines={}", t));
+    }
+    let resp = crate::kubelet_client::http_client(Some(std::time::Duration::from_secs(10)))?
+        .get(&url)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("{} answered {}", url, resp.status());
+    }
+    Ok(resp.text().await?)
 }
 
 /// Get real logs from the container runtime
@@ -331,77 +422,6 @@ async fn get_container_logs(
     }
 
     Ok(log_output)
-}
-
-/// Generate synthetic logs for a pod container
-fn generate_pod_logs(
-    pod: &rusternetes_common::resources::Pod,
-    container_name: &str,
-    query: &LogsQuery,
-) -> String {
-    use chrono::Utc;
-
-    let mut lines = vec![];
-
-    // Get pod status phase
-    let phase = pod
-        .status
-        .as_ref()
-        .map(|s| format!("{:?}", s.phase))
-        .unwrap_or_else(|| "Unknown".to_string());
-
-    // Generate log entries
-    let base_time = pod.metadata.creation_timestamp.unwrap_or_else(Utc::now);
-
-    let mut log_lines = vec![
-        format!(
-            "Container {} starting in pod {}",
-            container_name, pod.metadata.name
-        ),
-        format!("Pod phase: {}", phase),
-        format!("Environment initialized"),
-        format!("Starting application process"),
-        format!("Application ready to serve traffic"),
-        format!("Health check passed"),
-        format!("Serving requests"),
-    ];
-
-    // Apply tail_lines if specified
-    if let Some(tail) = query.tail_lines {
-        let tail = tail as usize;
-        if tail < log_lines.len() {
-            log_lines = log_lines.drain(log_lines.len() - tail..).collect();
-        }
-    }
-
-    // Format log lines with timestamps if requested
-    for (i, line) in log_lines.iter().enumerate() {
-        let log_time = base_time + chrono::Duration::seconds(i as i64 * 5);
-
-        let formatted_line = if query.timestamps {
-            format!("{} {}", log_time.to_rfc3339(), line)
-        } else {
-            line.clone()
-        };
-
-        lines.push(formatted_line);
-    }
-
-    let result = if lines.is_empty() {
-        String::new()
-    } else {
-        lines.join("\n")
-    };
-
-    // Apply limit_bytes if specified
-    if let Some(limit) = query.limit_bytes {
-        let limit = limit as usize;
-        if result.len() > limit {
-            return result[..limit].to_string();
-        }
-    }
-
-    result
 }
 
 /// GET/POST /api/v1/namespaces/{namespace}/pods/{name}/exec
@@ -586,6 +606,26 @@ pub async fn exec(
         // use channel 3 for status; v4/v5 do. We need to tell the handler.
         let is_v1_protocol = sec_ws_protocol == "channel.k8s.io"
             || (!sec_ws_protocol.contains("v4.channel") && !sec_ws_protocol.contains("v5.channel"));
+        if !streaming::local_runtime_reachable().await {
+            // No container runtime here: the kubelet of the pod's node runs it.
+            let addr = streaming::node_kubelet_addr(&state, &pod)
+                .await
+                .map_err(|e| Error::Internal(format!("exec: {}", e)))?;
+            let url = streaming::kubelet_stream_url(
+                &addr,
+                "exec",
+                &namespace,
+                &name,
+                &container_name,
+                &query.command,
+                query.stdin,
+                query.tty,
+            );
+            return Ok(ws
+                .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
+                .on_upgrade(move |socket| streaming::proxy_to_kubelet(socket, url, is_v1_protocol))
+                .into_response());
+        }
         return Ok(ws
             .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
             .on_upgrade(move |socket| {
@@ -867,6 +907,30 @@ pub async fn attach(
             "Upgrading attach to WebSocket for pod {}/{}",
             namespace, name
         );
+        if !streaming::local_runtime_reachable().await {
+            let addr = streaming::node_kubelet_addr(&state, &pod)
+                .await
+                .map_err(|e| Error::Internal(format!("attach: {}", e)))?;
+            let url = streaming::kubelet_stream_url(
+                &addr,
+                "attach",
+                &namespace,
+                &name,
+                &container_name,
+                &[],
+                query.stdin,
+                query.tty,
+            );
+            let v1 = req
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok())
+                .is_none_or(|p| !p.contains("v4.channel") && !p.contains("v5.channel"));
+            return Ok(ws
+                .protocols(["v5.channel.k8s.io", "v4.channel.k8s.io", "channel.k8s.io"])
+                .on_upgrade(move |socket| streaming::proxy_to_kubelet(socket, url, v1))
+                .into_response());
+        }
         Ok(ws
             .on_upgrade(move |socket| {
                 streaming::handle_attach_websocket(
