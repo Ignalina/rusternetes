@@ -1,0 +1,137 @@
+{
+  "kind": "Node",
+  "apiVersion": "v1",
+  "metadata": {
+    "name": "worker",
+    "uid": "8a1b2c3d-0000-4000-8000-000000000001",
+    "resourceVersion": "42",
+    "generation": 3,
+    "creationTimestamp": "2026-11-04T10:00:00Z",
+    "labels": {
+      "k8s.ovn.org/zone-name": "worker",
+      "kubernetes.io/hostname": "worker"
+    },
+    "annotations": {
+      "k8s.ovn.org/node-chassis-id": "3f1a",
+      "k8s.ovn.org/node-subnets": "{\"default\":[\"10.244.1.0/24\"]}"
+    },
+    "ownerReferences": [
+      {
+        "apiVersion": "v1",
+        "kind": "Node",
+        "name": "cp",
+        "uid": "u-1",
+        "controller": true
+      }
+    ],
+    "finalizers": [
+      "k8s.ovn.org/f"
+    ]
+  },
+  "spec": {
+    "podCIDR": "10.244.1.0/24",
+    "podCIDRs": [
+      "10.244.1.0/24",
+      "fd00:10:244:1::/64"
+    ],
+    "providerID": "tunnr://worker",
+    "unschedulable": true,
+    "taints": [
+      {
+        "key": "k8s.ovn.org/network-unavailable",
+        "value": "x",
+        "effect": "NoSchedule",
+        "timeAdded": "2026-11-04T10:00:00Z"
+      }
+    ]
+  },
+  "status": {
+    "capacity": {
+      "cpu": "4",
+      "memory": "3Gi",
+      "pods": "110"
+    },
+    "allocatable": {
+      "cpu": "3800m",
+      "memory": "2900Mi"
+    },
+    "phase": "Running",
+    "conditions": [
+      {
+        "type": "Ready",
+        "status": "True",
+        "lastHeartbeatTime": "2026-11-04T10:00:00Z",
+        "lastTransitionTime": "2026-11-04T10:00:00Z",
+        "reason": "KubeletReady",
+        "message": "kubelet is posting ready status"
+      },
+      {
+        "type": "NetworkUnavailable",
+        "status": "False",
+        "lastHeartbeatTime": "2026-11-04T10:00:00Z",
+        "lastTransitionTime": "2026-11-04T10:00:00Z",
+        "reason": "RouteCreated",
+        "message": "ovn"
+      }
+    ],
+    "addresses": [
+      {
+        "type": "InternalIP",
+        "address": "10.0.2.15"
+      },
+      {
+        "type": "Hostname",
+        "address": "worker"
+      }
+    ],
+    "daemonEndpoints": {
+      "kubeletEndpoint": {
+        "Port": 10250
+      }
+    },
+    "nodeInfo": {
+      "machineID": "m",
+      "systemUUID": "s",
+      "bootID": "b",
+      "kernelVersion": "6.12",
+      "osImage": "tunnr",
+      "containerRuntimeVersion": "youki://0.7.0",
+      "kubeletVersion": "v1.35.0",
+      "kubeProxyVersion": "",
+      "operatingSystem": "linux",
+      "architecture": "amd64",
+      "swap": {
+        "capacity": 0
+      }
+    },
+    "images": [
+      {
+        "names": [
+          "ghcr.io/ovn-kubernetes/ovn-kubernetes/ovn-kube-ubuntu:release-1.4"
+        ],
+        "sizeBytes": 982000000
+      }
+    ],
+    "volumesInUse": [
+      "kubernetes.io/csi/x"
+    ],
+    "volumesAttached": [
+      {
+        "name": "kubernetes.io/csi/x",
+        "devicePath": "/dev/vdb"
+      }
+    ],
+    "runtimeHandlers": [
+      {
+        "name": "heimdall",
+        "features": {
+          "recursiveReadOnlyMounts": true,
+          "userNamespaces": false
+        }
+      }
+    ],
+    "features": {
+      "supplementalGroupsPolicy": true
+    }
+  }
+}

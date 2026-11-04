@@ -1,0 +1,34 @@
+{
+  "kind": "Event",
+  "apiVersion": "events.k8s.io/v1",
+  "metadata": {
+    "name": "worker.18a2c",
+    "namespace": "default"
+  },
+  "eventTime": "2026-11-04T10:00:01.123456Z",
+  "series": {
+    "count": 3,
+    "lastObservedTime": "2026-11-04T10:00:01.123456Z"
+  },
+  "reportingController": "ovnkube",
+  "reportingInstance": "worker",
+  "action": "Reconcile",
+  "reason": "Started",
+  "regarding": {
+    "kind": "Node",
+    "name": "worker"
+  },
+  "related": {
+    "kind": "Pod",
+    "name": "p"
+  },
+  "note": "started",
+  "type": "Normal",
+  "deprecatedSource": {
+    "component": "c",
+    "host": "h"
+  },
+  "deprecatedFirstTimestamp": "2026-11-04T10:00:00Z",
+  "deprecatedLastTimestamp": "2026-11-04T10:00:00Z",
+  "deprecatedCount": 1
+}

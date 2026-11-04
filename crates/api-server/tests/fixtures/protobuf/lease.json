@@ -1,0 +1,15 @@
+{
+  "kind": "Lease",
+  "apiVersion": "coordination.k8s.io/v1",
+  "metadata": {
+    "name": "ovn-kubernetes-master",
+    "namespace": "ovn-kubernetes"
+  },
+  "spec": {
+    "holderIdentity": "cp",
+    "leaseDurationSeconds": 137,
+    "acquireTime": "2026-11-04T10:00:01.123456Z",
+    "renewTime": "2026-11-04T10:00:01.123456Z",
+    "leaseTransitions": 1
+  }
+}

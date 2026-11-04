@@ -1,0 +1,39 @@
+{
+  "kind": "Event",
+  "apiVersion": "v1",
+  "metadata": {
+    "name": "worker.18a2b",
+    "namespace": "default"
+  },
+  "involvedObject": {
+    "kind": "Node",
+    "name": "worker",
+    "uid": "u-2",
+    "apiVersion": "v1",
+    "resourceVersion": "41",
+    "fieldPath": "spec"
+  },
+  "reason": "ErrorReconcilingNode",
+  "message": "error creating gateway",
+  "source": {
+    "component": "ovnkube-controller",
+    "host": "worker"
+  },
+  "firstTimestamp": "2026-11-04T10:00:00Z",
+  "lastTimestamp": "2026-11-04T10:00:00Z",
+  "count": 2,
+  "type": "Warning",
+  "eventTime": "2026-11-04T10:00:01.123456Z",
+  "series": {
+    "count": 2,
+    "lastObservedTime": "2026-11-04T10:00:01.123456Z"
+  },
+  "action": "Reconcile",
+  "related": {
+    "kind": "Pod",
+    "namespace": "ovn-kubernetes",
+    "name": "ovnkube-node-x"
+  },
+  "reportingComponent": "ovnkube",
+  "reportingInstance": "worker"
+}
