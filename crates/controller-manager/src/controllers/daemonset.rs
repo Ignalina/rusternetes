@@ -2033,4 +2033,26 @@ mod tests {
             .flatten()
             .any(|v| v.name == "kube-api-access"));
     }
+
+    /// The DaemonSet pod's token volume is the one admission gives every
+    /// other pod: the token, the cluster CA (`kube-root-ca.crt`, key
+    /// `ca.crt`) and the namespace. Without the CA source ovnkube refused
+    /// to start ('TLS-secured apiservers require token/cert and CA
+    /// certificate', R10).
+    #[tokio::test]
+    async fn a_daemonset_pod_token_volume_carries_the_cluster_ca_and_namespace() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        storage.create("/registry/nodes/n1", &make_test_node("n1")).await.unwrap();
+        let mut ds = make_test_daemonset("ca-ds", "default");
+        storage.create("/registry/daemonsets/default/ca-ds", &ds).await.unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let spec = pods[0].spec.as_ref().unwrap();
+        let vol = spec.volumes.iter().flatten().find(|v| v.name == "kube-api-access").unwrap();
+        let sources = vol.projected.as_ref().unwrap().sources.clone().unwrap();
+        assert!(sources.iter().any(|s| s.config_map.as_ref().is_some_and(|c| c.name.as_deref() == Some("kube-root-ca.crt")
+            && c.items.iter().flatten().any(|i| i.key == "ca.crt" && i.path == "ca.crt"))), "{sources:?}");
+        assert!(sources.iter().any(|s| s.downward_api.as_ref().is_some_and(|d| d.items.iter().flatten().any(|i| i.path == "namespace"))), "{sources:?}");
+    }
 }
