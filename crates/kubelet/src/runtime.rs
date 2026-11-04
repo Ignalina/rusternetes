@@ -1482,6 +1482,22 @@ impl ContainerRuntime {
         Ok(())
     }
 
+    /// (Re)create one container of a pod whose sandbox is already up: a
+    /// container missing from the runtime (its create failed during the pod
+    /// start) or one that exited and is restarted. It gets what the pod start
+    /// gives every container: the pod's volume binds (and the injected
+    /// ServiceAccount volume), its /etc/hosts and its sandbox network.
+    pub async fn start_pod_container(
+        &self,
+        pod: &Pod,
+        container: &Container,
+        pod_ip: Option<&str>,
+    ) -> Result<()> {
+        let empty_binds = HashMap::new();
+        self.start_container(pod, container, &empty_binds, None, None, pod_ip)
+            .await
+    }
+
     /// Create /etc/hosts file for a pod.
     ///
     /// Generates a hosts file with:
@@ -12897,5 +12913,62 @@ exit 0
         e.runtime.start_pod(&pod()).await.unwrap();
         assert_eq!(e.log(), vec!["ADD"]);
         assert_eq!(e.held(), (1, 1));
+    }
+
+    /// A pod whose second container failed to be created: the kubelet's
+    /// next sync creates it alone. It must get the pod's volumes, the
+    /// ServiceAccount token, /etc/hosts and the pod's network namespace, as
+    /// its sibling did (R7: the retry ran with only / and resolv.conf).
+    #[tokio::test]
+    async fn a_container_created_after_a_failed_pod_start_gets_the_pod_mounts_and_network() {
+        let e = env().await;
+        let pod: Pod = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": "ns", "uid": "uid-1"},
+            "spec": {
+                "nodeName": "node-1",
+                "volumes": [{"name": "data", "emptyDir": {}}],
+                "containers": [
+                    {"name": "app", "image": "app:1",
+                     "volumeMounts": [{"name": "data", "mountPath": "/data"}]},
+                    {"name": "side", "image": "side:1",
+                     "volumeMounts": [{"name": "data", "mountPath": "/data"}]}
+                ]
+            }
+        }))
+        .unwrap();
+        e.backend.fail_image("side:1", true);
+        assert!(e.runtime.start_pod(&pod).await.is_err(), "side cannot be created");
+        assert!(e.runtime.is_pod_running("web").await.unwrap(), "app runs");
+
+        e.backend.fail_image("side:1", false);
+        let side = pod.spec.as_ref().unwrap().containers[1].clone();
+        e.runtime
+            .start_pod_container(&pod, &side, Some("10.1.0.1"))
+            .await
+            .unwrap();
+
+        let cfg = |n: &str| {
+            e.backend.state.lock().unwrap().containers[n]
+                .config
+                .host_config
+                .clone()
+                .unwrap()
+        };
+        let (app, side) = (cfg("web_app"), cfg("web_side"));
+        let dsts = |b: &Option<Vec<String>>| -> Vec<String> {
+            b.clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|b| b.split(':').nth(1).unwrap_or("").to_string())
+                .collect()
+        };
+        for want in ["/data", "/var/run/secrets/kubernetes.io/serviceaccount", "/etc/hosts"] {
+            assert!(dsts(&app.binds).iter().any(|d| d == want), "app has {want}: {:?}", app.binds);
+            assert!(dsts(&side.binds).iter().any(|d| d == want), "side has {want}: {:?}", side.binds);
+        }
+        assert_eq!(side.network_mode, app.network_mode, "the pod network namespace");
+        assert!(app.network_mode.as_deref().unwrap_or("").starts_with("ns:"));
     }
 }

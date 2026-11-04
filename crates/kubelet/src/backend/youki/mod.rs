@@ -621,6 +621,19 @@ impl Inner {
         }
     }
 
+    /// Start a created container: its init process, parked on the
+    /// container's notify socket, is told to exec the workload.
+    fn start(&self, name: &str) -> Result<()> {
+        let m = self.meta(name)?;
+        let mut c = self.load(&m.name).ok_or_else(|| not_found(name))?;
+        c.start()?;
+        let mut m = m;
+        m.started_at = Some(now_rfc3339());
+        image::write_json(&self.dir(&m.name).join("meta.json"), &m)?;
+        self.index_put(m);
+        Ok(())
+    }
+
     fn cleanup_dir(&self, dir: &Path) {
         let _ = nix::mount::umount2(&dir.join("rootfs"), nix::mount::MntFlags::MNT_DETACH);
         let _ = fs::remove_dir_all(dir);
@@ -914,17 +927,7 @@ impl ContainerBackend for YoukiBackend {
 
     async fn start_container(&self, name: &str) -> Result<()> {
         let name = name.to_string();
-        self.blocking(move |i| {
-            let m = i.meta(&name)?;
-            let mut c = i.load(&m.name).ok_or_else(|| not_found(&name))?;
-            c.start()?;
-            let mut m = m;
-            m.started_at = Some(now_rfc3339());
-            image::write_json(&i.dir(&m.name).join("meta.json"), &m)?;
-            i.index_put(m);
-            Ok(())
-        })
-        .await
+        self.blocking(move |i| i.start(&name)).await
     }
 
     async fn stop_container(&self, name: &str, options: StopContainerOptions) -> Result<()> {
@@ -1319,5 +1322,99 @@ mod tests {
         assert_eq!(shares_to_weight(2), 1);
         assert_eq!(shares_to_weight(1024), 39);
         assert_eq!(shares_to_weight(262144), 10000);
+    }
+
+    /// R7: containers of one pod (and of pods started side by side) are
+    /// started from the kubelet's blocking threads at the same time. Each
+    /// start must reach its own container's notify socket, and none may move
+    /// the kubelet's working directory (libcontainer's start chdirs into the
+    /// container root to connect, process-wide: 'failed to connect to notify
+    /// socket: notify.sock', and a start delivered to another container).
+    #[test]
+    fn concurrent_starts_reach_their_own_container_and_keep_the_cwd() {
+        use libcontainer::config::YoukiConfig as LcConfig;
+        use libcontainer::notify_socket::NotifyListener;
+        let base = tempfile::tempdir().unwrap();
+        let cfg = YoukiConfig {
+            root: base.path().join("root"),
+            state_root: base.path().join("state"),
+            shim: PathBuf::from("/nonexistent-shim"),
+        };
+        let inner = Arc::new(Inner::open(cfg.clone()).unwrap());
+        let cwd = std::env::current_dir().unwrap();
+        const N: usize = 24;
+        for round in 0..6 {
+            let mut listeners = Vec::new();
+            for k in 0..N {
+                let name = format!("p{round}_c{k}");
+                let root = cfg.state_root.join(&name);
+                let bundle = inner.dir(&name);
+                fs::create_dir_all(&root).unwrap();
+                fs::create_dir_all(&bundle).unwrap();
+                let spec = oci_spec::runtime::Spec::default();
+                LcConfig::from_spec(&spec, &name).unwrap().save(&root).unwrap();
+                Container::new(
+                    &name,
+                    ContainerStatus::Created,
+                    Some(std::process::id() as i32),
+                    &bundle,
+                    &root,
+                )
+                .unwrap()
+                .save()
+                .unwrap();
+                listeners.push((name.clone(), NotifyListener::new(&root.join("notify.sock")).unwrap()));
+                inner.index_put(Meta {
+                    id: format!("id-{name}"),
+                    name: name.clone(),
+                    image: "busybox".into(),
+                    image_id: "sha256:0".into(),
+                    created: 0,
+                    started_at: None,
+                    network_mode: None,
+                    config: StoredProcess::default(),
+                    cgroups_path: format!("/rusternetes/{name}"),
+                });
+            }
+            assert_eq!(std::env::current_dir().unwrap(), cwd);
+            let got: Vec<_> = listeners
+                .into_iter()
+                .map(|(name, l)| {
+                    std::thread::spawn(move || {
+                        l.wait_for_container_start().unwrap();
+                        name
+                    })
+                })
+                .collect();
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let starts: Vec<_> = (0..N)
+                .map(|k| {
+                    let (inner, barrier) = (inner.clone(), barrier.clone());
+                    let name = format!("p{round}_c{k}");
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        inner.start(&name).map_err(|e| format!("{name}: {e:#}"))
+                    })
+                })
+                .collect();
+            let errs: Vec<String> = starts
+                .into_iter()
+                .filter_map(|t| t.join().unwrap().err())
+                .collect();
+            assert!(errs.is_empty(), "round {round}: failed starts: {errs:?}");
+            assert_eq!(
+                std::env::current_dir().unwrap(),
+                cwd,
+                "round {round}: a start moved the process working directory"
+            );
+            for t in got {
+                t.join().unwrap();
+            }
+            for k in 0..N {
+                let name = format!("p{round}_c{k}");
+                let c = Container::load(cfg.state_root.join(&name)).unwrap();
+                assert_eq!(c.status(), ContainerStatus::Running, "{name}");
+            }
+        }
     }
 }
