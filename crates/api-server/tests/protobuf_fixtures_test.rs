@@ -14,8 +14,8 @@ use std::path::PathBuf;
 fn fixture(name: &str) -> (Vec<u8>, Value) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/protobuf");
     let pb = std::fs::read(dir.join(format!("{name}.pb"))).unwrap();
-    let json = serde_json::from_slice(&std::fs::read(dir.join(format!("{name}.json"))).unwrap())
-        .unwrap();
+    let json =
+        serde_json::from_slice(&std::fs::read(dir.join(format!("{name}.json"))).unwrap()).unwrap();
     (pb, json)
 }
 

@@ -1374,8 +1374,14 @@ impl ProtoRegistry {
             "VolumeResourceRequirements".into(),
             MessageSchema {
                 fields: HashMap::from([
-                    (1, ("limits".into(), FieldType::StringMap)),
-                    (2, ("requests".into(), FieldType::StringMap)),
+                    (
+                        1,
+                        ("limits".into(), FieldType::MessageMap("Quantity".into())),
+                    ),
+                    (
+                        2,
+                        ("requests".into(), FieldType::MessageMap("Quantity".into())),
+                    ),
                 ]),
             },
         );
@@ -1496,16 +1502,487 @@ impl ProtoRegistry {
                 ]),
             },
         );
+        // ===== R3: generated from k8s.io/api core/v1 + events/v1 generated.proto (ovn-kubernetes v1.4.0 vendor) =====
         schemas.insert(
             "NodeSpec".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (1, ("podCIDR".into(), FieldType::String)),
+                    (
+                        7,
+                        (
+                            "podCIDRs".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (3, ("providerID".into(), FieldType::String)),
+                    (4, ("unschedulable".into(), FieldType::Bool)),
+                    (
+                        5,
+                        (
+                            "taints".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("Taint".into()))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "configSource".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (2, ("externalID".into(), FieldType::String)),
+                ]),
             },
         );
         schemas.insert(
             "NodeStatus".into(),
             MessageSchema {
-                fields: HashMap::new(),
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("capacity".into(), FieldType::MessageMap("Quantity".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "allocatable".into(),
+                            FieldType::MessageMap("Quantity".into()),
+                        ),
+                    ),
+                    (3, ("phase".into(), FieldType::String)),
+                    (
+                        4,
+                        (
+                            "conditions".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeCondition".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        5,
+                        (
+                            "addresses".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message("NodeAddress".into()))),
+                        ),
+                    ),
+                    (
+                        6,
+                        (
+                            "daemonEndpoints".into(),
+                            FieldType::Message("NodeDaemonEndpoints".into()),
+                        ),
+                    ),
+                    (
+                        7,
+                        (
+                            "nodeInfo".into(),
+                            FieldType::Message("NodeSystemInfo".into()),
+                        ),
+                    ),
+                    (
+                        8,
+                        (
+                            "images".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "ContainerImage".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "volumesInUse".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (
+                        10,
+                        (
+                            "volumesAttached".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "AttachedVolume".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        11,
+                        (
+                            "config".into(),
+                            FieldType::Message("NodeConfigStatus".into()),
+                        ),
+                    ),
+                    (
+                        12,
+                        (
+                            "runtimeHandlers".into(),
+                            FieldType::Repeated(Box::new(FieldType::Message(
+                                "NodeRuntimeHandler".into(),
+                            ))),
+                        ),
+                    ),
+                    (
+                        13,
+                        ("features".into(), FieldType::Message("NodeFeatures".into())),
+                    ),
+                    (
+                        14,
+                        (
+                            "declaredFeatures".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "Taint".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("key".into(), FieldType::String)),
+                    (2, ("value".into(), FieldType::String)),
+                    (3, ("effect".into(), FieldType::String)),
+                    (4, ("timeAdded".into(), FieldType::Message("Time".into()))),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeCondition".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("status".into(), FieldType::String)),
+                    (
+                        3,
+                        (
+                            "lastHeartbeatTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (
+                        4,
+                        (
+                            "lastTransitionTime".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (5, ("reason".into(), FieldType::String)),
+                    (6, ("message".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeAddress".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("type".into(), FieldType::String)),
+                    (2, ("address".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeDaemonEndpoints".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    1,
+                    (
+                        "kubeletEndpoint".into(),
+                        FieldType::Message("DaemonEndpoint".into()),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "DaemonEndpoint".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("Port".into(), FieldType::Int))]),
+            },
+        );
+        schemas.insert(
+            "NodeSystemInfo".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("machineID".into(), FieldType::String)),
+                    (2, ("systemUUID".into(), FieldType::String)),
+                    (3, ("bootID".into(), FieldType::String)),
+                    (4, ("kernelVersion".into(), FieldType::String)),
+                    (5, ("osImage".into(), FieldType::String)),
+                    (6, ("containerRuntimeVersion".into(), FieldType::String)),
+                    (7, ("kubeletVersion".into(), FieldType::String)),
+                    (8, ("kubeProxyVersion".into(), FieldType::String)),
+                    (9, ("operatingSystem".into(), FieldType::String)),
+                    (10, ("architecture".into(), FieldType::String)),
+                    (
+                        11,
+                        ("swap".into(), FieldType::Message("NodeSwapStatus".into())),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeSwapStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("capacity".into(), FieldType::Int))]),
+            },
+        );
+        schemas.insert(
+            "ContainerImage".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "names".into(),
+                            FieldType::Repeated(Box::new(FieldType::String)),
+                        ),
+                    ),
+                    (2, ("sizeBytes".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "AttachedVolume".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (2, ("devicePath".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeConfigSource".into(),
+            MessageSchema {
+                fields: HashMap::from([(
+                    2,
+                    (
+                        "configMap".into(),
+                        FieldType::Message("ConfigMapNodeConfigSource".into()),
+                    ),
+                )]),
+            },
+        );
+        schemas.insert(
+            "NodeConfigStatus".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        (
+                            "assigned".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (
+                        2,
+                        (
+                            "active".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (
+                        3,
+                        (
+                            "lastKnownGood".into(),
+                            FieldType::Message("NodeConfigSource".into()),
+                        ),
+                    ),
+                    (4, ("error".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "ConfigMapNodeConfigSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("namespace".into(), FieldType::String)),
+                    (2, ("name".into(), FieldType::String)),
+                    (3, ("uid".into(), FieldType::String)),
+                    (4, ("resourceVersion".into(), FieldType::String)),
+                    (5, ("kubeletConfigKey".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeRuntimeHandler".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("name".into(), FieldType::String)),
+                    (
+                        2,
+                        (
+                            "features".into(),
+                            FieldType::Message("NodeRuntimeHandlerFeatures".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeRuntimeHandlerFeatures".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("recursiveReadOnlyMounts".into(), FieldType::Bool)),
+                    (2, ("userNamespaces".into(), FieldType::Bool)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "NodeFeatures".into(),
+            MessageSchema {
+                fields: HashMap::from([(1, ("supplementalGroupsPolicy".into(), FieldType::Bool))]),
+            },
+        );
+        schemas.insert(
+            "Event".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        (
+                            "involvedObject".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (3, ("reason".into(), FieldType::String)),
+                    (4, ("message".into(), FieldType::String)),
+                    (
+                        5,
+                        ("source".into(), FieldType::Message("EventSource".into())),
+                    ),
+                    (
+                        6,
+                        ("firstTimestamp".into(), FieldType::Message("Time".into())),
+                    ),
+                    (
+                        7,
+                        ("lastTimestamp".into(), FieldType::Message("Time".into())),
+                    ),
+                    (8, ("count".into(), FieldType::Int)),
+                    (9, ("type".into(), FieldType::String)),
+                    (
+                        10,
+                        ("eventTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (
+                        11,
+                        ("series".into(), FieldType::Message("EventSeries".into())),
+                    ),
+                    (12, ("action".into(), FieldType::String)),
+                    (
+                        13,
+                        (
+                            "related".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (14, ("reportingComponent".into(), FieldType::String)),
+                    (15, ("reportingInstance".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EventSource".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("component".into(), FieldType::String)),
+                    (2, ("host".into(), FieldType::String)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "EventSeries".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("count".into(), FieldType::Int)),
+                    (
+                        2,
+                        (
+                            "lastObservedTime".into(),
+                            FieldType::Message("MicroTime".into()),
+                        ),
+                    ),
+                ]),
+            },
+        );
+        schemas.insert(
+            "events.k8s.io/Event".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (
+                        1,
+                        ("metadata".into(), FieldType::Message("ObjectMeta".into())),
+                    ),
+                    (
+                        2,
+                        ("eventTime".into(), FieldType::Message("MicroTime".into())),
+                    ),
+                    (
+                        3,
+                        ("series".into(), FieldType::Message("EventSeries".into())),
+                    ),
+                    (4, ("reportingController".into(), FieldType::String)),
+                    (5, ("reportingInstance".into(), FieldType::String)),
+                    (6, ("action".into(), FieldType::String)),
+                    (7, ("reason".into(), FieldType::String)),
+                    (
+                        8,
+                        (
+                            "regarding".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (
+                        9,
+                        (
+                            "related".into(),
+                            FieldType::Message("ObjectReference".into()),
+                        ),
+                    ),
+                    (10, ("note".into(), FieldType::String)),
+                    (11, ("type".into(), FieldType::String)),
+                    (
+                        12,
+                        (
+                            "deprecatedSource".into(),
+                            FieldType::Message("EventSource".into()),
+                        ),
+                    ),
+                    (
+                        13,
+                        (
+                            "deprecatedFirstTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (
+                        14,
+                        (
+                            "deprecatedLastTimestamp".into(),
+                            FieldType::Message("Time".into()),
+                        ),
+                    ),
+                    (15, ("deprecatedCount".into(), FieldType::Int)),
+                ]),
+            },
+        );
+        schemas.insert(
+            "events.k8s.io/EventSeries".into(),
+            MessageSchema {
+                fields: HashMap::from([
+                    (1, ("count".into(), FieldType::Int)),
+                    (
+                        2,
+                        (
+                            "lastObservedTime".into(),
+                            FieldType::Message("MicroTime".into()),
+                        ),
+                    ),
+                ]),
             },
         );
 
@@ -2016,8 +2493,9 @@ impl ProtoRegistry {
     fn owner_reference_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("apiVersion".into(), FieldType::String)),
-                (2, ("kind".into(), FieldType::String)),
+                // meta/v1 generated.proto: kind = 1, name = 3, uid = 4, apiVersion = 5.
+                (5, ("apiVersion".into(), FieldType::String)),
+                (1, ("kind".into(), FieldType::String)),
                 (3, ("name".into(), FieldType::String)),
                 (4, ("uid".into(), FieldType::String)),
                 (6, ("controller".into(), FieldType::Bool)),
@@ -2446,8 +2924,14 @@ impl ProtoRegistry {
     fn resource_requirements_schema() -> MessageSchema {
         MessageSchema {
             fields: HashMap::from([
-                (1, ("limits".into(), FieldType::StringMap)),
-                (2, ("requests".into(), FieldType::StringMap)),
+                (
+                    1,
+                    ("limits".into(), FieldType::MessageMap("Quantity".into())),
+                ),
+                (
+                    2,
+                    ("requests".into(), FieldType::MessageMap("Quantity".into())),
+                ),
                 (
                     3,
                     (
@@ -2834,6 +3318,10 @@ impl ProtoRegistry {
                     // MicroTime is the same Timestamp proto, RFC3339 with microseconds
                     return decode_micro_timestamp(data);
                 }
+                if msg_type == "Quantity" {
+                    // resource.Quantity { optional string string = 1 }: JSON is the string.
+                    return decode_quantity(data);
+                }
                 match self.decode_message(msg_type, data) {
                     Some(v) => v,
                     None => {
@@ -2959,9 +3447,10 @@ impl ProtoRegistry {
                         key = String::from_utf8_lossy(&data[pos..pos + len]).to_string();
                     }
                     2 => {
-                        val = self
-                            .decode_message(msg_type, &data[pos..pos + len])
-                            .unwrap_or(Value::Null);
+                        val = self.decode_field_value(
+                            &FieldType::Message(msg_type.to_string()),
+                            &data[pos..pos + len],
+                        );
                     }
                     _ => {}
                 }
@@ -3071,8 +3560,15 @@ impl ProtoRegistry {
             return Some(raw.to_vec());
         }
 
-        // Look up the schema for this kind
-        if let Some(json_obj) = self.decode_message(&kind, raw) {
+        // Look up the schema for this kind: `<group>/<kind>` first (an
+        // events.k8s.io Event is not a core Event), then the kind.
+        let grouped = api_version
+            .rsplit_once('/')
+            .map(|(group, _)| format!("{group}/{kind}"));
+        let decoded = grouped
+            .and_then(|g| self.decode_message(&g, raw))
+            .or_else(|| self.decode_message(&kind, raw));
+        if let Some(json_obj) = decoded {
             // Add apiVersion and kind to the JSON
             let result = match json_obj {
                 Value::Object(m) => {
@@ -3173,6 +3669,30 @@ fn decode_map_entry_bytes(data: &[u8]) -> (String, Vec<u8>) {
         }
     }
     (key, val)
+}
+
+/// Decode a `resource.Quantity` message (field 1 = its canonical string).
+fn decode_quantity(data: &[u8]) -> Value {
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some((tag, p)) = read_varint(data, pos) else {
+            break;
+        };
+        pos = p;
+        if tag & 0x07 != WIRE_LENGTH_DELIMITED as u64 {
+            break;
+        }
+        let Some((len, p)) = read_varint(data, pos) else {
+            break;
+        };
+        pos = p;
+        let end = pos.saturating_add(len as usize).min(data.len());
+        if tag >> 3 == 1 {
+            return Value::String(String::from_utf8_lossy(&data[pos..end]).into_owned());
+        }
+        pos = end;
+    }
+    Value::String("0".into())
 }
 
 /// Decode a K8s Timestamp protobuf to RFC3339 string
