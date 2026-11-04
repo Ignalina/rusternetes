@@ -12732,6 +12732,7 @@ ADD)
   printf '{"cniVersion":"1.0.0","interfaces":[{"name":"eth0","sandbox":"%s"}],"ips":[{"address":"10.1.0.%s/24","interface":0}]}' "$CNI_NETNS" "$i"
   ;;
 DEL)
+  echo "$CNI_ARGS" >> "$d/del-args"
   for f in "$d"/ip-*; do [ -e "$f" ] && [ "$(cat "$f")" = "$id" ] && rm -f "$f"; done
   rm -f "$d/ep-$id" "$CNI_NETNS/eth0"
   echo "DEL $id" >> "$d/log"
@@ -13063,5 +13064,40 @@ exit 0
             "the pod network namespace"
         );
         assert!(app.network_mode.as_deref().unwrap_or("").starts_with("ns:"));
+    }
+
+    /// CNI DEL carries the same `CNI_ARGS` as ADD, as the CRI runtimes pass
+    /// them: ovn-kubernetes refuses a DEL without K8S_POD_NAMESPACE and
+    /// K8S_POD_NAME ('missing CNI_ARGS'), its port then outlives the pod and a
+    /// pod recreated under that name has no traffic (lane OVN-BENCH, media ob3).
+    #[tokio::test]
+    async fn cni_del_carries_the_pods_cni_args() {
+        let e = env().await;
+        e.runtime.start_pod(&pod()).await.unwrap();
+        e.runtime.stop_and_remove_pod("web").await.unwrap();
+        let args = std::fs::read_to_string(e.state().join("del-args")).unwrap();
+        assert!(
+            args.contains("K8S_POD_NAMESPACE=ns;K8S_POD_NAME=web"),
+            "the DEL of a stopped pod: {args:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_del_after_a_failed_add_and_of_a_stale_network_carry_cni_args() {
+        let e = env().await;
+        std::fs::create_dir_all(e.state()).unwrap();
+        std::fs::write(e.state().join("fail-add"), "").unwrap();
+        assert!(e.runtime.start_pod(&pod()).await.is_err());
+        std::fs::remove_file(e.state().join("fail-add")).unwrap();
+        let args = std::fs::read_to_string(e.state().join("del-args")).unwrap();
+        assert!(args.contains("K8S_POD_NAME=web"), "after a failed ADD: {args:?}");
+
+        std::fs::remove_file(e.state().join("del-args")).unwrap();
+        e.runtime.start_pod(&pod()).await.unwrap();
+        // A new kubelet process: the old network is stale, its args not remembered.
+        let (fresh, _v) = runtime(&e.root, Arc::new(FakeBackend::new("fake"))).await;
+        fresh.start_pod(&pod()).await.unwrap();
+        let args = std::fs::read_to_string(e.state().join("del-args")).unwrap();
+        assert!(args.contains("K8S_POD_NAME=web"), "of a stale network: {args:?}");
     }
 }
