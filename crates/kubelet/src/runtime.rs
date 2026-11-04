@@ -88,6 +88,14 @@ enum NetnsProbe {
 }
 
 /// ContainerRuntime manages containers using Docker/Podman with CNI networking
+/// The mounts and network a pod start gave the pod's containers.
+#[derive(Debug, Clone, Default)]
+struct PodSandbox {
+    binds: HashMap<String, String>,
+    hosts: Option<String>,
+    netns: Option<String>,
+}
+
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
     storage: Option<Arc<rusternetes_storage::StorageBackend>>,
@@ -122,6 +130,10 @@ pub struct ContainerRuntime {
     /// the node's network namespace, get no CNI attachment, and their pod IP
     /// is the node's address.
     host_network_pods: Mutex<std::collections::HashSet<String>>,
+    /// What the pod start gave each pod's containers (volume binds, /etc/hosts,
+    /// sandbox network), by pod name: a container created or restarted
+    /// later gets the same (R7).
+    pod_sandboxes: Mutex<HashMap<String, PodSandbox>>,
     /// Where pod network namespaces are made (`/var/run/netns` on a node).
     netns: Arc<dyn NetnsOps>,
 }
@@ -336,7 +348,7 @@ impl ContainerRuntime {
         info!("Kubernetes service host: {}", kubernetes_service_host);
 
         // Initialize CNI if plugins are available
-        let (cni, use_cni) = match Self::initialize_cni(backend.joins_kubelet_netns()) {
+        let (cni, use_cni) = match Self::initialize_cni(backend.joins_kubelet_netns(), &network) {
             Ok(cni_runtime) => {
                 info!("CNI networking enabled");
                 (Some(cni_runtime), true)
@@ -382,6 +394,7 @@ impl ContainerRuntime {
             starting_containers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             csi: Arc::new(crate::csi::CsiManager::from_env()),
             host_network_pods: Mutex::new(std::collections::HashSet::new()),
+            pod_sandboxes: Mutex::new(HashMap::new()),
             netns: Arc::new(HostNetns),
         })
     }
@@ -479,7 +492,7 @@ impl ContainerRuntime {
     }
 
     /// Initialize CNI runtime
-    fn initialize_cni(backend_joins_kubelet_netns: bool) -> Result<CniRuntime> {
+    fn initialize_cni(backend_joins_kubelet_netns: bool, network: &str) -> Result<CniRuntime> {
         let cni_plugin_paths = vec![PathBuf::from("/opt/cni/bin")];
         let cni_config_dir = PathBuf::from("/etc/cni/net.d");
 
@@ -492,8 +505,12 @@ impl ContainerRuntime {
         };
         Self::cni_usable(plugins_found, netns, backend_joins_kubelet_netns)?;
 
+        // The kubelet's --network when the node has a CNI config of that
+        // name, then `rusternetes` (tunnr names its conflist so), then the
+        // first config in the dir (R6: was always `rusternetes`).
         let cni = CniRuntime::new(cni_plugin_paths, cni_config_dir)?
-            .with_default_network("rusternetes".to_string());
+            .with_default_network(network.to_string())
+            .with_fallback_networks(vec!["rusternetes".to_string()]);
 
         Ok(cni)
     }
@@ -550,10 +567,6 @@ impl ContainerRuntime {
     /// The container backend this runtime drives.
     pub fn backend(&self) -> &Arc<dyn ContainerBackend> {
         &self.backend
-    }
-
-    pub fn volumes_base_path(&self) -> &str {
-        &self.volumes_base_path
     }
 
     pub fn with_storage(mut self, storage: Arc<rusternetes_storage::StorageBackend>) -> Self {
@@ -958,17 +971,9 @@ impl ContainerRuntime {
         }
     }
 
-    /// The part of [`Self::start_pod`] after the sandbox network: volumes,
-    /// images, init containers, app containers.
-    async fn start_pod_in_sandbox(
-        &self,
-        pod: &Pod,
-        host_network: bool,
-        netns_path: Option<String>,
-    ) -> Result<()> {
-        let pod_name = &pod.metadata.name;
-        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
-
+    /// The pod with the projected ServiceAccount volume (`kube-api-access`)
+    /// and its mount in every app container, when the pod has none.
+    fn with_sa_volume(pod: &Pod) -> Pod {
         // Ensure the pod has a kube-api-access volume for SA tokens.
         // Controllers that create pods directly in etcd bypass the API server's
         // admission controller, so the SA token volume may not be injected.
@@ -1031,6 +1036,21 @@ impl ContainerRuntime {
                 }
             }
         }
+        pod_with_sa
+    }
+
+    /// The part of [`Self::start_pod`] after the sandbox network: volumes,
+    /// images, init containers, app containers.
+    async fn start_pod_in_sandbox(
+        &self,
+        pod: &Pod,
+        host_network: bool,
+        netns_path: Option<String>,
+    ) -> Result<()> {
+        let pod_name = &pod.metadata.name;
+        let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
+
+        let pod_with_sa = Self::with_sa_volume(pod);
         let pod = &pod_with_sa;
 
         // Create volumes first (includes service account token volumes)
@@ -1082,6 +1102,14 @@ impl ContainerRuntime {
 
         // Create /etc/hosts now that we know the pod IP.
         let hosts_file_path = self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
+        self.pod_sandboxes.lock().unwrap().insert(
+            pod_name.to_string(),
+            PodSandbox {
+                binds: volume_binds.clone(),
+                hosts: hosts_file_path.clone(),
+                netns: netns_path.clone(),
+            },
+        );
 
         // /etc/hosts is bind-mounted into each app container (see start_container).
         // No need to upload into the pause container — app containers use the bind mount.
@@ -1493,9 +1521,55 @@ impl ContainerRuntime {
         container: &Container,
         pod_ip: Option<&str>,
     ) -> Result<()> {
-        let empty_binds = HashMap::new();
-        self.start_container(pod, container, &empty_binds, None, None, pod_ip)
-            .await
+        let pod = Self::with_sa_volume(pod);
+        let pod_name = pod.metadata.name.clone();
+        // The container as the pod start saw it (with the ServiceAccount mount).
+        let container = pod
+            .spec
+            .as_ref()
+            .and_then(|s| {
+                s.containers
+                    .iter()
+                    .chain(s.init_containers.iter().flatten())
+                    .find(|c| c.name == container.name)
+            })
+            .cloned()
+            .unwrap_or_else(|| container.clone());
+        let recorded = self.pod_sandboxes.lock().unwrap().get(&pod_name).cloned();
+        let sandbox = match recorded {
+            Some(sb) => sb,
+            None => {
+                // An earlier kubelet process started the pod: what its start
+                // gave, again (the volumes are on disk; this refreshes them).
+                let binds = self.create_pod_volumes(&pod).await?;
+                let hosts = self.create_pod_hosts_file(&pod, pod_ip)?;
+                let netns = if self.use_cni && !is_host_network(&pod) {
+                    let p = self.netns.path(&format!("cni-{}", pod_name));
+                    p.exists().then(|| p.to_string_lossy().into_owned())
+                } else {
+                    None
+                };
+                let sb = PodSandbox {
+                    binds,
+                    hosts,
+                    netns,
+                };
+                self.pod_sandboxes
+                    .lock()
+                    .unwrap()
+                    .insert(pod_name.clone(), sb.clone());
+                sb
+            }
+        };
+        self.start_container(
+            &pod,
+            &container,
+            &sandbox.binds,
+            sandbox.netns.as_deref(),
+            sandbox.hosts.as_deref(),
+            pod_ip,
+        )
+        .await
     }
 
     /// Create /etc/hosts file for a pod.
@@ -5507,6 +5581,7 @@ impl ContainerRuntime {
     /// after all containers are stopped, and by the container GC for
     /// orphaned pods. K8s ref: pkg/kubelet/kubelet.go:2484
     pub async fn cleanup_pod_volumes(&self, pod_name: &str) -> Result<()> {
+        self.pod_sandboxes.lock().unwrap().remove(pod_name);
         let volume_dir = format!("{}/{}", self.volumes_base_path, pod_name);
 
         // CSI volumes first. If one cannot be unpublished, its mount may
@@ -12939,7 +13014,10 @@ exit 0
         }))
         .unwrap();
         e.backend.fail_image("side:1", true);
-        assert!(e.runtime.start_pod(&pod).await.is_err(), "side cannot be created");
+        assert!(
+            e.runtime.start_pod(&pod).await.is_err(),
+            "side cannot be created"
+        );
         assert!(e.runtime.is_pod_running("web").await.unwrap(), "app runs");
 
         e.backend.fail_image("side:1", false);
@@ -12964,11 +13042,26 @@ exit 0
                 .map(|b| b.split(':').nth(1).unwrap_or("").to_string())
                 .collect()
         };
-        for want in ["/data", "/var/run/secrets/kubernetes.io/serviceaccount", "/etc/hosts"] {
-            assert!(dsts(&app.binds).iter().any(|d| d == want), "app has {want}: {:?}", app.binds);
-            assert!(dsts(&side.binds).iter().any(|d| d == want), "side has {want}: {:?}", side.binds);
+        for want in [
+            "/data",
+            "/var/run/secrets/kubernetes.io/serviceaccount",
+            "/etc/hosts",
+        ] {
+            assert!(
+                dsts(&app.binds).iter().any(|d| d == want),
+                "app has {want}: {:?}",
+                app.binds
+            );
+            assert!(
+                dsts(&side.binds).iter().any(|d| d == want),
+                "side has {want}: {:?}",
+                side.binds
+            );
         }
-        assert_eq!(side.network_mode, app.network_mode, "the pod network namespace");
+        assert_eq!(
+            side.network_mode, app.network_mode,
+            "the pod network namespace"
+        );
         assert!(app.network_mode.as_deref().unwrap_or("").starts_with("ns:"));
     }
 }

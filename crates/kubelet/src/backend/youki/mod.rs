@@ -623,10 +623,40 @@ impl Inner {
 
     /// Start a created container: its init process, parked on the
     /// container's notify socket, is told to exec the workload.
+    ///
+    /// Not libcontainer's `Container::start`: that one chdirs into the
+    /// container root to connect the socket by a short relative name, which
+    /// moves the whole kubelet's working directory while other threads start
+    /// other containers (a start lands in the wrong container, or fails with
+    /// 'failed to connect to notify socket'). Here the socket is reached
+    /// through an fd of the root (`/proc/self/fd/<n>/notify.sock`: short,
+    /// and no cwd involved); the rest is what libcontainer does.
     fn start(&self, name: &str) -> Result<()> {
         let m = self.meta(name)?;
         let mut c = self.load(&m.name).ok_or_else(|| not_found(name))?;
-        c.start()?;
+        if !c.can_start() {
+            bail!(
+                "cannot start container {}: it is {:?}, not created",
+                name,
+                c.status()
+            );
+        }
+        let config = libcontainer::config::YoukiConfig::load(&c.root)
+            .with_context(|| format!("the runtime spec of container {name}"))?;
+        notify_start(&c.root).with_context(|| format!("starting container {name}"))?;
+        c.set_status(ContainerStatus::Running)
+            .save()
+            .with_context(|| format!("saving the state of container {name}"))?;
+        if let Some(hooks) = config.hooks.as_ref() {
+            libcontainer::hooks::run_hooks(
+                hooks.poststart().as_ref(),
+                Some(&c.state),
+                Some(&c.root),
+                None,
+                None,
+            )
+            .with_context(|| format!("poststart hooks of container {name}"))?;
+        }
         let mut m = m;
         m.started_at = Some(now_rfc3339());
         image::write_json(&self.dir(&m.name).join("meta.json"), &m)?;
@@ -734,6 +764,27 @@ fn netns_ipv4(path: &str) -> Option<String> {
 }
 
 /// Last `tail` lines of `text` (`"all"` or unparsable: everything).
+/// Tell the init process of a created container to exec its workload: one
+/// write to its notify socket, opened through an fd of the container root
+/// so neither a long path nor the process working directory matters.
+fn notify_start(container_root: &Path) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    let dir = fs::File::open(container_root)
+        .with_context(|| format!("opening {}", container_root.display()))?;
+    let sock = format!("/proc/self/fd/{}/notify.sock", dir.as_raw_fd());
+    let mut s = std::os::unix::net::UnixStream::connect(&sock).with_context(|| {
+        format!(
+            "failed to connect to notify socket {}",
+            container_root.join("notify.sock").display()
+        )
+    })?;
+    s.write_all(b"start container")
+        .context("sending start container")?;
+    drop(dir);
+    Ok(())
+}
+
 fn tail_lines(text: &str, tail: &str) -> String {
     match tail.parse::<usize>() {
         Ok(n) => {
@@ -884,6 +935,7 @@ impl ContainerBackend for YoukiBackend {
         let cfg = &self.inner.cfg;
         let shim_log = fs::File::create(dir.join("shim.log"))?;
         let spawned = tokio::process::Command::new(&cfg.shim)
+            .current_dir("/")
             .arg("create")
             .arg(&cfg.state_root)
             .arg(name)
@@ -1098,6 +1150,7 @@ impl ContainerBackend for YoukiBackend {
         // The shim's stdout and stderr ("-") are the exec's: streamed as
         // they come; its stdin is the exec's when attached.
         let mut child = tokio::process::Command::new(&cfg.shim)
+            .current_dir("/")
             .arg("exec")
             .arg(&cfg.state_root)
             .arg(name)
@@ -1352,7 +1405,10 @@ mod tests {
                 fs::create_dir_all(&root).unwrap();
                 fs::create_dir_all(&bundle).unwrap();
                 let spec = oci_spec::runtime::Spec::default();
-                LcConfig::from_spec(&spec, &name).unwrap().save(&root).unwrap();
+                LcConfig::from_spec(&spec, &name)
+                    .unwrap()
+                    .save(&root)
+                    .unwrap();
                 Container::new(
                     &name,
                     ContainerStatus::Created,
@@ -1363,7 +1419,10 @@ mod tests {
                 .unwrap()
                 .save()
                 .unwrap();
-                listeners.push((name.clone(), NotifyListener::new(&root.join("notify.sock")).unwrap()));
+                listeners.push((
+                    name.clone(),
+                    NotifyListener::new(&root.join("notify.sock")).unwrap(),
+                ));
                 inner.index_put(Meta {
                     id: format!("id-{name}"),
                     name: name.clone(),

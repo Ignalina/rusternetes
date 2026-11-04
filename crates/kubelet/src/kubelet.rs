@@ -2034,29 +2034,9 @@ impl Kubelet {
                                     );
                                     return Ok(());
                                 }
-                                let volume_paths: std::collections::HashMap<String, String> = pod
-                                    .spec
-                                    .as_ref()
-                                    .and_then(|s| s.volumes.as_ref())
-                                    .map(|vols| {
-                                        vols.iter()
-                                            .map(|v| {
-                                                let path = format!(
-                                                    "{}/{}/{}",
-                                                    self.runtime.volumes_base_path(),
-                                                    pod_name,
-                                                    v.name
-                                                );
-                                                (v.name.clone(), path)
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
                                 let pod_ip = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref());
-                                if let Err(e) = self
-                                    .runtime
-                                    .start_container(pod, ic, &volume_paths, None, None, pod_ip)
-                                    .await
+                                if let Err(e) =
+                                    self.runtime.start_pod_container(pod, ic, pod_ip).await
                                 {
                                     warn!(
                                         "Failed to start init container {} for {}/{}: {}",
@@ -2846,15 +2826,13 @@ impl Kubelet {
                                 "Container {} missing for running pod {}/{}, creating",
                                 container.name, namespace, pod_name
                             );
-                            let empty_binds = std::collections::HashMap::new();
+                            // The pod's mounts and sandbox network, as the pod
+                            // start gave its siblings (R7).
                             if let Err(e) = self
                                 .runtime
-                                .start_container(
+                                .start_pod_container(
                                     pod,
                                     container,
-                                    &empty_binds,
-                                    None, // netns — pod already has networking via pause
-                                    None, // hosts file
                                     pod.status.as_ref().and_then(|s| s.pod_ip.as_deref()),
                                 )
                                 .await
@@ -3100,28 +3078,6 @@ impl Kubelet {
                                     // start_pod() would redo init containers, networking, etc.
                                     // We just need to remove and recreate the exited containers.
                                     if let Some(spec) = &pod.spec {
-                                        // Rebuild volume paths from existing pod volumes on disk.
-                                        // Volumes were created during start_pod and persist on disk.
-                                        let volume_paths: std::collections::HashMap<
-                                            String,
-                                            String,
-                                        > = spec
-                                            .volumes
-                                            .as_ref()
-                                            .map(|vols| {
-                                                vols.iter()
-                                                    .map(|v| {
-                                                        let path = format!(
-                                                            "{}/{}/{}",
-                                                            self.runtime.volumes_base_path(),
-                                                            pod_name,
-                                                            v.name
-                                                        );
-                                                        (v.name.clone(), path)
-                                                    })
-                                                    .collect()
-                                            })
-                                            .unwrap_or_default();
                                         for c in &spec.containers {
                                             if !due.contains(&c.name) {
                                                 continue;
@@ -3157,14 +3113,7 @@ impl Kubelet {
                                                     .and_then(|s| s.pod_ip.as_deref());
                                                 if let Err(e) = self
                                                     .runtime
-                                                    .start_container(
-                                                        pod,
-                                                        c,
-                                                        &volume_paths,
-                                                        None,
-                                                        None,
-                                                        pod_ip,
-                                                    )
+                                                    .start_pod_container(pod, c, pod_ip)
                                                     .await
                                                 {
                                                     debug!(

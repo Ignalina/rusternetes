@@ -40,6 +40,9 @@ pub struct CniRuntime {
 
     /// Default network to use
     default_network: Option<String>,
+
+    /// Tried after `default_network`, before the first config in the dir.
+    fallback_networks: Vec<String>,
 }
 
 /// The `CNI_CONTAINERID` for a pod sandbox the kubelet names by `id` (the
@@ -69,12 +72,19 @@ impl CniRuntime {
             config_manager,
             attachments: Arc::new(Mutex::new(HashMap::new())),
             default_network: None,
+            fallback_networks: Vec::new(),
         })
     }
 
     /// Set the default network to use
     pub fn with_default_network(mut self, network: String) -> Self {
         self.default_network = Some(network);
+        self
+    }
+
+    /// Networks tried, in order, when the default network has no config.
+    pub fn with_fallback_networks(mut self, networks: Vec<String>) -> Self {
+        self.fallback_networks = networks;
         self
     }
 
@@ -358,18 +368,38 @@ impl CniRuntime {
         plugin_manager.discover_plugins()
     }
 
-    /// Get network configuration by name or use default
+    /// Get network configuration by name or use default.
+    ///
+    /// Without a name: the preferred default network when the node has a
+    /// config of that name, else the first config in lexical order (what
+    /// upstream runtimes do). A CNI that writes its own config (e.g.
+    /// ovn-kubernetes' 10-ovn-kubernetes.conf) works without being renamed.
     fn get_network_config(
         &self,
         network_name: Option<&str>,
     ) -> Result<NetworkConfigList, CniError> {
         if let Some(name) = network_name {
-            self.config_manager.get_config(name)
-        } else if let Some(default) = &self.default_network {
-            self.config_manager.get_config(default)
-        } else {
-            self.config_manager.get_default_config()
+            return self.config_manager.get_config(name);
         }
+        let mut configs = self.config_manager.load_configs()?;
+        for want in self.default_network.iter().chain(&self.fallback_networks) {
+            if let Some(i) = configs.iter().position(|c| &c.name == want) {
+                return Ok(configs.swap_remove(i));
+            }
+        }
+        if configs.is_empty() {
+            return Err(CniError::new(
+                ErrorCode::InvalidNetworkConfig,
+                match &self.default_network {
+                    Some(d) => format!(
+                        "Network configuration '{}' not found (no CNI config on the node)",
+                        d
+                    ),
+                    None => "No network configurations found".to_string(),
+                },
+            ));
+        }
+        Ok(configs.remove(0))
     }
 
     /// List available networks
@@ -588,7 +618,10 @@ mod tests {
     #[test]
     fn a_preferred_network_that_is_there_wins() {
         let plugins = TempDir::new().unwrap();
-        let conf = net_dir(&[("05-a.conf", "a"), ("10-ovn-kubernetes.conf", "ovn-kubernetes")]);
+        let conf = net_dir(&[
+            ("05-a.conf", "a"),
+            ("10-ovn-kubernetes.conf", "ovn-kubernetes"),
+        ]);
         let rt = CniRuntime::new(vec![plugins.path().into()], conf.path().into())
             .unwrap()
             .with_default_network("ovn-kubernetes".to_string());

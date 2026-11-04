@@ -173,14 +173,18 @@ impl CniConfigManager {
                 format!("Failed to read config directory: {}", e),
             )
         })?;
-
+        // In lexical order of the file names, as libcni's ConfFiles: the
+        // first one is the node's default network.
+        let mut paths = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| {
                 CniError::new(ErrorCode::IoFailure, format!("Failed to read entry: {}", e))
             })?;
+            paths.push(entry.path());
+        }
+        paths.sort();
 
-            let path = entry.path();
-
+        for path in paths {
             // Only process .conflist and .conf files
             if let Some(ext) = path.extension() {
                 match ext.to_str() {
@@ -241,9 +245,9 @@ impl CniConfigManager {
 
     /// Get the default network configuration (first in alphabetical order)
     pub fn get_default_config(&self) -> Result<NetworkConfigList, CniError> {
-        let mut configs = self.load_configs()?;
+        let configs = self.load_configs()?;
 
-        configs.pop().ok_or_else(|| {
+        configs.into_iter().next().ok_or_else(|| {
             CniError::new(
                 ErrorCode::InvalidNetworkConfig,
                 "No network configurations found".to_string(),
