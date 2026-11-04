@@ -542,4 +542,56 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         assert!(cni.get_container_ip("pod-a").is_none());
     }
+
+    fn net_dir(files: &[(&str, &str)]) -> TempDir {
+        let d = TempDir::new().unwrap();
+        for (file, name) in files {
+            std::fs::write(
+                d.path().join(file),
+                format!(r#"{{"cniVersion":"1.0.0","name":"{name}","type":"bridge"}}"#),
+            )
+            .unwrap();
+        }
+        d
+    }
+
+    /// R6: the kubelet preferred CNI network `rusternetes` and failed every
+    /// pod ('Network configuration rusternetes not found') on a node whose
+    /// only config is another CNI's (ovn-kubernetes writes
+    /// 10-ovn-kubernetes.conf). A preferred name that is not there falls
+    /// back to the first config in lexical order, as upstream runtimes do.
+    #[test]
+    fn a_missing_preferred_network_falls_back_to_the_first_config() {
+        let plugins = TempDir::new().unwrap();
+        let conf = net_dir(&[("10-ovn-kubernetes.conf", "ovn-kubernetes")]);
+        let rt = CniRuntime::new(vec![plugins.path().into()], conf.path().into())
+            .unwrap()
+            .with_default_network("rusternetes".to_string());
+        assert_eq!(rt.get_network_config(None).unwrap().name, "ovn-kubernetes");
+    }
+
+    #[test]
+    fn the_default_config_is_the_first_in_lexical_order() {
+        let plugins = TempDir::new().unwrap();
+        for _ in 0..5 {
+            let conf = net_dir(&[
+                ("99-z.conf", "z"),
+                ("05-a.conf", "a"),
+                ("50-m.conflist", "m"),
+                ("10-b.conf", "b"),
+            ]);
+            let rt = CniRuntime::new(vec![plugins.path().into()], conf.path().into()).unwrap();
+            assert_eq!(rt.get_network_config(None).unwrap().name, "a");
+        }
+    }
+
+    #[test]
+    fn a_preferred_network_that_is_there_wins() {
+        let plugins = TempDir::new().unwrap();
+        let conf = net_dir(&[("05-a.conf", "a"), ("10-ovn-kubernetes.conf", "ovn-kubernetes")]);
+        let rt = CniRuntime::new(vec![plugins.path().into()], conf.path().into())
+            .unwrap()
+            .with_default_network("ovn-kubernetes".to_string());
+        assert_eq!(rt.get_network_config(None).unwrap().name, "ovn-kubernetes");
+    }
 }
