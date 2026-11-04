@@ -614,6 +614,7 @@ impl ContainerRuntime {
                     netns_path.clone(),
                     "eth0".into(),
                     None,
+                    Some(cni_args(pod, pod_name)),
                 )
                 .await
             {
@@ -661,6 +662,7 @@ impl ContainerRuntime {
                         netns_path.clone(),
                         "eth0".into(),
                         None,
+                        Some(cni_args(pod, pod_name)),
                     )
                     .await
                 {
@@ -691,6 +693,7 @@ impl ContainerRuntime {
                     pod_name.to_string(),
                     netns_path.clone(),
                     "eth0".into(),
+                    None,
                     None,
                 )
                 .await
@@ -13090,7 +13093,10 @@ exit 0
         assert!(e.runtime.start_pod(&pod()).await.is_err());
         std::fs::remove_file(e.state().join("fail-add")).unwrap();
         let args = std::fs::read_to_string(e.state().join("del-args")).unwrap();
-        assert!(args.contains("K8S_POD_NAME=web"), "after a failed ADD: {args:?}");
+        assert!(
+            args.contains("K8S_POD_NAME=web"),
+            "after a failed ADD: {args:?}"
+        );
 
         std::fs::remove_file(e.state().join("del-args")).unwrap();
         e.runtime.start_pod(&pod()).await.unwrap();
@@ -13098,6 +13104,9 @@ exit 0
         let (fresh, _v) = runtime(&e.root, Arc::new(FakeBackend::new("fake"))).await;
         fresh.start_pod(&pod()).await.unwrap();
         let args = std::fs::read_to_string(e.state().join("del-args")).unwrap();
-        assert!(args.contains("K8S_POD_NAME=web"), "of a stale network: {args:?}");
+        assert!(
+            args.contains("K8S_POD_NAME=web"),
+            "of a stale network: {args:?}"
+        );
     }
 }

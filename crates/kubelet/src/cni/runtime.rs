@@ -25,6 +25,9 @@ pub struct NetworkAttachment {
 
     /// CNI result from ADD operation
     pub result: CniResult,
+
+    /// The `CNI_ARGS` of the ADD: DEL passes the same ones.
+    pub args: Option<String>,
 }
 
 /// CNI Runtime - high-level interface for container network lifecycle
@@ -167,6 +170,7 @@ impl CniRuntime {
             ifname: ifname.to_string(),
             network: network.name.clone(),
             result: result.clone(),
+            args: args.map(str::to_string),
         };
 
         let mut attachments = self.attachments.lock().unwrap();
@@ -223,10 +227,17 @@ impl CniRuntime {
         netns: String,
         ifname: String,
         network_name: Option<String>,
+        args: Option<String>,
     ) -> Result<(), CniError> {
         let cni = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
-            cni.teardown_network(&container_id, &netns, &ifname, network_name.as_deref())
+            cni.teardown_network_with_args(
+                &container_id,
+                &netns,
+                &ifname,
+                network_name.as_deref(),
+                args.as_deref(),
+            )
         })
         .await
         .unwrap_or_else(|e| {
@@ -245,6 +256,20 @@ impl CniRuntime {
         ifname: &str,
         network_name: Option<&str>,
     ) -> Result<(), CniError> {
+        self.teardown_network_with_args(container_id, netns, ifname, network_name, None)
+    }
+
+    /// Teardown network with `CNI_ARGS`; without any, those of the ADD this
+    /// process made for the container (plugins such as ovn-kubernetes refuse
+    /// a DEL that does not name the pod).
+    pub fn teardown_network_with_args(
+        &self,
+        container_id: &str,
+        netns: &str,
+        ifname: &str,
+        network_name: Option<&str>,
+        args: Option<&str>,
+    ) -> Result<(), CniError> {
         info!(
             "Tearing down network for container {} in netns {}",
             container_id, netns
@@ -252,6 +277,15 @@ impl CniRuntime {
 
         // Get network configuration
         let network = self.get_network_config(network_name)?;
+
+        let remembered = self
+            .attachments
+            .lock()
+            .unwrap()
+            .get(container_id)
+            .and_then(|a| a.iter().find(|a| a.network == network.name))
+            .and_then(|a| a.args.clone());
+        let args = args.or(remembered.as_deref());
 
         // Execute DEL command
         let plugin_manager = self.plugin_manager.lock().unwrap();
@@ -261,7 +295,7 @@ impl CniRuntime {
             &cni_container_id(container_id),
             netns,
             ifname,
-            None,
+            args,
         )?;
 
         // Remove attachment
@@ -566,6 +600,7 @@ mod tests {
                 "pod-a".into(),
                 netns.to_string_lossy().into_owned(),
                 "eth0".into(),
+                None,
                 None,
             )
             .await;
