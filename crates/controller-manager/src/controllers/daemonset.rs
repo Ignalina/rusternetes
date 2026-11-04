@@ -1030,40 +1030,9 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         if spec.service_account_name.is_none() {
             spec.service_account_name = Some("default".to_string());
         }
-        // A projected, kubelet-minted bound token (as admission and the
-        // kubelet inject it): no `<sa>-token` Secret exists since bound tokens.
-        let sa_token_volume = Volume {
-            name: "kube-api-access".to_string(),
-            empty_dir: None,
-            host_path: None,
-            config_map: None,
-            secret: None,
-            persistent_volume_claim: None,
-            downward_api: None,
-            csi: None,
-            ephemeral: None,
-            nfs: None,
-            iscsi: None,
-            projected: Some(rusternetes_common::resources::ProjectedVolumeSource {
-                sources: Some(vec![rusternetes_common::resources::VolumeProjection {
-                    service_account_token: Some(
-                        rusternetes_common::resources::ServiceAccountTokenProjection {
-                            path: "token".to_string(),
-                            expiration_seconds: Some(
-                                rusternetes_common::auth::DEFAULT_PROJECTED_EXPIRATION,
-                            ),
-                            audience: None,
-                        },
-                    ),
-                    config_map: None,
-                    secret: None,
-                    downward_api: None,
-                    cluster_trust_bundle: None,
-                }]),
-                default_mode: Some(0o644),
-            }),
-            image: None,
-        };
+        // The projected token + cluster CA + namespace volume admission gives
+        // every other pod: no `<sa>-token` Secret exists since bound tokens.
+        let sa_token_volume = rusternetes_common::resources::pod::kube_api_access_volume();
 
         // Add volume to pod spec
         if let Some(volumes) = &mut spec.volumes {
@@ -2043,16 +2012,45 @@ mod tests {
     async fn a_daemonset_pod_token_volume_carries_the_cluster_ca_and_namespace() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = DaemonSetController::new(storage.clone());
-        storage.create("/registry/nodes/n1", &make_test_node("n1")).await.unwrap();
+        storage
+            .create("/registry/nodes/n1", &make_test_node("n1"))
+            .await
+            .unwrap();
         let mut ds = make_test_daemonset("ca-ds", "default");
-        storage.create("/registry/daemonsets/default/ca-ds", &ds).await.unwrap();
+        storage
+            .create("/registry/daemonsets/default/ca-ds", &ds)
+            .await
+            .unwrap();
         controller.reconcile(&mut ds).await.unwrap();
         let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
         let spec = pods[0].spec.as_ref().unwrap();
-        let vol = spec.volumes.iter().flatten().find(|v| v.name == "kube-api-access").unwrap();
+        let vol = spec
+            .volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == "kube-api-access")
+            .unwrap();
         let sources = vol.projected.as_ref().unwrap().sources.clone().unwrap();
-        assert!(sources.iter().any(|s| s.config_map.as_ref().is_some_and(|c| c.name.as_deref() == Some("kube-root-ca.crt")
-            && c.items.iter().flatten().any(|i| i.key == "ca.crt" && i.path == "ca.crt"))), "{sources:?}");
-        assert!(sources.iter().any(|s| s.downward_api.as_ref().is_some_and(|d| d.items.iter().flatten().any(|i| i.path == "namespace"))), "{sources:?}");
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.config_map.as_ref().is_some_and(|c| c.name.as_deref()
+                    == Some("kube-root-ca.crt")
+                    && c.items
+                        .iter()
+                        .flatten()
+                        .any(|i| i.key == "ca.crt" && i.path == "ca.crt"))),
+            "{sources:?}"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.downward_api.as_ref().is_some_and(|d| d
+                    .items
+                    .iter()
+                    .flatten()
+                    .any(|i| i.path == "namespace"))),
+            "{sources:?}"
+        );
     }
 }

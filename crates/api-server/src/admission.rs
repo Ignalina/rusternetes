@@ -1012,73 +1012,7 @@ pub async fn inject_service_account_token<S: Storage>(
     //   3. DownwardAPI — provides namespace from pod metadata
     //
     // See K8s source: plugin/pkg/admission/serviceaccount/admission.go
-    let sa_token_volume = Volume {
-        name: "kube-api-access".to_string(),
-        empty_dir: None,
-        host_path: None,
-        config_map: None,
-        secret: None,
-        persistent_volume_claim: None,
-        downward_api: None,
-        csi: None,
-        ephemeral: None,
-        nfs: None,
-        iscsi: None,
-        projected: Some(rusternetes_common::resources::ProjectedVolumeSource {
-            sources: Some(vec![
-                // Source 1: ServiceAccountToken — kubelet generates bound JWT
-                rusternetes_common::resources::VolumeProjection {
-                    service_account_token: Some(
-                        rusternetes_common::resources::ServiceAccountTokenProjection {
-                            path: "token".to_string(),
-                            expiration_seconds: Some(3607),
-                            audience: None,
-                        },
-                    ),
-                    config_map: None,
-                    secret: None,
-                    downward_api: None,
-                    cluster_trust_bundle: None,
-                },
-                // Source 2: ConfigMap kube-root-ca.crt — provides ca.crt
-                rusternetes_common::resources::VolumeProjection {
-                    service_account_token: None,
-                    config_map: Some(rusternetes_common::resources::ConfigMapProjection {
-                        name: Some("kube-root-ca.crt".to_string()),
-                        items: Some(vec![rusternetes_common::resources::KeyToPath {
-                            key: "ca.crt".to_string(),
-                            path: "ca.crt".to_string(),
-                            mode: None,
-                        }]),
-                        optional: None,
-                    }),
-                    secret: None,
-                    downward_api: None,
-                    cluster_trust_bundle: None,
-                },
-                // Source 3: DownwardAPI — provides namespace
-                rusternetes_common::resources::VolumeProjection {
-                    service_account_token: None,
-                    config_map: None,
-                    secret: None,
-                    downward_api: Some(rusternetes_common::resources::DownwardAPIProjection {
-                        items: Some(vec![rusternetes_common::resources::DownwardAPIVolumeFile {
-                            path: "namespace".to_string(),
-                            field_ref: Some(rusternetes_common::resources::ObjectFieldSelector {
-                                api_version: Some("v1".to_string()),
-                                field_path: "metadata.namespace".to_string(),
-                            }),
-                            resource_field_ref: None,
-                            mode: None,
-                        }]),
-                    }),
-                    cluster_trust_bundle: None,
-                },
-            ]),
-            default_mode: Some(0o644),
-        }),
-        image: None,
-    };
+    let sa_token_volume = rusternetes_common::resources::pod::kube_api_access_volume();
 
     // Add volume to pod spec
     if let Some(volumes) = &mut spec.volumes {
