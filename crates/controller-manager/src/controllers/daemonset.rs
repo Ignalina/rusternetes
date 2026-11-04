@@ -1950,4 +1950,55 @@ mod tests {
         // small cluster — that previously allowed all pods to be deleted.
         assert_eq!(resolve_max_unavailable(Some("25%"), 3), 1);
     }
+
+    /// A DaemonSet pod's ServiceAccount token is a projected, kubelet-minted
+    /// token: since bound tokens (node/authfix) no `<sa>-token` Secret exists,
+    /// and a Secret volume of that name left every DaemonSet pod Pending
+    /// ('waiting for volume: Secret default-token not found', ovn-kubernetes'
+    /// ovs-node and ovnkube-node on tunnr, lane OVN-BENCH).
+    #[tokio::test]
+    async fn a_daemonset_pod_gets_a_projected_token_not_a_token_secret() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        storage.create("/registry/nodes/n1", &make_test_node("n1")).await.unwrap();
+        let mut ds = make_test_daemonset("tok-ds", "default");
+        storage.create("/registry/daemonsets/default/tok-ds", &ds).await.unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        assert_eq!(pods.len(), 1);
+        let spec = pods[0].spec.as_ref().unwrap();
+        let vol = spec
+            .volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == "kube-api-access")
+            .expect("a token volume");
+        assert!(vol.secret.is_none(), "no token Secret exists to mount: {vol:?}");
+        let proj = vol.projected.as_ref().expect("a projected volume");
+        assert!(proj
+            .sources
+            .iter()
+            .flatten()
+            .any(|s| s.service_account_token.as_ref().is_some_and(|t| t.path == "token")));
+        assert!(spec.containers.iter().all(|c| c
+            .volume_mounts
+            .iter()
+            .flatten()
+            .any(|m| m.name == "kube-api-access"
+                && m.mount_path == "/var/run/secrets/kubernetes.io/serviceaccount")));
+    }
+
+    #[tokio::test]
+    async fn a_daemonset_pod_with_automount_off_gets_no_token() {
+        let storage = Arc::new(MemoryStorage::new());
+        let controller = DaemonSetController::new(storage.clone());
+        storage.create("/registry/nodes/n1", &make_test_node("n1")).await.unwrap();
+        let mut ds = make_test_daemonset("notok-ds", "default");
+        ds.spec.template.spec.automount_service_account_token = Some(false);
+        storage.create("/registry/daemonsets/default/notok-ds", &ds).await.unwrap();
+        controller.reconcile(&mut ds).await.unwrap();
+        let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
+        let spec = pods[0].spec.as_ref().unwrap();
+        assert!(!spec.volumes.iter().flatten().any(|v| v.name == "kube-api-access"));
+    }
 }
