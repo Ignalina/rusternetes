@@ -1,7 +1,7 @@
 use anyhow::Result;
 use futures::StreamExt;
 use rusternetes_common::resources::node::Taint;
-use rusternetes_common::resources::pod::{SecretVolumeSource, Toleration, Volume, VolumeMount};
+use rusternetes_common::resources::pod::{Toleration, Volume, VolumeMount};
 use rusternetes_common::resources::{
     ControllerRevision, DaemonSet, DaemonSetStatus, Node, Pod, PodStatus,
 };
@@ -1023,31 +1023,45 @@ impl<S: Storage + 'static> DaemonSetController<S> {
         spec: &mut rusternetes_common::resources::PodSpec,
         namespace: &str,
     ) {
-        // Get service account name, default to "default"
-        let sa_name = spec.service_account_name.as_deref().unwrap_or("default");
-
-        // The service account token secret name follows the pattern: {sa-name}-token
-        let token_secret_name = format!("{}-token", sa_name);
-
-        // Define the service account token volume
+        // automountServiceAccountToken: false on the pod: no token.
+        if spec.automount_service_account_token == Some(false) {
+            return;
+        }
+        if spec.service_account_name.is_none() {
+            spec.service_account_name = Some("default".to_string());
+        }
+        // A projected, kubelet-minted bound token (as admission and the
+        // kubelet inject it): no `<sa>-token` Secret exists since bound tokens.
         let sa_token_volume = Volume {
             name: "kube-api-access".to_string(),
             empty_dir: None,
             host_path: None,
             config_map: None,
-            secret: Some(SecretVolumeSource {
-                secret_name: Some(token_secret_name.clone()),
-                items: None,
-                default_mode: None,
-                optional: None,
-            }),
+            secret: None,
             persistent_volume_claim: None,
             downward_api: None,
             csi: None,
             ephemeral: None,
             nfs: None,
             iscsi: None,
-            projected: None,
+            projected: Some(rusternetes_common::resources::ProjectedVolumeSource {
+                sources: Some(vec![rusternetes_common::resources::VolumeProjection {
+                    service_account_token: Some(
+                        rusternetes_common::resources::ServiceAccountTokenProjection {
+                            path: "token".to_string(),
+                            expiration_seconds: Some(
+                                rusternetes_common::auth::DEFAULT_PROJECTED_EXPIRATION,
+                            ),
+                            audience: None,
+                        },
+                    ),
+                    config_map: None,
+                    secret: None,
+                    downward_api: None,
+                    cluster_trust_bundle: None,
+                }]),
+                default_mode: Some(0o644),
+            }),
             image: None,
         };
 
@@ -1960,9 +1974,15 @@ mod tests {
     async fn a_daemonset_pod_gets_a_projected_token_not_a_token_secret() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = DaemonSetController::new(storage.clone());
-        storage.create("/registry/nodes/n1", &make_test_node("n1")).await.unwrap();
+        storage
+            .create("/registry/nodes/n1", &make_test_node("n1"))
+            .await
+            .unwrap();
         let mut ds = make_test_daemonset("tok-ds", "default");
-        storage.create("/registry/daemonsets/default/tok-ds", &ds).await.unwrap();
+        storage
+            .create("/registry/daemonsets/default/tok-ds", &ds)
+            .await
+            .unwrap();
         controller.reconcile(&mut ds).await.unwrap();
         let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
         assert_eq!(pods.len(), 1);
@@ -1973,13 +1993,15 @@ mod tests {
             .flatten()
             .find(|v| v.name == "kube-api-access")
             .expect("a token volume");
-        assert!(vol.secret.is_none(), "no token Secret exists to mount: {vol:?}");
+        assert!(
+            vol.secret.is_none(),
+            "no token Secret exists to mount: {vol:?}"
+        );
         let proj = vol.projected.as_ref().expect("a projected volume");
-        assert!(proj
-            .sources
-            .iter()
-            .flatten()
-            .any(|s| s.service_account_token.as_ref().is_some_and(|t| t.path == "token")));
+        assert!(proj.sources.iter().flatten().any(|s| s
+            .service_account_token
+            .as_ref()
+            .is_some_and(|t| t.path == "token")));
         assert!(spec.containers.iter().all(|c| c
             .volume_mounts
             .iter()
@@ -1992,13 +2014,23 @@ mod tests {
     async fn a_daemonset_pod_with_automount_off_gets_no_token() {
         let storage = Arc::new(MemoryStorage::new());
         let controller = DaemonSetController::new(storage.clone());
-        storage.create("/registry/nodes/n1", &make_test_node("n1")).await.unwrap();
+        storage
+            .create("/registry/nodes/n1", &make_test_node("n1"))
+            .await
+            .unwrap();
         let mut ds = make_test_daemonset("notok-ds", "default");
         ds.spec.template.spec.automount_service_account_token = Some(false);
-        storage.create("/registry/daemonsets/default/notok-ds", &ds).await.unwrap();
+        storage
+            .create("/registry/daemonsets/default/notok-ds", &ds)
+            .await
+            .unwrap();
         controller.reconcile(&mut ds).await.unwrap();
         let pods: Vec<Pod> = storage.list("/registry/pods/default/").await.unwrap();
         let spec = pods[0].spec.as_ref().unwrap();
-        assert!(!spec.volumes.iter().flatten().any(|v| v.name == "kube-api-access"));
+        assert!(!spec
+            .volumes
+            .iter()
+            .flatten()
+            .any(|v| v.name == "kube-api-access"));
     }
 }
