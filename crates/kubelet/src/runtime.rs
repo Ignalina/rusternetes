@@ -12725,6 +12725,7 @@ cat >/dev/null
 id="$CNI_CONTAINERID"
 case "$CNI_COMMAND" in
 ADD)
+  if [ -e "$d/slow-add" ]; then sleep 3; fi
   if [ -e "$d/ep-$id" ] || [ -e "$CNI_NETNS/eth0" ]; then
     echo "ADD-EXISTS $id" >> "$d/log"
     printf '{"cniVersion":"1.0.0","code":11,"msg":"endpoint already exists"}'; exit 1
@@ -13152,5 +13153,35 @@ exit 0
             "every DEL names the pod: {lines:?}"
         );
         assert_eq!(lines.len(), 1, "one DEL for one ADD: {lines:?}");
+    }
+    /// The kubelet gives a pod start 30 s; an OVN ADD waits for its port
+    /// binding and takes longer on a loaded node. The start was dropped, but
+    /// its ADD went on in the blocking pool, and the retry took the sandbox
+    /// for stale: DEL + a fresh namespace + ADD while the first ADD still
+    /// ran, every 30 s, so the pod never started (lane TUNNR-OPEN, bench A
+    /// run 1: pw-1 'timed out waiting for OVS port binding'). A retry while
+    /// the earlier ADD runs now waits for it, and then keeps its network.
+    #[tokio::test]
+    async fn a_retry_while_the_dropped_starts_add_still_runs_keeps_that_add() {
+        let e = env().await;
+        std::fs::create_dir_all(e.state()).unwrap();
+        std::fs::write(e.state().join("slow-add"), "").unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            e.runtime.start_pod(&pod()),
+        )
+        .await;
+        assert!(first.is_err(), "the first start should time out");
+        // The kubelet's retry, while the first ADD sleeps.
+        let _ = e.runtime.start_pod(&pod()).await;
+        assert!(
+            !e.log().iter().any(|l| l == "DEL"),
+            "the retry tore down the network of a running ADD: {:?}",
+            e.log()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        std::fs::remove_file(e.state().join("slow-add")).unwrap();
+        e.runtime.start_pod(&pod()).await.unwrap();
+        assert_eq!(e.log(), vec!["ADD".to_string()], "one ADD, no DEL");
     }
 }
