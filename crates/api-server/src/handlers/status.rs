@@ -151,9 +151,7 @@ pub async fn update_status(
             &patch_ops,
             crate::patch::PatchType::JsonPatch,
         )
-        .map_err(|e| {
-            rusternetes_common::Error::Internal(format!("Failed to apply JSON patch: {}", e))
-        })?;
+        .map_err(json_patch_error)?;
 
         // Keep status changes and metadata changes (annotations/labels) from patch
         let mut result = current_resource.clone();
@@ -376,9 +374,7 @@ pub async fn update_cluster_status(
             &patch_ops,
             crate::patch::PatchType::JsonPatch,
         )
-        .map_err(|e| {
-            rusternetes_common::Error::Internal(format!("Failed to apply JSON patch: {}", e))
-        })?;
+        .map_err(json_patch_error)?;
 
         // Keep status changes and metadata changes (annotations/labels) from patch
         let mut result = current_resource.clone();
@@ -652,10 +648,29 @@ pub async fn get_cluster_status(
     Ok(Json(resource))
 }
 
+/// The API error of a JSON Patch (RFC 6902) that does not apply to the stored object.
+fn json_patch_error(e: impl std::fmt::Display) -> rusternetes_common::Error {
+    rusternetes_common::Error::Internal(format!("Failed to apply JSON patch: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A JSON Patch whose `test` op fails (ovn-kubernetes guards its pod-annotation patch on
+    /// pods/status with a test of /metadata/resourceVersion) is 422 Invalid, as the apiserver
+    /// answers, which ovn-kubernetes retries (util.IsPodAnnotationUpdateRetryable: Conflict or
+    /// Invalid); a 500 stops its retry.
+    #[test]
+    fn a_failed_json_patch_test_op_is_422_invalid_not_500() {
+        let current = json!({"metadata": {"name": "p", "resourceVersion": "7"}});
+        let ops = json!([{"op": "test", "path": "/metadata/resourceVersion", "value": "6"}]);
+        let e = crate::patch::apply_patch(&current, &ops, crate::patch::PatchType::JsonPatch)
+            .map_err(json_patch_error)
+            .expect_err("a failed test op applied");
+        assert_eq!(e.reason(), "Invalid", "{e}");
+    }
 
     #[test]
     fn test_status_update_preserves_spec() {
