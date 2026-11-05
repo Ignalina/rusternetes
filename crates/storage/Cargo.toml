@@ -33,6 +33,7 @@ uuid.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+tonic.workspace = true
 # Encryption at rest through a served store (tests/encryption.rs).
 tunnr-etcd = { version = "0.3.3", features = ["server"] }
 

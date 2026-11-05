@@ -182,3 +182,35 @@ async fn a_rolebinding_written_on_one_control_plane_counts_at_once_on_the_others
         late.join("\n")
     );
 }
+
+/// A replica that lost its quorum (the two others gone: a dwarf load jump,
+/// an election) answers its API clients 503 + Retry-After, not 500: the
+/// store did not answer, nothing is broken (T12-OPEN race-37 via cp1,
+/// 'no quorum for a linearizable read', 'write not committed in time').
+#[tokio::test]
+async fn a_replica_without_a_quorum_is_unavailable_not_an_internal_error() {
+    let cps = three().await;
+    cps[1]._node.shutdown().await;
+    cps[2]._node.shutdown().await;
+    let read = cps[0]
+        .store
+        .get::<serde_json::Value>("/registry/namespaces/default")
+        .await;
+    let e = read.expect_err("a read without a quorum answered");
+    assert_eq!(e.reason(), "ServiceUnavailable", "read: {e}");
+    let write = cps[0]
+        .store
+        .create::<serde_json::Value>(
+            "/registry/namespaces/other",
+            &json!({"metadata": {"name": "other"}}),
+        )
+        .await;
+    let e = write.expect_err("a write without a quorum went through");
+    assert_eq!(e.reason(), "ServiceUnavailable", "write: {e}");
+    let list = cps[0]
+        .store
+        .list::<serde_json::Value>("/registry/namespaces/")
+        .await;
+    let e = list.expect_err("a list without a quorum answered");
+    assert_eq!(e.reason(), "ServiceUnavailable", "list: {e}");
+}
