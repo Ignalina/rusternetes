@@ -27,6 +27,30 @@ pub fn transient(e: &etcd_client::Error) -> bool {
     matches!(e, etcd_client::Error::GRpcStatus(s) if s.code() as i32 == 14)
 }
 
+/// Does this error say the store did not answer (gRPC Unavailable: no
+/// quorum for a linearizable read, a write not committed in time;
+/// DeadlineExceeded: a Raft peer call timed out; no connection to the
+/// replica), rather than that the request or the data are wrong?
+pub fn not_answering(e: &etcd_client::Error) -> bool {
+    match e {
+        // 14 = UNAVAILABLE, 4 = DEADLINE_EXCEEDED.
+        etcd_client::Error::GRpcStatus(s) => matches!(s.code() as i32, 14 | 4),
+        etcd_client::Error::TransportError(_) => true,
+        _ => false,
+    }
+}
+
+/// The API error for a failed store call `what`: a store that did not
+/// answer is [`Error::Unavailable`] (503 + Retry-After), anything else
+/// [`Error::Storage`] (500).
+pub fn store_err(what: &str, e: etcd_client::Error) -> Error {
+    if not_answering(&e) {
+        Error::Unavailable(format!("{what}: the store did not answer: {e}"))
+    } else {
+        Error::Storage(format!("{what}: {e}"))
+    }
+}
+
 /// A (linearizable) range read, asked again for up to [`READ_RETRY_FOR`]
 /// while the store answers Unavailable: a read is never wrongly empty, and
 /// a short quorum hiccup is not an error (nor, through the authorizer, a
@@ -107,7 +131,7 @@ impl EtcdStorage {
     async fn connect(endpoints: Vec<String>, options: etcd_client::ConnectOptions) -> Result<Self> {
         let client = Client::connect(endpoints, Some(options))
             .await
-            .map_err(|e| Error::Storage(format!("Failed to connect to etcd: {}", e)))?;
+            .map_err(|e| store_err("Failed to connect to etcd", e))?;
 
         info!("Connected to etcd successfully");
 
@@ -288,7 +312,7 @@ impl Storage for EtcdStorage {
         let txn_resp = client
             .txn(txn)
             .await
-            .map_err(|e| Error::Storage(format!("Failed to create resource: {}", e)))?;
+            .map_err(|e| store_err("Failed to create resource", e))?;
 
         if !txn_resp.succeeded() {
             return Err(Error::AlreadyExists(key.to_string()));
@@ -322,7 +346,7 @@ impl Storage for EtcdStorage {
 
         let resp = read_retrying(&mut client, key, None)
             .await
-            .map_err(|e| Error::Storage(format!("Failed to get resource: {}", e)))?;
+            .map_err(|e| store_err("Failed to get resource", e))?;
 
         if let Some(kv) = resp.kvs().first() {
             let json = crate::open_str(&self.encryption, key, kv.value())?;
@@ -377,7 +401,7 @@ impl Storage for EtcdStorage {
             let txn_resp = client
                 .txn(txn)
                 .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+                .map_err(|e| store_err("Failed to update resource", e))?;
 
             if !txn_resp.succeeded() {
                 // Get the current resourceVersion from the failed txn's else branch
@@ -424,7 +448,7 @@ impl Storage for EtcdStorage {
             let get_resp = client
                 .get(key, Some(GetOptions::new().with_keys_only()))
                 .await
-                .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
+                .map_err(|e| store_err("Failed to check resource", e))?;
 
             if get_resp.kvs().is_empty() {
                 return Err(Error::NotFound(key.to_string()));
@@ -437,7 +461,7 @@ impl Storage for EtcdStorage {
                     None,
                 )
                 .await
-                .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+                .map_err(|e| store_err("Failed to update resource", e))?;
 
             debug!("Updated resource at key: {}", key);
 
@@ -445,7 +469,7 @@ impl Storage for EtcdStorage {
             let get_resp = client
                 .get(key, None)
                 .await
-                .map_err(|e| Error::Storage(format!("Failed to get updated resource: {}", e)))?;
+                .map_err(|e| store_err("Failed to get updated resource", e))?;
 
             if let Some(kv) = get_resp.kvs().first() {
                 let mod_revision = kv.mod_revision();
@@ -466,7 +490,7 @@ impl Storage for EtcdStorage {
         let get_resp = client
             .get(key, Some(GetOptions::new().with_keys_only()))
             .await
-            .map_err(|e| Error::Storage(format!("Failed to check resource: {}", e)))?;
+            .map_err(|e| store_err("Failed to check resource", e))?;
 
         if get_resp.kvs().is_empty() {
             return Err(Error::NotFound(key.to_string()));
@@ -479,7 +503,7 @@ impl Storage for EtcdStorage {
                 None,
             )
             .await
-            .map_err(|e| Error::Storage(format!("Failed to update resource: {}", e)))?;
+            .map_err(|e| store_err("Failed to update resource", e))?;
 
         debug!("Updated resource (raw) at key: {}", key);
         Ok(())
@@ -491,7 +515,7 @@ impl Storage for EtcdStorage {
         let resp = client
             .delete(key, None)
             .await
-            .map_err(|e| Error::Storage(format!("Failed to delete resource: {}", e)))?;
+            .map_err(|e| store_err("Failed to delete resource", e))?;
 
         if resp.deleted() == 0 {
             return Err(Error::NotFound(key.to_string()));
@@ -535,7 +559,7 @@ impl Storage for EtcdStorage {
 
             let resp = read_retrying(&mut client, query_key, Some(get_options))
                 .await
-                .map_err(|e| Error::Storage(format!("Failed to list resources: {}", e)))?;
+                .map_err(|e| store_err("Failed to list resources", e))?;
 
             let kvs = resp.kvs();
             for kv in kvs {
@@ -698,7 +722,7 @@ impl Storage for EtcdStorage {
         let (watcher, stream) = client
             .watch(prefix, Some(watch_options))
             .await
-            .map_err(|e| Error::Storage(format!("Failed to create watch: {}", e)))?;
+            .map_err(|e| store_err("Failed to create watch", e))?;
 
         info!("Started watching prefix: {}", prefix);
 
@@ -764,7 +788,7 @@ impl Storage for EtcdStorage {
         let resp = client
             .get("/", Some(GetOptions::new().with_keys_only()))
             .await
-            .map_err(|e| Error::Storage(format!("Failed to get current revision: {}", e)))?;
+            .map_err(|e| store_err("Failed to get current revision", e))?;
         Ok(resp.header().unwrap().revision())
     }
 
@@ -868,6 +892,29 @@ impl AuthzStorage for EtcdStorage {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+
+    #[test]
+    fn a_store_that_does_not_answer_is_unavailable_and_a_broken_one_internal() {
+        let st = |s: tonic::Status| {
+            store_err("Failed to get resource", etcd_client::Error::GRpcStatus(s))
+        };
+        assert!(matches!(
+            st(tonic::Status::unavailable(
+                "tunnr-etcd: no quorum for a linearizable read"
+            )),
+            Error::Unavailable(_)
+        ));
+        assert!(matches!(
+            st(tonic::Status::deadline_exceeded(
+                "tunnr-etcd: raft peer call timed out"
+            )),
+            Error::Unavailable(_)
+        ));
+        assert!(matches!(
+            st(tonic::Status::internal("tunnr-etcd: raft reply")),
+            Error::Storage(_)
+        ));
+    }
 
     #[test]
     fn test_inject_resource_version_with_existing() {

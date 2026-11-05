@@ -55,6 +55,12 @@ pub enum Error {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// The store did not answer in time (a Raft replica without a quorum,
+    /// an election under way): 503 with Retry-After, the client asks again.
+    /// Not 500 — nothing is broken, and clients retry a 503.
+    #[error("Service unavailable: {0}")]
+    Unavailable(String),
 }
 
 impl Error {
@@ -77,6 +83,7 @@ impl Error {
             Error::UnsupportedMediaType(_) => "UnsupportedMediaType",
             Error::NotAcceptable(_) => "NotAcceptable",
             Error::Internal(_) => "InternalError",
+            Error::Unavailable(_) => "ServiceUnavailable",
         }
     }
 }
@@ -89,6 +96,7 @@ impl axum::response::IntoResponse for Error {
         use axum::http::StatusCode;
         use axum::Json;
 
+        let retry_after = matches!(self, Error::Unavailable(_));
         // Extract resource name from error message for StatusDetails
         let (status, message, reason, details) = match self {
             Error::NotFound(msg) => {
@@ -158,6 +166,19 @@ impl axum::response::IntoResponse for Error {
                 "InternalError",
                 None,
             ),
+            Error::Unavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                msg,
+                "ServiceUnavailable",
+                Some(crate::types::StatusDetails {
+                    name: None,
+                    group: None,
+                    kind: None,
+                    uid: None,
+                    causes: None,
+                    retry_after_seconds: Some(1),
+                }),
+            ),
         };
 
         let status_obj = if let Some(details) = details {
@@ -166,7 +187,14 @@ impl axum::response::IntoResponse for Error {
             crate::types::Status::failure(&message, reason, status.as_u16())
         };
 
-        (status, Json(status_obj)).into_response()
+        let mut r = (status, Json(status_obj)).into_response();
+        if retry_after {
+            r.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        r
     }
 }
 
@@ -212,4 +240,20 @@ fn extract_resource_details_for_invalid(msg: &str) -> Option<crate::types::Statu
         }]),
         retry_after_seconds: None,
     })
+}
+
+#[cfg(all(test, feature = "axum-support"))]
+mod unavailable_tests {
+    use super::Error;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn a_store_that_did_not_answer_is_503_with_retry_after() {
+        let r = Error::Unavailable("no quorum for a linearizable read".into()).into_response();
+        assert_eq!(r.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers()[axum::http::header::RETRY_AFTER], "1");
+        let r = Error::Storage("broken".into()).into_response();
+        assert_eq!(r.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
+    }
 }
