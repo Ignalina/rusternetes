@@ -46,6 +46,11 @@ pub struct CniRuntime {
 
     /// Tried after `default_network`, before the first config in the dir.
     fallback_networks: Vec<String>,
+
+    /// Where the `CNI_ARGS` of each ADD are kept until its DEL, so a kubelet
+    /// started after the ADD (a restart, a node-certificate renewal) still
+    /// names the pod on DEL. `None`: in memory only.
+    args_dir: Option<PathBuf>,
 }
 
 /// The `CNI_CONTAINERID` for a pod sandbox the kubelet names by `id` (the
@@ -76,6 +81,7 @@ impl CniRuntime {
             attachments: Arc::new(Mutex::new(HashMap::new())),
             default_network: None,
             fallback_networks: Vec::new(),
+            args_dir: None,
         })
     }
 
@@ -89,6 +95,66 @@ impl CniRuntime {
     pub fn with_fallback_networks(mut self, networks: Vec<String>) -> Self {
         self.fallback_networks = networks;
         self
+    }
+
+    /// Keep the `CNI_ARGS` of every ADD on disk in `dir` until its DEL.
+    pub fn with_args_dir(mut self, dir: PathBuf) -> Self {
+        self.args_dir = Some(dir);
+        self
+    }
+
+    /// The file that holds the ADD's `CNI_ARGS` of one attachment.
+    fn args_file(&self, container_id: &str, network: &str, ifname: &str) -> Option<PathBuf> {
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        self.args_dir.as_ref().map(|d| {
+            d.join(format!(
+                "{}-{}-{}",
+                safe(network),
+                cni_container_id(container_id),
+                safe(ifname)
+            ))
+        })
+    }
+
+    fn remember_args(&self, container_id: &str, network: &str, ifname: &str, args: &str) {
+        let Some(f) = self.args_file(container_id, network, ifname) else {
+            return;
+        };
+        let tmp = f.with_extension("tmp");
+        let r = f
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&tmp, args))
+            .and_then(|()| std::fs::rename(&tmp, &f));
+        if let Err(e) = r {
+            warn!(
+                "CNI args of container {} not kept in {}: {}",
+                container_id,
+                f.display(),
+                e
+            );
+        }
+    }
+
+    fn stored_args(&self, container_id: &str, network: &str, ifname: &str) -> Option<String> {
+        let f = self.args_file(container_id, network, ifname)?;
+        std::fs::read_to_string(f).ok().filter(|a| !a.is_empty())
+    }
+
+    fn forget_args(&self, container_id: &str, network: &str, ifname: &str) {
+        if let Some(f) = self.args_file(container_id, network, ifname) {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     /// Setup network for a container (ADD operation)
@@ -153,6 +219,11 @@ impl CniRuntime {
             .any(|p| !plugin_manager.has_plugin(&p.plugin_type))
         {
             plugin_manager.discover_plugins()?;
+        }
+        // Kept before the plugin runs: a kubelet that dies inside the ADD
+        // leaves the plugin's half of it, and the next DEL must name the pod.
+        if let Some(a) = args {
+            self.remember_args(container_id, &network.name, ifname, a);
         }
         let result = plugin_manager.execute_network(
             CniCommand::Add,
@@ -259,9 +330,11 @@ impl CniRuntime {
         self.teardown_network_with_args(container_id, netns, ifname, network_name, None)
     }
 
-    /// Teardown network with `CNI_ARGS`; without any, those of the ADD this
-    /// process made for the container (plugins such as ovn-kubernetes refuse
-    /// a DEL that does not name the pod).
+    /// Teardown network with `CNI_ARGS`; without any, those of the ADD (this
+    /// process's, else the ones kept on disk): plugins such as ovn-kubernetes
+    /// refuse a DEL that does not name the pod. With no args known and no
+    /// namespace left, the attachment is gone already (a repeat teardown, a
+    /// DEL after the DEL): no plugin is run.
     pub fn teardown_network_with_args(
         &self,
         container_id: &str,
@@ -285,7 +358,19 @@ impl CniRuntime {
             .get(container_id)
             .and_then(|a| a.iter().find(|a| a.network == network.name))
             .and_then(|a| a.args.clone());
-        let args = args.or(remembered.as_deref());
+        let stored = if args.is_none() && remembered.is_none() {
+            self.stored_args(container_id, &network.name, ifname)
+        } else {
+            None
+        };
+        let args = args.or(remembered.as_deref()).or(stored.as_deref());
+        if args.is_none() && !Path::new(netns).exists() {
+            debug!(
+                "No attachment of container {} on network {} is known and its namespace is gone: no DEL",
+                container_id, network.name
+            );
+            return Ok(());
+        }
 
         // Execute DEL command
         let plugin_manager = self.plugin_manager.lock().unwrap();
@@ -297,6 +382,8 @@ impl CniRuntime {
             ifname,
             args,
         )?;
+        drop(plugin_manager);
+        self.forget_args(container_id, &network.name, ifname);
 
         // Remove attachment
         let mut attachments = self.attachments.lock().unwrap();

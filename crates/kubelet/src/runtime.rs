@@ -510,7 +510,8 @@ impl ContainerRuntime {
         // first config in the dir (R6: was always `rusternetes`).
         let cni = CniRuntime::new(cni_plugin_paths, cni_config_dir)?
             .with_default_network(network.to_string())
-            .with_fallback_networks(vec!["rusternetes".to_string()]);
+            .with_fallback_networks(vec!["rusternetes".to_string()])
+            .with_args_dir(PathBuf::from(CNI_ARGS_DIR));
 
         Ok(cni)
     }
@@ -8645,6 +8646,10 @@ fn node_internal_ip() -> String {
     "127.0.0.1".to_string()
 }
 
+/// Where the kubelet keeps each CNI ADD's `CNI_ARGS` until the DEL (the
+/// CNI result cache of the CRI runtimes lives beside it, in /var/lib/cni).
+const CNI_ARGS_DIR: &str = "/var/lib/cni/rusternetes-args";
+
 /// `CNI_ARGS` for a pod, as the CRI runtimes pass them: plugins such as
 /// Cilium's look the pod up by namespace and name.
 fn cni_args(pod: &Pod, container_id: &str) -> String {
@@ -12782,7 +12787,9 @@ exit 0
         netns: Arc<dyn NetnsOps>,
     ) -> (ContainerRuntime, tempfile::TempDir) {
         let volumes = tempfile::tempdir().unwrap();
-        let cni = CniRuntime::new(vec![root.join("bin")], root.join("net.d")).unwrap();
+        let cni = CniRuntime::new(vec![root.join("bin")], root.join("net.d"))
+            .unwrap()
+            .with_args_dir(root.join("cni-args"));
         let runtime = ContainerRuntime::with_backend(
             backend,
             volumes.path().to_string_lossy().into_owned(),
