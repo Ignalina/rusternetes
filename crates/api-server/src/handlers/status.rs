@@ -650,7 +650,7 @@ pub async fn get_cluster_status(
 
 /// The API error of a JSON Patch (RFC 6902) that does not apply to the stored object.
 fn json_patch_error(e: impl std::fmt::Display) -> rusternetes_common::Error {
-    rusternetes_common::Error::Internal(format!("Failed to apply JSON patch: {}", e))
+    rusternetes_common::Error::InvalidResource(format!("Failed to apply JSON patch: {}", e))
 }
 
 #[cfg(test)]
