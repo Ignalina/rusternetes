@@ -13109,4 +13109,41 @@ exit 0
             "of a stale network: {args:?}"
         );
     }
+    /// A kubelet restarted between ADD and DEL has no ADD in memory: the
+    /// args the ADD passed are kept on disk with the attachment, so the DEL
+    /// of the new process still names the pod (ovn-kubernetes refuses a DEL
+    /// without them and its port outlives the pod).
+    #[tokio::test]
+    async fn a_del_after_a_kubelet_restart_carries_the_adds_cni_args() {
+        let e = env().await;
+        e.runtime.start_pod(&pod()).await.unwrap();
+        let (fresh, _v) = runtime(&e.root, Arc::new(FakeBackend::new("fake"))).await;
+        fresh.stop_and_remove_pod("web").await.unwrap();
+        let args = std::fs::read_to_string(e.state().join("del-args")).unwrap();
+        assert!(
+            args.contains("K8S_POD_NAMESPACE=ns;K8S_POD_NAME=web"),
+            "the DEL after a restart: {args:?}"
+        );
+    }
+
+    /// A pod torn down once is not DELeted again without args: the repeat
+    /// teardowns (stop, then remove; a failed start, then the delete) found
+    /// no attachment and sent a DEL with no CNI_ARGS, which ovn-kubernetes
+    /// logs as refused (missing CNI_ARGS).
+    #[tokio::test]
+    async fn a_repeat_teardown_sends_no_del_without_cni_args() {
+        let e = env().await;
+        e.runtime.start_pod(&pod()).await.unwrap();
+        e.runtime.stop_and_remove_pod("web").await.unwrap();
+        e.runtime.stop_and_remove_pod("web").await.unwrap();
+        let (fresh, _v) = runtime(&e.root, Arc::new(FakeBackend::new("fake"))).await;
+        fresh.stop_and_remove_pod("web").await.unwrap();
+        let args = std::fs::read_to_string(e.state().join("del-args")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            lines.iter().all(|l| l.contains("K8S_POD_NAME=web")),
+            "every DEL names the pod: {lines:?}"
+        );
+        assert_eq!(lines.len(), 1, "one DEL for one ADD: {lines:?}");
+    }
 }
