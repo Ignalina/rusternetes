@@ -596,6 +596,17 @@ impl ContainerRuntime {
         let netns_name = format!("cni-{}", pod_name);
         let netns_path = self.netns.path(&netns_name).to_string_lossy().into_owned();
 
+        // The ADD of an earlier start (dropped by the kubelet's pod-start
+        // timeout) still runs: wait for it rather than tearing its namespace
+        // down under it; it records its attachment, and the sandbox is kept.
+        let waited = std::time::Instant::now();
+        while cni.add_in_flight(pod_name) {
+            if waited.elapsed() > std::time::Duration::from_secs(20) {
+                anyhow::bail!("the CNI ADD of an earlier start of pod {pod_name} still runs");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
         if std::path::Path::new(&netns_path).exists() {
             if cni
                 .get_attachments(pod_name)

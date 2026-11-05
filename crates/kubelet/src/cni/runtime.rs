@@ -51,6 +51,20 @@ pub struct CniRuntime {
     /// started after the ADD (a restart, a node-certificate renewal) still
     /// names the pod on DEL. `None`: in memory only.
     args_dir: Option<PathBuf>,
+
+    /// Containers whose ADD runs on the blocking pool now. The ADD goes on
+    /// when its caller is dropped (the kubelet's pod-start timeout), so a
+    /// retry must not take its namespace for stale.
+    adds_in_flight: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+/// Takes a container out of [`CniRuntime::adds_in_flight`] when its ADD ends.
+struct AddInFlight(Arc<Mutex<std::collections::HashSet<String>>>, String);
+
+impl Drop for AddInFlight {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().remove(&self.1);
+    }
 }
 
 /// The `CNI_CONTAINERID` for a pod sandbox the kubelet names by `id` (the
@@ -82,6 +96,7 @@ impl CniRuntime {
             default_network: None,
             fallback_networks: Vec::new(),
             args_dir: None,
+            adds_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -273,7 +288,13 @@ impl CniRuntime {
         args: Option<String>,
     ) -> Result<CniResult, CniError> {
         let cni = Arc::clone(self);
+        self.adds_in_flight
+            .lock()
+            .unwrap()
+            .insert(container_id.clone());
+        let in_flight = AddInFlight(Arc::clone(&self.adds_in_flight), container_id.clone());
         tokio::task::spawn_blocking(move || {
+            let _in_flight = in_flight;
             cni.setup_network_with_args(
                 &container_id,
                 &netns,
@@ -289,6 +310,11 @@ impl CniRuntime {
                 format!("the CNI ADD task failed: {e}"),
             ))
         })
+    }
+
+    /// Is an ADD for this container still running (its caller may be gone)?
+    pub fn add_in_flight(&self, container_id: &str) -> bool {
+        self.adds_in_flight.lock().unwrap().contains(container_id)
     }
 
     /// [`Self::teardown_network`] for the async callers.
