@@ -511,6 +511,26 @@ mod tests {
         }
     }
 
+    /// HostConfig `group_add` (the pod's supplementalGroups) is the OCI
+    /// process's additionalGids.
+    #[test]
+    fn group_add_is_the_process_additional_gids() {
+        let c = ContainerConfig {
+            cmd: s(&["true"]),
+            host_config: Some(HostConfig {
+                group_add: s(&["2900", "10"]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let image = ImageConfig::default();
+        let spec = build(&input(&c, &image)).unwrap();
+        assert_eq!(spec["process"]["user"]["additionalGids"], json!([2900, 10]));
+        let c = ContainerConfig { cmd: s(&["true"]), ..Default::default() };
+        let spec = build(&input(&c, &image)).unwrap();
+        assert!(spec["process"]["user"].get("additionalGids").is_none());
+    }
+
     #[test]
     fn spec_has_namespaces_mounts_and_limits() {
         let c = ContainerConfig {
