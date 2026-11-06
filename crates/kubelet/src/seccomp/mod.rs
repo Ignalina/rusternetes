@@ -57,15 +57,20 @@ pub fn profile_root() -> PathBuf {
 /// `seccompDefault` (upstream kubelet `--seccomp-default`): on when
 /// `$KUBELET_SECCOMP_DEFAULT` is `true` or `1`.
 pub fn default_on() -> bool {
-    matches!(std::env::var("KUBELET_SECCOMP_DEFAULT").as_deref(), Ok("true") | Ok("1"))
+    matches!(
+        std::env::var("KUBELET_SECCOMP_DEFAULT").as_deref(),
+        Ok("true") | Ok("1")
+    )
 }
 
 /// `seccompDefault` applied to a resolved setting: a container that names no
 /// profile (pod or container) runs under RuntimeDefault, not unconfined; a
 /// privileged one stays unconfined (upstream).
 pub fn apply_default(resolved: Option<Seccomp>, privileged: bool, on: bool) -> Option<Seccomp> {
-    let _ = (privileged, on);
-    resolved
+    match resolved {
+        None if on && !privileged => Some(Seccomp::RuntimeDefault),
+        r => r,
+    }
 }
 
 /// The container's setting: its own profile, else the pod's; `None` when
@@ -647,9 +652,20 @@ mod tests {
     /// seccompDefault (lane TUNNR-OPEN): a pod that names no profile is filtered.
     #[test]
     fn seccomp_default_puts_a_container_without_a_profile_under_runtime_default() {
-        assert_eq!(apply_default(None, false, true), Some(Seccomp::RuntimeDefault));
+        assert_eq!(
+            apply_default(None, false, true),
+            Some(Seccomp::RuntimeDefault)
+        );
         assert_eq!(apply_default(None, false, false), None, "off: as before");
-        assert_eq!(apply_default(None, true, true), None, "privileged stays unconfined");
-        assert_eq!(apply_default(Some(Seccomp::Unconfined), false, true), Some(Seccomp::Unconfined), "a named profile wins");
+        assert_eq!(
+            apply_default(None, true, true),
+            None,
+            "privileged stays unconfined"
+        );
+        assert_eq!(
+            apply_default(Some(Seccomp::Unconfined), false, true),
+            Some(Seccomp::Unconfined),
+            "a named profile wins"
+        );
     }
 }
