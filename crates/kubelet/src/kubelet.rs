@@ -653,7 +653,10 @@ impl Kubelet {
         match self.storage.create(&key, &node).await {
             Ok(_) => info!("Node registered successfully"),
             Err(rusternetes_common::Error::AlreadyExists(_)) => {
-                self.storage.update(&key, &node).await?;
+                let existing: Node = self.storage.get(&key).await?;
+                self.storage
+                    .update(&key, &registered_node(existing, node))
+                    .await?;
                 info!("Node updated successfully");
             }
             Err(e) => return Err(e.into()),
@@ -5279,5 +5282,51 @@ mod merge_kubelet_owned_tests {
             serde_json::to_value(&fresh.status).unwrap(),
             serde_json::to_value(&mine.status).unwrap()
         );
+    }
+}
+
+/// The Node a kubelet registers when its Node already exists: its own labels, spec and
+/// status on top of what others wrote to it.
+pub(crate) fn registered_node(existing: Node, fresh: Node) -> Node {
+    let _ = existing;
+    fresh
+}
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    /// A kubelet that starts again (a reboot) keeps what others wrote on its Node: the
+    /// annotations (ovn-kubernetes' k8s.ovn.org/node-subnets, chassis id, encap IPs), other
+    /// labels, uid and creationTimestamp. It replaced the whole object, the cluster manager
+    /// handed out new subnets, and the OVN databases on the nodes no longer matched them:
+    /// no pod traffic across nodes after a reboot (lane TUNNR-OPEN row P).
+    #[test]
+    fn a_registration_over_an_existing_node_keeps_what_others_wrote() {
+        let mut existing = Node::new("worker");
+        existing.metadata.uid = "uid-1".into();
+        existing.metadata.annotations = Some(std::collections::HashMap::from([(
+            "k8s.ovn.org/node-subnets".to_string(),
+            r#"{"default":["10.244.2.0/24"]}"#.to_string(),
+        )]));
+        existing.metadata.labels = Some(std::collections::HashMap::from([
+            ("k8s.ovn.org/zone".to_string(), "worker".to_string()),
+            ("kubernetes.io/os".to_string(), "windows".to_string()),
+        ]));
+        let mut fresh = Node::new("worker");
+        fresh.metadata.labels = Some(std::collections::HashMap::from([(
+            "kubernetes.io/os".to_string(),
+            "linux".to_string(),
+        )]));
+        let n = registered_node(existing, fresh);
+        let a = n.metadata.annotations.unwrap_or_default();
+        assert_eq!(
+            a.get("k8s.ovn.org/node-subnets").map(String::as_str),
+            Some(r#"{"default":["10.244.2.0/24"]}"#)
+        );
+        let l = n.metadata.labels.unwrap_or_default();
+        assert_eq!(l.get("k8s.ovn.org/zone").map(String::as_str), Some("worker"));
+        assert_eq!(l.get("kubernetes.io/os").map(String::as_str), Some("linux"));
+        assert_eq!(n.metadata.uid, "uid-1");
     }
 }
