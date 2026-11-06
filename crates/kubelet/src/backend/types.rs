@@ -128,6 +128,8 @@ pub struct HostConfig {
     pub cpu_shares: Option<i64>,
     pub readonly_rootfs: Option<bool>,
     pub security_opt: Option<Vec<String>>,
+    /// Extra groups of the container's process (Docker `GroupAdd`).
+    pub group_add: Option<Vec<String>>,
     pub cap_add: Option<Vec<String>>,
     pub cap_drop: Option<Vec<String>>,
     pub privileged: Option<bool>,
