@@ -24,7 +24,7 @@ pub struct DockerBackend {
 pub const HOST_NETNS_ENV: &str = "KUBELET_DOCKER_HOST_NETNS";
 
 fn host_netns_from(v: Option<&str>) -> bool {
-    false
+    matches!(v.map(str::trim), Some("1" | "true" | "yes"))
 }
 
 impl DockerBackend {
@@ -39,6 +39,10 @@ impl DockerBackend {
 
 #[async_trait]
 impl ContainerBackend for DockerBackend {
+    fn joins_kubelet_netns(&self) -> bool {
+        self.host_netns
+    }
+
     async fn version_identity(&self) -> Result<String> {
         let version = self.docker.version().await?;
         Ok(version
