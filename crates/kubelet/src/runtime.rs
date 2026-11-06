@@ -8716,12 +8716,22 @@ fn node_internal_ip() -> String {
 const CNI_ARGS_DIR: &str = "/var/lib/cni/rusternetes-args";
 
 /// A volume mount as a `binds` entry (`src:dst[:opts]`).
+/// `mountPropagation` Bidirectional is `rshared`, HostToContainer `rslave`
+/// (as the CRI runtimes map them); None or unset keeps the runtime's default.
 fn volume_bind(src: &str, dst: &str, read_only: bool, propagation: Option<&str>) -> String {
-    let _ = propagation;
+    let mut opts: Vec<&str> = Vec::new();
     if read_only {
-        format!("{src}:{dst}:ro")
-    } else {
+        opts.push("ro");
+    }
+    match propagation {
+        Some("Bidirectional") => opts.push("rshared"),
+        Some("HostToContainer") => opts.push("rslave"),
+        _ => {}
+    }
+    if opts.is_empty() {
         format!("{src}:{dst}")
+    } else {
+        format!("{src}:{dst}:{}", opts.join(","))
     }
 }
 
@@ -8750,8 +8760,14 @@ mod volume_bind_tests {
         assert_eq!(volume_bind("/a", "/b", false, None), "/a:/b");
         assert_eq!(volume_bind("/a", "/b", true, None), "/a:/b:ro");
         assert_eq!(volume_bind("/a", "/b", false, Some("None")), "/a:/b");
-        assert_eq!(volume_bind("/a", "/b", false, Some("Bidirectional")), "/a:/b:rshared");
-        assert_eq!(volume_bind("/a", "/b", true, Some("HostToContainer")), "/a:/b:ro,rslave");
+        assert_eq!(
+            volume_bind("/a", "/b", false, Some("Bidirectional")),
+            "/a:/b:rshared"
+        );
+        assert_eq!(
+            volume_bind("/a", "/b", true, Some("HostToContainer")),
+            "/a:/b:ro,rslave"
+        );
     }
 }
 
