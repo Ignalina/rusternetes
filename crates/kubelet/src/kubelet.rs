@@ -5287,8 +5287,23 @@ mod merge_kubelet_owned_tests {
 
 /// The Node a kubelet registers when its Node already exists: its own labels, spec and
 /// status on top of what others wrote to it.
-pub(crate) fn registered_node(existing: Node, fresh: Node) -> Node {
-    let _ = existing;
+pub(crate) fn registered_node(existing: Node, mut fresh: Node) -> Node {
+    let mut labels = existing.metadata.labels.clone().unwrap_or_default();
+    labels.extend(fresh.metadata.labels.take().unwrap_or_default());
+    let mut meta = existing.metadata;
+    meta.labels = Some(labels);
+    // Registration writes over whatever version is stored (as before).
+    meta.resource_version = None;
+    fresh.metadata = meta;
+    if let (Some(fs), Some(es)) = (fresh.spec.as_mut(), existing.spec.as_ref()) {
+        // Taints and the provider id belong to others too.
+        if fs.taints.is_none() {
+            fs.taints = es.taints.clone();
+        }
+        if fs.provider_id.is_none() {
+            fs.provider_id = es.provider_id.clone();
+        }
+    }
     fresh
 }
 
@@ -5325,7 +5340,10 @@ mod register_tests {
             Some(r#"{"default":["10.244.2.0/24"]}"#)
         );
         let l = n.metadata.labels.unwrap_or_default();
-        assert_eq!(l.get("k8s.ovn.org/zone").map(String::as_str), Some("worker"));
+        assert_eq!(
+            l.get("k8s.ovn.org/zone").map(String::as_str),
+            Some("worker")
+        );
         assert_eq!(l.get("kubernetes.io/os").map(String::as_str), Some("linux"));
         assert_eq!(n.metadata.uid, "uid-1");
     }
