@@ -1860,6 +1860,20 @@ impl ContainerRuntime {
                     Some(port_bindings)
                 },
                 sysctls: sysctls_map,
+                // The sandbox takes the pod's seccompProfile, else seccompDefault (upstream).
+                seccomp: crate::seccomp::apply_default(
+                    crate::seccomp::resolve(
+                        pod.spec
+                            .as_ref()
+                            .and_then(|s| s.security_context.as_ref())
+                            .and_then(|sc| sc.seccomp_profile.as_ref()),
+                        None,
+                        false,
+                        &crate::seccomp::profile_root(),
+                    )?,
+                    false,
+                    crate::seccomp::default_on(),
+                ),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4844,6 +4858,16 @@ impl ContainerRuntime {
                 .unwrap_or(false),
             &crate::seccomp::profile_root(),
         )?;
+        // seccompDefault: no profile anywhere is RuntimeDefault, not unconfined.
+        let seccomp_setting = crate::seccomp::apply_default(
+            seccomp_setting,
+            container
+                .security_context
+                .as_ref()
+                .and_then(|sc| sc.privileged)
+                .unwrap_or(false),
+            crate::seccomp::default_on(),
+        );
 
         // Resolve runAsUser and runAsGroup from container or pod security context
         let run_as_user_id: Option<i64> = container
