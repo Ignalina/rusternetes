@@ -30,6 +30,8 @@ pub(crate) struct FakeState {
     last_exec: Vec<String>,
     /// Images whose containers cannot be created (a broken image).
     pub failing_images: std::collections::BTreeSet<String>,
+    /// Images not on the node until a pull, which takes the given time.
+    pub missing_images: BTreeMap<String, std::time::Duration>,
 }
 
 /// Containers live in a map; nothing runs.
@@ -61,6 +63,12 @@ impl FakeBackend {
                 config: ContainerConfig::default(),
             },
         );
+    }
+
+    /// `image` is not on the node; a pull of it takes `takes` (calls `pull <image>`, then
+    /// `pulled <image>` when it ends; a pull dropped before then never ends).
+    pub fn missing_image(&self, image: &str, takes: std::time::Duration) {
+        self.state.lock().unwrap().missing_images.insert(image.to_string(), takes);
     }
 
     /// Containers of `image` fail to be created until `fail` is false again.
@@ -118,12 +126,30 @@ impl ContainerBackend for FakeBackend {
         Ok(self.identity.clone())
     }
 
-    async fn inspect_image(&self, _image: &str) -> Result<ImageInspect> {
+    async fn inspect_image(&self, image: &str) -> Result<ImageInspect> {
+        if self.state.lock().unwrap().missing_images.contains_key(image) {
+            return Err(anyhow!("404 no such image: {image}"));
+        }
         Ok(ImageInspect::default())
     }
 
-    fn pull_image<'a>(&'a self, _image: &'a str) -> BackendStream<'a, PullProgress> {
-        futures::stream::empty().boxed()
+    fn pull_image<'a>(&'a self, image: &'a str) -> BackendStream<'a, PullProgress> {
+        let takes = {
+            let mut st = self.state.lock().unwrap();
+            st.calls.push(format!("pull {image}"));
+            st.missing_images.get(image).copied()
+        };
+        let Some(takes) = takes else {
+            return futures::stream::empty().boxed();
+        };
+        futures::stream::once(async move {
+            tokio::time::sleep(takes).await;
+            let mut st = self.state.lock().unwrap();
+            st.missing_images.remove(image);
+            st.calls.push(format!("pulled {image}"));
+            Ok(PullProgress::default())
+        })
+        .boxed()
     }
 
     async fn create_container(&self, name: &str, config: ContainerConfig) -> Result<String> {

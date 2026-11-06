@@ -12272,6 +12272,30 @@ mod backend_tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    /// A pull outlives the pod start that asked for it (the kubelet drops a start after
+    /// 30 s), and a second start while it runs waits for it instead of pulling again. With
+    /// podman the dropped request cancelled the pull ('writing blob: storing ...: broken
+    /// pipe') and every 30 s retry began a new one, so the 1 GB OVN image never arrived
+    /// (lane TUNNR-OPEN row P).
+    #[tokio::test]
+    async fn a_pull_outlives_the_start_that_asked_for_it_and_runs_once() {
+        use std::time::Duration;
+        let img = "docker.io/library/big:1";
+        let backend = Arc::new(FakeBackend::new("podman"));
+        backend.missing_image(img, Duration::from_millis(600));
+        let (rt, _v) = runtime_with(backend.clone()).await;
+        let first = tokio::time::timeout(Duration::from_millis(100), rt.ensure_image(img, None)).await;
+        assert!(first.is_err(), "the first start should give up");
+        rt.ensure_image(img, None).await.unwrap();
+        let calls = backend.state.lock().unwrap().calls.clone();
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("pull ")).count(),
+            1,
+            "{calls:?}"
+        );
+        assert!(calls.iter().any(|c| c == &format!("pulled {img}")), "{calls:?}");
+    }
+
     async fn runtime_with(backend: Arc<FakeBackend>) -> (ContainerRuntime, tempfile::TempDir) {
         let volumes = tempfile::tempdir().unwrap();
         let runtime = ContainerRuntime::with_backend(
