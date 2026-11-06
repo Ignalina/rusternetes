@@ -358,6 +358,7 @@ fn to_bollard_config(c: ContainerConfig) -> bc::Config<String> {
         hostname: c.hostname,
         exposed_ports: c.exposed_ports,
         host_config: c.host_config.map(|h| bm::HostConfig {
+            group_add: h.group_add,
             binds: h.binds,
             mounts: h.mounts.map(|ms| {
                 ms.into_iter()

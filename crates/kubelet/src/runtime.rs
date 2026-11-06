@@ -4909,6 +4909,7 @@ impl ContainerRuntime {
                 Some(exposed_ports)
             },
             host_config: Some(HostConfig {
+                group_add: pod_group_add(pod),
                 port_bindings: if port_bindings.is_empty() {
                     None
                 } else {
@@ -8609,6 +8610,22 @@ impl Drop for StartInFlight {
     }
 }
 
+/// The pod's extra groups for every container process (Docker `GroupAdd`):
+/// `securityContext.supplementalGroups`, then `fsGroup`, as the kubelet adds
+/// them to each container's supplementary groups.
+fn pod_group_add(pod: &Pod) -> Option<Vec<String>> {
+    let sc = pod.spec.as_ref()?.security_context.as_ref()?;
+    let groups: Vec<String> = sc
+        .supplemental_groups
+        .iter()
+        .flatten()
+        .copied()
+        .chain(sc.fs_group)
+        .map(|g| g.to_string())
+        .collect();
+    (!groups.is_empty()).then_some(groups)
+}
+
 /// `spec.hostNetwork: true`.
 fn is_host_network(pod: &Pod) -> bool {
     pod.spec.as_ref().and_then(|s| s.host_network) == Some(true)
@@ -10078,6 +10095,44 @@ mod tests {
 
     use rusternetes_common::resources::pod::{PodSecurityContext, Sysctl};
     use std::collections::HashMap;
+
+    /// supplementalGroups (then fsGroup) reach the container as extra groups:
+    /// a node gate like `kernel.io_uring_group` checks them.
+    #[test]
+    fn supplemental_groups_and_fs_group_are_the_containers_extra_groups() {
+        let mut pod = make_pod_with_sysctls("g", Some(vec![]));
+        assert_eq!(super::pod_group_add(&pod), None);
+        let sc = pod
+            .spec
+            .as_mut()
+            .unwrap()
+            .security_context
+            .as_mut()
+            .unwrap();
+        sc.supplemental_groups = Some(vec![2900, 10]);
+        sc.fs_group = Some(2000);
+        assert_eq!(
+            super::pod_group_add(&pod),
+            Some(vec![
+                "2900".to_string(),
+                "10".to_string(),
+                "2000".to_string()
+            ])
+        );
+        sc_fs_only(&mut pod);
+        assert_eq!(super::pod_group_add(&pod), Some(vec!["2000".to_string()]));
+    }
+
+    fn sc_fs_only(pod: &mut Pod) {
+        let sc = pod
+            .spec
+            .as_mut()
+            .unwrap()
+            .security_context
+            .as_mut()
+            .unwrap();
+        sc.supplemental_groups = None;
+    }
 
     /// Helper: build a pod with optional sysctls in its security context
     fn make_pod_with_sysctls(name: &str, sysctls: Option<Vec<Sysctl>>) -> Pod {
