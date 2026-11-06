@@ -120,6 +120,9 @@ pub struct ContainerRuntime {
     probe_states: Mutex<HashMap<String, ProbeState>>,
     /// Cache of images known to exist locally (avoid repeated Docker API calls)
     image_cache: Mutex<std::collections::HashSet<String>>,
+    /// Pulls in flight, by image: each runs on its own task (a pod start that gives
+    /// up does not cancel it) and a second request for the image waits for it.
+    pulls: PullsInFlight,
     /// Cache of shell availability per image (true = has /bin/sh)
     shell_cache: Mutex<HashMap<String, bool>>,
     /// Names of containers this process is currently creating and starting
@@ -390,6 +393,7 @@ impl ContainerRuntime {
             token_manager,
             probe_states: Mutex::new(HashMap::new()),
             image_cache: Mutex::new(std::collections::HashSet::new()),
+            pulls: PullsInFlight::default(),
             shell_cache: Mutex::new(HashMap::new()),
             starting_containers: Arc::new(Mutex::new(std::collections::HashSet::new())),
             csi: Arc::new(crate::csi::CsiManager::from_env()),
@@ -829,7 +833,55 @@ impl ContainerRuntime {
 
     /// Pull image with retry logic
     async fn pull_image_with_retry(&self, image: &str) -> Result<()> {
-        let mut stream = self.backend.pull_image(image);
+        let mut rx = {
+            let mut m = self.pulls.lock().unwrap();
+            match m.get(image) {
+                Some(rx) => rx.clone(),
+                None => {
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    m.insert(image.to_string(), rx.clone());
+                    let backend = Arc::clone(&self.backend);
+                    let pulls = Arc::clone(&self.pulls);
+                    let img = image.to_string();
+                    tokio::spawn(async move {
+                        let r = drive_pull(&*backend, &img).await;
+                        pulls.lock().unwrap().remove(&img);
+                        let _ = tx.send(Some(r.map_err(|e| format!("{e:#}"))));
+                    });
+                    rx
+                }
+            }
+        };
+        loop {
+            if let Some(r) = rx.borrow().clone() {
+                return r.map_err(|e| anyhow::anyhow!(e));
+            }
+            if rx.changed().await.is_err() {
+                return match rx.borrow().clone() {
+                    Some(r) => r.map_err(|e| anyhow::anyhow!(e)),
+                    None => Err(anyhow::anyhow!(
+                        "the pull of {image} ended without an answer"
+                    )),
+                };
+            }
+        }
+    }
+}
+
+/// [`ContainerRuntime`]'s pulls in flight: image -> the answer when its pull ends.
+type PullsInFlight = Arc<
+    Mutex<
+        std::collections::HashMap<
+            String,
+            tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+        >,
+    >,
+>;
+
+/// One pull through the backend, read to its end.
+async fn drive_pull(backend: &dyn ContainerBackend, image: &str) -> Result<()> {
+    {
+        let mut stream = backend.pull_image(image);
         let mut last_error = None;
 
         while let Some(result) = stream.next().await {
@@ -860,7 +912,9 @@ impl ContainerRuntime {
 
         Ok(())
     }
+}
 
+impl ContainerRuntime {
     /// Start all containers for a pod
     pub async fn start_pod(&self, pod: &Pod) -> Result<()> {
         let pod_name = &pod.metadata.name;
@@ -12284,7 +12338,8 @@ mod backend_tests {
         let backend = Arc::new(FakeBackend::new("podman"));
         backend.missing_image(img, Duration::from_millis(600));
         let (rt, _v) = runtime_with(backend.clone()).await;
-        let first = tokio::time::timeout(Duration::from_millis(100), rt.ensure_image(img, None)).await;
+        let first =
+            tokio::time::timeout(Duration::from_millis(100), rt.ensure_image(img, None)).await;
         assert!(first.is_err(), "the first start should give up");
         rt.ensure_image(img, None).await.unwrap();
         let calls = backend.state.lock().unwrap().calls.clone();
@@ -12293,7 +12348,10 @@ mod backend_tests {
             1,
             "{calls:?}"
         );
-        assert!(calls.iter().any(|c| c == &format!("pulled {img}")), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c == &format!("pulled {img}")),
+            "{calls:?}"
+        );
     }
 
     async fn runtime_with(backend: Arc<FakeBackend>) -> (ContainerRuntime, tempfile::TempDir) {

@@ -68,7 +68,11 @@ impl FakeBackend {
     /// `image` is not on the node; a pull of it takes `takes` (calls `pull <image>`, then
     /// `pulled <image>` when it ends; a pull dropped before then never ends).
     pub fn missing_image(&self, image: &str, takes: std::time::Duration) {
-        self.state.lock().unwrap().missing_images.insert(image.to_string(), takes);
+        self.state
+            .lock()
+            .unwrap()
+            .missing_images
+            .insert(image.to_string(), takes);
     }
 
     /// Containers of `image` fail to be created until `fail` is false again.
@@ -127,7 +131,13 @@ impl ContainerBackend for FakeBackend {
     }
 
     async fn inspect_image(&self, image: &str) -> Result<ImageInspect> {
-        if self.state.lock().unwrap().missing_images.contains_key(image) {
+        if self
+            .state
+            .lock()
+            .unwrap()
+            .missing_images
+            .contains_key(image)
+        {
             return Err(anyhow!("404 no such image: {image}"));
         }
         Ok(ImageInspect::default())
