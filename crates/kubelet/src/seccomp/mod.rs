@@ -379,13 +379,18 @@ mod oci_seccomp {
 /// text Docker's API takes: "opening seccomp profile failed: ... file name too
 /// long"); the kubelet and podman share the node's filesystem.
 pub fn docker_security_opt_by_path(s: &Seccomp) -> Option<String> {
-    let _ = s;
-    None
+    match s {
+        Seccomp::Localhost { path, .. } => Some(format!("seccomp={}", path.display())),
+        other => docker_security_opt(other),
+    }
 }
 
 /// `$KUBELET_DOCKER_SECCOMP_BY_PATH` (`true`/`1`): name Localhost profiles by path (podman).
 pub fn docker_seccomp_by_path() -> bool {
-    matches!(std::env::var("KUBELET_DOCKER_SECCOMP_BY_PATH").as_deref(), Ok("true") | Ok("1"))
+    matches!(
+        std::env::var("KUBELET_DOCKER_SECCOMP_BY_PATH").as_deref(),
+        Ok("true") | Ok("1")
+    )
 }
 
 pub fn docker_security_opt(s: &Seccomp) -> Option<String> {
@@ -686,10 +691,23 @@ mod tests {
     /// podman's Docker API takes a Localhost profile by its path, not its text.
     #[test]
     fn a_localhost_profile_goes_to_podman_by_path() {
-        let l = Seccomp::Localhost { path: PathBuf::from("/var/lib/kubelet/seccomp/bench/busybox.json"), profile: "{}".into() };
-        assert_eq!(docker_security_opt_by_path(&l).as_deref(), Some("seccomp=/var/lib/kubelet/seccomp/bench/busybox.json"));
-        assert_eq!(docker_security_opt_by_path(&Seccomp::Unconfined).as_deref(), Some("seccomp=unconfined"));
+        let l = Seccomp::Localhost {
+            path: PathBuf::from("/var/lib/kubelet/seccomp/bench/busybox.json"),
+            profile: "{}".into(),
+        };
+        assert_eq!(
+            docker_security_opt_by_path(&l).as_deref(),
+            Some("seccomp=/var/lib/kubelet/seccomp/bench/busybox.json")
+        );
+        assert_eq!(
+            docker_security_opt_by_path(&Seccomp::Unconfined).as_deref(),
+            Some("seccomp=unconfined")
+        );
         assert_eq!(docker_security_opt_by_path(&Seccomp::RuntimeDefault), None);
-        assert_eq!(docker_security_opt(&l).as_deref(), Some("seccomp={}"), "Docker's API: the text, as before");
+        assert_eq!(
+            docker_security_opt(&l).as_deref(),
+            Some("seccomp={}"),
+            "Docker's API: the text, as before"
+        );
     }
 }

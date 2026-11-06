@@ -419,11 +419,13 @@ fn to_bollard_config(c: ContainerConfig) -> bc::Config<String> {
             readonly_rootfs: h.readonly_rootfs,
             security_opt: {
                 let mut opts = h.security_opt.unwrap_or_default();
-                opts.extend(
-                    h.seccomp
-                        .as_ref()
-                        .and_then(crate::seccomp::docker_security_opt),
-                );
+                opts.extend(h.seccomp.as_ref().and_then(|s| {
+                    if crate::seccomp::docker_seccomp_by_path() {
+                        crate::seccomp::docker_security_opt_by_path(s)
+                    } else {
+                        crate::seccomp::docker_security_opt(s)
+                    }
+                }));
                 (!opts.is_empty()).then_some(opts)
             },
             cap_add: h.cap_add,
