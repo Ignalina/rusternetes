@@ -4519,12 +4519,12 @@ impl ContainerRuntime {
                             };
                             tmpfs_mounts.insert(mount.mount_path.clone(), opts);
                         } else {
-                            let ro_suffix = if read_only { ":ro" } else { "" };
-                            let bind = format!(
-                                "{}:{}{}",
-                                effective_host_path, mount.mount_path, ro_suffix
-                            );
-                            binds.push(bind);
+                            binds.push(volume_bind(
+                                &effective_host_path,
+                                &mount.mount_path,
+                                read_only,
+                                mount.mount_propagation.as_deref(),
+                            ));
                         }
                         info!(
                             "Mounting volume {} at {} in container {}",
@@ -8715,6 +8715,16 @@ fn node_internal_ip() -> String {
 /// CNI result cache of the CRI runtimes lives beside it, in /var/lib/cni).
 const CNI_ARGS_DIR: &str = "/var/lib/cni/rusternetes-args";
 
+/// A volume mount as a `binds` entry (`src:dst[:opts]`).
+fn volume_bind(src: &str, dst: &str, read_only: bool, propagation: Option<&str>) -> String {
+    let _ = propagation;
+    if read_only {
+        format!("{src}:{dst}:ro")
+    } else {
+        format!("{src}:{dst}")
+    }
+}
+
 /// `CNI_ARGS` for a pod, as the CRI runtimes pass them: plugins such as
 /// Cilium's look the pod up by namespace and name.
 fn cni_args(pod: &Pod, container_id: &str) -> String {
@@ -8725,6 +8735,24 @@ fn cni_args(pod: &Pod, container_id: &str) -> String {
         crate::cni::runtime::cni_container_id(container_id),
         pod.metadata.uid,
     )
+}
+
+#[cfg(test)]
+mod volume_bind_tests {
+    use super::volume_bind;
+
+    /// A volumeMount's mountPropagation reaches the bind: ovnkube-node mounts the host's
+    /// /var/run/netns Bidirectional and must see the pod namespaces the kubelet binds there
+    /// later; with podman the bind was private and the CNI ADD failed ('failed to open
+    /// netns /var/run/netns/cni-web: unknown FS magic', lane TUNNR-OPEN row P).
+    #[test]
+    fn mount_propagation_becomes_the_binds_propagation() {
+        assert_eq!(volume_bind("/a", "/b", false, None), "/a:/b");
+        assert_eq!(volume_bind("/a", "/b", true, None), "/a:/b:ro");
+        assert_eq!(volume_bind("/a", "/b", false, Some("None")), "/a:/b");
+        assert_eq!(volume_bind("/a", "/b", false, Some("Bidirectional")), "/a:/b:rshared");
+        assert_eq!(volume_bind("/a", "/b", true, Some("HostToContainer")), "/a:/b:ro,rslave");
+    }
 }
 
 #[cfg(test)]
