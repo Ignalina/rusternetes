@@ -245,9 +245,19 @@ pub fn build(input: &SpecInput) -> Result<Value> {
         .iter()
         .flatten()
         .any(|o| o.starts_with("no-new-privileges"));
+    let mut user = json!({"uid": input.uid, "gid": input.gid});
+    let extra: Vec<u32> = hc
+        .group_add
+        .iter()
+        .flatten()
+        .filter_map(|g| g.parse().ok())
+        .collect();
+    if !extra.is_empty() {
+        user["additionalGids"] = json!(extra);
+    }
     spec["process"] = json!({
         "terminal": false,
-        "user": {"uid": input.uid, "gid": input.gid},
+        "user": user,
         "args": args,
         "env": process_env(input.config, input.image, &hostname),
         "cwd": cwd,
@@ -526,7 +536,10 @@ mod tests {
         let image = ImageConfig::default();
         let spec = build(&input(&c, &image)).unwrap();
         assert_eq!(spec["process"]["user"]["additionalGids"], json!([2900, 10]));
-        let c = ContainerConfig { cmd: s(&["true"]), ..Default::default() };
+        let c = ContainerConfig {
+            cmd: s(&["true"]),
+            ..Default::default()
+        };
         let spec = build(&input(&c, &image)).unwrap();
         assert!(spec["process"]["user"].get("additionalGids").is_none());
     }
