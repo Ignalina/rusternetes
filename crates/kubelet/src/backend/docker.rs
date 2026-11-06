@@ -14,6 +14,17 @@ use super::ContainerBackend;
 #[derive(Clone)]
 pub struct DockerBackend {
     docker: Docker,
+    host_netns: bool,
+}
+
+/// `KUBELET_DOCKER_HOST_NETNS`: the daemon runs on the kubelet's own host (Podman's
+/// `podman system service` on the node, a host dockerd) and can put containers into
+/// the network namespaces the kubelet makes for CNI (`ns:<path>`). Unset: it cannot
+/// (a daemon in a VM, e.g. Podman Machine), and the kubelet keeps CNI off.
+pub const HOST_NETNS_ENV: &str = "KUBELET_DOCKER_HOST_NETNS";
+
+fn host_netns_from(v: Option<&str>) -> bool {
+    false
 }
 
 impl DockerBackend {
@@ -21,6 +32,7 @@ impl DockerBackend {
     pub fn connect_with_local_defaults() -> Result<Self> {
         Ok(Self {
             docker: Docker::connect_with_local_defaults()?,
+            host_netns: host_netns_from(std::env::var(HOST_NETNS_ENV).ok().as_deref()),
         })
     }
 }
@@ -424,5 +436,24 @@ fn to_bollard_config(c: ContainerConfig) -> bc::Config<String> {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod host_netns_tests {
+    use super::*;
+
+    /// Rusternetes + podman on plain hosts (lane TUNNR-OPEN row P): the kubelet found the CNI
+    /// plugins and could make namespaces, but kept CNI off ('Network namespace isolation
+    /// prevents CNI usage') because the Docker-API backend never says it can join them, so
+    /// OVN-Kubernetes never wired a pod.
+    #[test]
+    fn a_daemon_on_the_kubelets_host_joins_its_namespaces_when_told() {
+        for v in ["1", "true", "yes"] {
+            assert!(host_netns_from(Some(v)), "{v}");
+        }
+        for v in [None, Some(""), Some("0"), Some("false")] {
+            assert!(!host_netns_from(v), "{v:?}");
+        }
     }
 }
