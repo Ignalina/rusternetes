@@ -608,3 +608,27 @@ async fn test_field_validation_strict_pod_update_unknown_field_rejected() {
         message
     );
 }
+
+#[tokio::test]
+async fn test_field_validation_strict_pod_host_pid_and_host_ipc_accepted() {
+    // The upstream PodSpec names them `hostPID` and `hostIPC` (not camelCase
+    // `hostPid` / `hostIpc`). Under the default Strict decoding a pod that asks
+    // for the node's PID or IPC namespace must be accepted, keep both fields,
+    // and read back with the upstream names (kubectl, the seccomp/audit pods).
+    let (_mem, router) = spawn_router();
+    let mut stub = pod_stub("pod-host-pid-ipc");
+    stub["spec"]["hostPID"] = json!(true);
+    stub["spec"]["hostIPC"] = json!(true);
+    let uri = format!("{}?fieldValidation=Strict", pod_uri());
+
+    let (status, _hdrs, body) = send_json(router, Method::POST, &uri, &stub).await;
+
+    assert!(
+        status.is_success(),
+        "hostPID/hostIPC are PodSpec fields; got {}: body={}",
+        status,
+        body
+    );
+    assert_eq!(body["spec"]["hostPID"], json!(true), "body={}", body);
+    assert_eq!(body["spec"]["hostIPC"], json!(true), "body={}", body);
+}
