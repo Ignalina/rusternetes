@@ -12,6 +12,6 @@ with the clone3 fix", tool pin heimdall main 9d4114d):
 | `pod-nginx-alpine.x86_64-musl.oci.json` | `.nornir/profiles/rusternetes-node/pod-nginx-alpine/x86_64-musl.oci.json` | `c02ab950328a8c77856fc8bd34bfcd8d88dc8d498bad9e6e414f61122c79e745` |
 
 They are the OCI `linux.seccomp` sections Heimdall's profiler wrote for the
-bench pods; `heimdall_seccomp.rs` (feature `heimdall-seccomp`) runs each one
+bench pods; `../../heimdall.rs` (feature `heimdall-seccomp`) runs each one
 through the shim's container backend and through libseccomp and compares the
 answers in a BPF interpreter.

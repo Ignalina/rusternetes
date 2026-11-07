@@ -23,7 +23,17 @@
 /// Make Heimdall's builder the seccomp backend of the containers this
 /// process creates (once per process; a second call is a no-op).
 pub fn register() -> Result<(), String> {
-    Ok(())
+    use libcontainer::seccomp::{container_backend, set_container_backend};
+    static HEIMDALL: heimdall_youki::HeimdallBackend = heimdall_youki::HeimdallBackend;
+    if set_container_backend(&HEIMDALL).is_ok()
+        || container_backend().name() == heimdall_youki::NAME
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "the containers' seccomp backend is already {:?}, not Heimdall's",
+        container_backend().name()
+    ))
 }
 
 #[cfg(test)]
@@ -510,7 +520,13 @@ mod tests {
             crate::seccomp::to_oci(crate::seccomp::RUNTIME_DEFAULT, &[], "6.12.0").unwrap(),
         )
         .unwrap();
-        let e = container_backend().compile(&spec).unwrap_err().to_string();
-        assert!(e.contains("heimdall"), "{e}");
+        let e = container_backend().compile(&spec).unwrap_err();
+        // The shim prints the chain (`{:#}`): youki's trait has no error of a
+        // backend's own, so Heimdall's reason is the source of LoadProgram.
+        let chain = format!("{:#}", anyhow::Error::from(e));
+        assert!(
+            chain.contains("heimdall seccomp backend") && chain.contains("SCMP_ACT_ERRNO"),
+            "{chain}"
+        );
     }
 }

@@ -167,6 +167,13 @@ pub fn tighten() {
 
 /// Entry point of the shim binary; returns the process exit code.
 pub fn main(args: Vec<String>) -> i32 {
+    // Feature heimdall-seccomp: the container's linux.seccomp is compiled by
+    // Heimdall's builder (the shim's own wait-phase filter keeps the default).
+    #[cfg(feature = "heimdall-seccomp")]
+    if let Err(e) = super::heimdall::register() {
+        eprintln!("rusternetes-youki-shim: {e}");
+        return 1;
+    }
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     match a.as_slice() {
         [_, "create", state, id, bundle, log, exit] => create(
