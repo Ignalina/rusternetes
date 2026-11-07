@@ -21,6 +21,8 @@
 //! network namespace and containers join it, so no pause container is used.
 
 pub mod handler;
+#[cfg(feature = "heimdall-seccomp")]
+pub mod heimdall;
 pub mod image;
 pub mod shim;
 pub mod spec;

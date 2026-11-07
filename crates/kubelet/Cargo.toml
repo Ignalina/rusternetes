@@ -29,6 +29,11 @@ youki = ["dep:libcontainer", "dep:oci-spec", "dep:nix", "dep:oci-image", "dep:uu
 # container profile may hand calls to a seccomp agent (SCMP_ACT_NOTIFY with listenerPath),
 # which records the container's calls (learning a profile). Links libseccomp; off by default.
 seccomp-listener = ["youki", "libcontainer/libseccomp"]
+# A pod's seccomp profile compiled by Heimdall's classic-BPF builder (vendor/heimdall-youki,
+# youki's SeccompBackend trait) instead of the default backend; pure Rust, no libseccomp.
+# Heimdall is AGPL-3.0-only: a shim built with this feature is AGPL-3.0-only as a whole.
+# Off by default. See src/backend/youki/heimdall.rs.
+heimdall-seccomp = ["youki", "dep:heimdall-youki", "dep:heimdall-seccomp"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
@@ -71,12 +76,19 @@ sha2 = "0.10"
 # The image store: references, digests, one-pass layer unpack (crates.io).
 oci-image = { version = "0.1.0", features = ["pull"], optional = true }
 uuid = { workspace = true, optional = true }
+# heimdall-seccomp: Heimdall's builder as libcontainer's seccomp backend, and its
+# interpreter for the tests (vendored from git.gunnar.rs nordisk/heimdall, vendor/HEIMDALL.md).
+heimdall-youki = { package = "nordisk-heimdall-youki", path = "../../vendor/heimdall-youki", features = ["youki"], optional = true }
+heimdall-seccomp = { package = "nordisk-heimdall-seccomp", path = "../../vendor/heimdall-seccomp", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 rcgen.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-tungstenite = "0.24"
+# heimdall-seccomp's test compares Heimdall's programs with libseccomp's (export_bpf);
+# only that test (feature heimdall-seccomp) names it, so only it links the C library.
+libseccomp = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"

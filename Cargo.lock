@@ -2945,6 +2945,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "nordisk-heimdall-seccomp"
+version = "0.3.3"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "nordisk-heimdall-youki"
+version = "0.1.0"
+dependencies = [
+ "libcontainer",
+ "nordisk-heimdall-seccomp",
+ "oci-spec",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4556,7 +4578,10 @@ dependencies = [
  "hyper-util",
  "libc",
  "libcontainer",
+ "libseccomp",
  "nix 0.29.0",
+ "nordisk-heimdall-seccomp",
+ "nordisk-heimdall-youki",
  "oci-image",
  "oci-spec",
  "prost 0.13.5",
