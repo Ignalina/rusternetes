@@ -1736,6 +1736,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_pid_and_host_ipc_use_the_upstream_field_names() {
+        // Upstream PodSpec: `hostPID`, `hostIPC` (json tags), not camelCase.
+        let spec: PodSpec = serde_json::from_value(serde_json::json!({
+            "containers": [{"name": "c", "image": "busybox"}],
+            "hostPID": true,
+            "hostIPC": true
+        }))
+        .unwrap();
+        assert_eq!(spec.host_pid, Some(true));
+        assert_eq!(spec.host_ipc, Some(true));
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["hostPID"], serde_json::json!(true), "{v}");
+        assert_eq!(v["hostIPC"], serde_json::json!(true), "{v}");
+        assert!(v.get("hostPid").is_none() && v.get("hostIpc").is_none(), "{v}");
+    }
+
+    #[test]
     fn test_pod_with_pvc_volume_serialization() {
         let json = r#"{
   "apiVersion": "v1",
