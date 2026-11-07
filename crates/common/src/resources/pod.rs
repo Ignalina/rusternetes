@@ -1761,7 +1761,10 @@ mod tests {
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(v["hostPID"], serde_json::json!(true), "{v}");
         assert_eq!(v["hostIPC"], serde_json::json!(true), "{v}");
-        assert!(v.get("hostPid").is_none() && v.get("hostIpc").is_none(), "{v}");
+        assert!(
+            v.get("hostPid").is_none() && v.get("hostIpc").is_none(),
+            "{v}"
+        );
     }
 
     #[test]
