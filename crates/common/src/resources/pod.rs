@@ -109,10 +109,22 @@ pub struct PodSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Upstream json tag `hostPID` (camelCase would give `hostPid`); the old
+    /// spelling is still read, from objects this fork stored before.
+    #[serde(
+        rename = "hostPID",
+        alias = "hostPid",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_pid: Option<bool>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Upstream json tag `hostIPC` (camelCase would give `hostIpc`); the old
+    /// spelling is still read, from objects this fork stored before.
+    #[serde(
+        rename = "hostIPC",
+        alias = "hostIpc",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub host_ipc: Option<bool>,
 
     /// Affinity rules for pod scheduling
