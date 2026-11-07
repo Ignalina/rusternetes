@@ -491,3 +491,61 @@ mod tests {
         unsafe { nix::libc::fork() }
     }
 }
+
+/// **The listener backend** (`seccomp-listener`): a container profile may hand
+/// calls to a seccomp agent (`SCMP_ACT_NOTIFY` with `listenerPath`), which
+/// learns the container's calls. Only the libseccomp backend has a listener;
+/// the pure-Rust backend (the default build) refuses such a profile.
+#[cfg(test)]
+mod listener_tests {
+    use oci_spec::runtime::{LinuxSeccompAction, LinuxSeccompBuilder, LinuxSyscallBuilder};
+
+    /// Install the profile in a child (a filter is for good) and report how
+    /// it went: 0 a listener fd came back, 1 refused, 2 installed without one.
+    fn install_in_child(s: &oci_spec::runtime::LinuxSeccomp) -> i32 {
+        use nix::sys::wait::{waitpid, WaitStatus};
+        use nix::unistd::{fork, ForkResult};
+        // SAFETY: the child only installs the filter and exits.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                let _ = nix::sys::prctl::set_no_new_privs();
+                let code = match libcontainer::seccomp::initialize_seccomp(s) {
+                    Ok(Some(_)) => 0,
+                    Err(_) => 1,
+                    Ok(None) => 2,
+                };
+                // SAFETY: _exit in the forked child, no destructors run.
+                unsafe { nix::libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => match waitpid(child, None).unwrap() {
+                WaitStatus::Exited(_, c) => c,
+                other => panic!("the child did not exit: {other:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn a_notify_profile_installs_only_with_the_listener_backend() {
+        let s = LinuxSeccompBuilder::default()
+            .default_action(LinuxSeccompAction::ScmpActAllow)
+            .listener_path("/run/seccomp-agent.sock")
+            .listener_metadata("workload=w;run=r")
+            .syscalls(vec![LinuxSyscallBuilder::default()
+                .names(vec!["getppid".to_string()])
+                .action(LinuxSeccompAction::ScmpActNotify)
+                .build()
+                .unwrap()])
+            .build()
+            .unwrap();
+        let want = if cfg!(feature = "seccomp-listener") {
+            0
+        } else {
+            1
+        };
+        assert_eq!(
+            install_in_child(&s),
+            want,
+            "with seccomp-listener the profile installs and hands back its listener; without it the profile is refused"
+        );
+    }
+}

@@ -25,6 +25,10 @@ redis = ["rusternetes-storage/redis"]
 redb = ["rusternetes-storage/redb"]
 # Daemonless container backend on youki's libcontainer (Linux, root, cgroup v2).
 youki = ["dep:libcontainer", "dep:oci-spec", "dep:nix", "dep:oci-image", "dep:uuid"]
+# The youki backend on libcontainer's libseccomp backend instead of its pure-Rust one: a
+# container profile may hand calls to a seccomp agent (SCMP_ACT_NOTIFY with listenerPath),
+# which records the container's calls (learning a profile). Links libseccomp; off by default.
+seccomp-listener = ["youki", "libcontainer/libseccomp"]
 
 [dependencies]
 rusternetes-common = { path = "../common" }
