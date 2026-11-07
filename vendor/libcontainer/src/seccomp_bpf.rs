@@ -64,6 +64,10 @@ pub enum SeccompError {
     Filter(#[source] seccompiler::BackendError),
     #[error("failed to load the seccomp filter: {0}")]
     Load(#[source] std::io::Error),
+    #[error("seccomp program is too long: {len} instructions")]
+    ProgramTooLong { len: usize },
+    #[error("failed to load seccomp program")]
+    LoadProgram { source: std::io::Error },
 }
 
 type Result<T> = std::result::Result<T, SeccompError>;
@@ -302,17 +306,211 @@ fn load(program: &BpfProgram, flags: libc::c_ulong) -> Result<()> {
     Ok(())
 }
 
-/// Compile and install the profile. Never returns a listener fd (this
-/// backend refuses `SCMP_ACT_NOTIFY`).
+/// Compile and install the profile with this module's own backend
+/// ([`SeccompBpfBackend`]). Never returns a listener fd (this backend refuses
+/// `SCMP_ACT_NOTIFY`).
 #[tracing::instrument(level = "trace", skip(seccomp))]
 pub fn initialize_seccomp(seccomp: &LinuxSeccomp) -> Result<Option<io::RawFd>> {
-    let programs = compile(seccomp)?;
-    let flags = filter_flags(seccomp);
-    for p in &programs {
-        load(p, flags)?;
+    initialize_seccomp_with(&SeccompBpfBackend, seccomp)
+}
+
+// ---- youki PR 3873's seccomp backend trait, for the pure-Rust backend too
+// (Rusternetes vendor patch). The same names and shapes as the trait in
+// `seccomp/mod.rs` (the libseccomp module, which carries the PR as it is), so
+// a backend written against youki's trait (Heimdall's, heimdall-youki)
+// builds against either module.
+
+// Same layout as the kernel's struct sock_filter.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SockFilter {
+    pub code: u16,
+    pub jt: u8,
+    pub jf: u8,
+    pub k: u32,
+}
+
+#[derive(Debug)]
+enum Filter {
+    /// seccompiler's stack of programs (this module's own backend).
+    Stack(Vec<BpfProgram>),
+    /// One program a backend built.
+    Program(Vec<SockFilter>),
+}
+
+#[derive(Debug)]
+pub struct CompiledSeccomp {
+    pub flags: u32,
+    pub wants_listener: bool,
+    filter: Filter,
+}
+
+impl CompiledSeccomp {
+    pub fn from_program(program: Vec<SockFilter>, flags: u32, wants_listener: bool) -> Self {
+        Self {
+            flags,
+            wants_listener,
+            filter: Filter::Program(program),
+        }
     }
-    tracing::debug!(filters = programs.len(), "seccomp profile loaded");
+
+    /// The BPF program, when the backend built one program (`None` for
+    /// seccompiler's stack, see [`CompiledSeccomp::stack`]).
+    pub fn program(&self) -> Option<&[SockFilter]> {
+        match &self.filter {
+            Filter::Program(p) => Some(p),
+            Filter::Stack(_) => None,
+        }
+    }
+
+    /// seccompiler's stack of programs, when this module's own backend
+    /// compiled the profile.
+    pub fn stack(&self) -> Option<&[BpfProgram]> {
+        match &self.filter {
+            Filter::Stack(s) => Some(s),
+            Filter::Program(_) => None,
+        }
+    }
+}
+
+pub trait SeccompBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn compile(&self, seccomp: &LinuxSeccomp) -> Result<CompiledSeccomp>;
+}
+
+/// This module's own backend: seccompiler's stack of filters.
+pub struct SeccompBpfBackend;
+
+impl SeccompBackend for SeccompBpfBackend {
+    fn name(&self) -> &'static str {
+        "seccompiler"
+    }
+
+    fn compile(&self, seccomp: &LinuxSeccomp) -> Result<CompiledSeccomp> {
+        Ok(CompiledSeccomp {
+            flags: filter_flags(seccomp) as u32,
+            wants_listener: false,
+            filter: Filter::Stack(compile(seccomp)?),
+        })
+    }
+}
+
+/// The profile checks every backend gets (youki PR 3873 runs them before
+/// any backend): no `SCMP_ACT_NOTIFY` default, no notify on `write`.
+fn check_profile(seccomp: &LinuxSeccomp) -> Result<()> {
+    if seccomp.default_action() == LinuxSeccompAction::ScmpActNotify {
+        return Err(SeccompError::NotifyAsDefaultAction);
+    }
+    for syscall in seccomp.syscalls().iter().flatten() {
+        if syscall.action() == LinuxSeccompAction::ScmpActNotify
+            && syscall.names().iter().any(|n| n == "write")
+        {
+            return Err(SeccompError::NotifyWriteSyscall);
+        }
+    }
+    Ok(())
+}
+
+/// Compile the profile with `backend` and install it on the calling thread.
+pub fn initialize_seccomp_with(
+    backend: &dyn SeccompBackend,
+    seccomp: &LinuxSeccomp,
+) -> Result<Option<io::RawFd>> {
+    tracing::trace!(backend = backend.name(), "compiling seccomp profile");
+    check_profile(seccomp)?;
+    let compiled = backend.compile(seccomp)?;
+    match &compiled.filter {
+        Filter::Stack(programs) => {
+            let flags = libc::c_ulong::from(compiled.flags);
+            for p in programs {
+                load(p, flags)?;
+            }
+            tracing::debug!(filters = programs.len(), "seccomp profile loaded");
+            Ok(None)
+        }
+        Filter::Program(program) => {
+            load_program(program, compiled.flags, compiled.wants_listener)
+        }
+    }
+}
+
+// youki PR 3873's loader of one program.
+fn load_program(
+    program: &[SockFilter],
+    flags: u32,
+    wants_listener: bool,
+) -> Result<Option<io::RawFd>> {
+    let len = u16::try_from(program.len())
+        .map_err(|_| SeccompError::ProgramTooLong { len: program.len() })?;
+    let prog = libc::sock_fprog {
+        len,
+        filter: program.as_ptr() as *mut libc::sock_filter,
+    };
+
+    let mut flags = libc::c_ulong::from(flags);
+    if wants_listener {
+        flags |= libc::SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        // With TSYNC a failure returns a thread id, which would be taken for
+        // the listener fd. TSYNC_ESRCH makes it an error instead.
+        if flags & libc::SECCOMP_FILTER_FLAG_TSYNC != 0 {
+            flags |= libc::SECCOMP_FILTER_FLAG_TSYNC_ESRCH;
+        }
+    } else {
+        // The kernel only accepts WAIT_KILLABLE_RECV together with a listener.
+        flags &= !libc::SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+    }
+
+    // SAFETY: `prog` points at `program`, which outlives the call; the
+    // kernel copies the instructions.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            libc::SECCOMP_SET_MODE_FILTER,
+            flags,
+            &raw const prog,
+        )
+    };
+    if ret < 0 {
+        return Err(SeccompError::LoadProgram {
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    if wants_listener {
+        return Ok(Some(ret as io::RawFd));
+    }
+    if ret > 0 {
+        return Err(SeccompError::LoadProgram {
+            source: std::io::Error::other(format!("failed to sync thread {ret}")),
+        });
+    }
     Ok(None)
+}
+
+// Rusternetes: the backend a container's init process compiles
+// `linux.seccomp` with (see the same functions in `seccomp/mod.rs`).
+static CONTAINER_BACKEND: std::sync::OnceLock<&'static dyn SeccompBackend> =
+    std::sync::OnceLock::new();
+
+/// Register the backend for containers' `linux.seccomp` (once per process);
+/// a second call returns the backend it did not register.
+pub fn set_container_backend(
+    backend: &'static dyn SeccompBackend,
+) -> std::result::Result<(), &'static dyn SeccompBackend> {
+    CONTAINER_BACKEND.set(backend)
+}
+
+/// The backend containers' `linux.seccomp` is compiled with: the registered
+/// one, else seccompiler's.
+pub fn container_backend() -> &'static dyn SeccompBackend {
+    CONTAINER_BACKEND
+        .get()
+        .copied()
+        .unwrap_or(&SeccompBpfBackend)
+}
+
+/// Install a container's `linux.seccomp` with [`container_backend`].
+pub fn initialize_container_seccomp(seccomp: &LinuxSeccomp) -> Result<Option<io::RawFd>> {
+    initialize_seccomp_with(container_backend(), seccomp)
 }
 
 pub fn is_notify(seccomp: &LinuxSeccomp) -> bool {

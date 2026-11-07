@@ -1,0 +1,32 @@
+# Vendored from Heimdall (git.gunnar.rs nordisk/heimdall, AGPL-3.0-only) at
+# 9d4114d0d7d59e24f1bf91bb157e625fa3e8399c: runtime/heimdall-youki, src/lib.rs
+# unchanged. The manifest differs from the original in two places only:
+# heimdall-seccomp is the vendored copy beside it, and `libcontainer` is the
+# crates.io name, which this workspace patches to vendor/libcontainer (youki
+# 0.7.0 with the SeccompBackend trait of youki PR 3873 ported into it) with its
+# pure-Rust seccomp (`seccomp-bpf`) instead of libseccomp. See vendor/HEIMDALL.md.
+[package]
+name = "nordisk-heimdall-youki"
+description = "Heimdall is a defensive sandbox: Heimdall's classic-BPF builder as a seccomp backend for youki (libcontainer's SeccompBackend trait). Static mode's floor only: no profiler, no broker, no follower."
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://gunnar.rs/nordisk/heimdall"
+homepage = "https://gunnar.rs/nordisk/heimdall"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "heimdall_youki"
+path = "src/lib.rs"
+
+[features]
+# The SeccompBackend impl.
+youki = ["dep:libcontainer", "dep:oci-spec"]
+
+[dependencies]
+heimdall-seccomp = { package = "nordisk-heimdall-seccomp", path = "../heimdall-seccomp" }
+thiserror = "2"
+libcontainer = { version = "0.7", default-features = false, features = ["v2", "seccomp-bpf"], optional = true }
+oci-spec = { version = "0.10", default-features = false, features = ["runtime"], optional = true }
+serde_json = "1"

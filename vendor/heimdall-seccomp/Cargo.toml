@@ -1,0 +1,29 @@
+# Vendored from Heimdall (git.gunnar.rs nordisk/heimdall, AGPL-3.0-only) at
+# 9d4114d0d7d59e24f1bf91bb157e625fa3e8399c: crates/heimdall-seccomp, src/ and
+# LICENSE unchanged. This manifest is the original with the workspace keys
+# written out and the tests (and their dev-dependencies) left out. See
+# vendor/HEIMDALL.md.
+[package]
+name = "nordisk-heimdall-seccomp"
+description = "Heimdall is a defensive sandbox: seccomp profile types per workload/arch/libc, a pure-Rust BPF builder, enforcing and audit modes, and the small USER_NOTIF API the broker and the probe build on."
+version = "0.3.3"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://gunnar.rs/nordisk/heimdall"
+homepage = "https://gunnar.rs/nordisk/heimdall"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "heimdall_seccomp"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(heimdall_test_no_base_set)"] }

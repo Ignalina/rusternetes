@@ -357,7 +357,7 @@ pub fn container_init_process(
     #[cfg(any(feature = "libseccomp", feature = "seccomp-bpf"))]
     if let Some(seccomp) = ctx.linux.seccomp() {
         if ctx.process.no_new_privileges() != Some(true) {
-            let notify_fd = seccomp::initialize_seccomp(seccomp).map_err(|err| {
+            let notify_fd = seccomp::initialize_container_seccomp(seccomp).map_err(|err| {
                 tracing::error!(?err, "failed to initialize seccomp");
                 err
             })?;
@@ -404,7 +404,7 @@ pub fn container_init_process(
     #[cfg(any(feature = "libseccomp", feature = "seccomp-bpf"))]
     if let Some(seccomp) = ctx.linux.seccomp() {
         if ctx.process.no_new_privileges() == Some(true) {
-            let notify_fd = seccomp::initialize_seccomp(seccomp).map_err(|err| {
+            let notify_fd = seccomp::initialize_container_seccomp(seccomp).map_err(|err| {
                 tracing::error!(?err, "failed to initialize seccomp");
                 err
             })?;

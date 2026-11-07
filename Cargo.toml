@@ -13,7 +13,8 @@ members = [
     "crates/rusternetes",
 ]
 # vendor/libcontainer: a patched crates.io crate, not a member.
-exclude = ["vendor/libcontainer"]
+# vendor/heimdall-*: Heimdall's seccomp backend (vendor/HEIMDALL.md), not members.
+exclude = ["vendor/libcontainer", "vendor/heimdall-youki", "vendor/heimdall-seccomp"]
 
 [workspace.package]
 version = "0.1.0"
@@ -79,5 +80,7 @@ strip = "symbols"
 [patch.crates-io]
 # youki's libcontainer 0.7.0 plus a pure-Rust seccomp backend (feature
 # `seccomp-bpf`: seccompiler + syscalls, no libseccomp C library) and the
-# noNewPrivileges=false fix (node/rtclass; candidate upstream youki PRs).
+# noNewPrivileges=false fix (node/rtclass; candidate upstream youki PRs), plus
+# youki PR 3873's SeccompBackend trait in both seccomp modules and the
+# container backend registration (node/heimdall-seccomp; vendor/HEIMDALL.md).
 libcontainer = { path = "vendor/libcontainer" }
