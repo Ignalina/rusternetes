@@ -514,19 +514,32 @@ mod tests {
     }
 
     #[test]
-    fn moby_runtime_default_is_refused_by_name() {
+    fn a_profile_heimdall_does_not_read_is_compiled_by_the_default_backend() {
+        // moby's RuntimeDefault, which the kubelet gives every pod that names
+        // no profile under seccompDefault (the OVN pods of the bench): an
+        // ERRNO default and three architectures. Heimdall's builder refuses
+        // it by name; the container still starts, under the program the
+        // default backend builds for it, never unconfined.
         super::register().unwrap();
         let spec: LinuxSeccomp = serde_json::from_value(
             crate::seccomp::to_oci(crate::seccomp::RUNTIME_DEFAULT, &[], "6.12.0").unwrap(),
         )
         .unwrap();
-        let e = container_backend().compile(&spec).unwrap_err();
-        // The shim prints the chain (`{:#}`): youki's trait has no error of a
-        // backend's own, so Heimdall's reason is the source of LoadProgram.
-        let chain = format!("{:#}", anyhow::Error::from(e));
-        assert!(
-            chain.contains("heimdall seccomp backend") && chain.contains("SCMP_ACT_ERRNO"),
-            "{chain}"
+        let refused = heimdall_youki::compile_oci_json(&serde_json::to_string(&spec).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("SCMP_ACT_ERRNO"), "{refused}");
+        let ours = container_backend()
+            .compile(&spec)
+            .unwrap_or_else(|e| panic!("refused: {:#}", anyhow::Error::from(e)));
+        let theirs = libcontainer::seccomp::SeccompBpfBackend.compile(&spec).unwrap();
+        assert!(ours.program().is_none(), "not Heimdall's program");
+        assert_eq!(
+            (format!("{:?}", ours.stack()), ours.flags, ours.wants_listener),
+            (format!("{:?}", theirs.stack()), theirs.flags, theirs.wants_listener)
         );
+        // a profile Heimdall reads is still Heimdall's one program
+        let (_, prog) = program_of(PROFILES[0].0, PROFILES[0].1);
+        assert!(!prog.is_empty());
     }
 }
