@@ -583,11 +583,21 @@ mod tests {
         let ours = container_backend()
             .compile(&spec)
             .unwrap_or_else(|e| panic!("refused: {:#}", anyhow::Error::from(e)));
-        let theirs = libcontainer::seccomp::SeccompBpfBackend.compile(&spec).unwrap();
+        let theirs = libcontainer::seccomp::SeccompBpfBackend
+            .compile(&spec)
+            .unwrap();
         assert!(ours.program().is_none(), "not Heimdall's program");
         assert_eq!(
-            (format!("{:?}", ours.stack()), ours.flags, ours.wants_listener),
-            (format!("{:?}", theirs.stack()), theirs.flags, theirs.wants_listener)
+            (
+                format!("{:?}", ours.stack()),
+                ours.flags,
+                ours.wants_listener
+            ),
+            (
+                format!("{:?}", theirs.stack()),
+                theirs.flags,
+                theirs.wants_listener
+            )
         );
         // a profile Heimdall reads is still Heimdall's one program
         let (_, prog) = program_of(PROFILES[0].0, PROFILES[0].1);
