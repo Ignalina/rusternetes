@@ -13,18 +13,69 @@
 //!
 //! Heimdall reads the profiles its profiler writes: default
 //! `SCMP_ACT_KILL_PROCESS`, the native architecture, `ALLOW` / `ERRNO` rules
-//! with argument conditions. It refuses any other profile by name (for example
-//! `RuntimeDefault`, moby's profile with an `ERRNO` default and three
-//! architectures): the container is then not started, and the shim says why.
-//! Every program starts with the architecture check, the x32 kill and the
-//! kernel-implied base set (`restart_syscall`, `rt_sigreturn`, `exit`,
-//! `exit_group`).
+//! with argument conditions. Every program it builds starts with the
+//! architecture check, the x32 kill and the kernel-implied base set
+//! (`restart_syscall`, `rt_sigreturn`, `exit`, `exit_group`).
+//!
+//! A profile Heimdall does not read (it refuses it by name: another default
+//! action, several architectures; for example `RuntimeDefault`, moby's
+//! profile, which the kubelet gives every pod that names no profile under
+//! seccompDefault) is compiled by the shim's default backend instead, so the
+//! pod starts under that profile, never unconfined. A profile Heimdall reads
+//! but cannot build here (another architecture than the host's, a program
+//! too long) is refused, and the shim says why.
+
+use libcontainer::seccomp::{CompiledSeccomp, SeccompBackend, SeccompError};
+use oci_spec::runtime::LinuxSeccomp;
+
+/// The shim's default backend: the one a profile Heimdall does not read goes to.
+#[cfg(not(feature = "seccomp-listener"))]
+static DEFAULT: libcontainer::seccomp::SeccompBpfBackend = libcontainer::seccomp::SeccompBpfBackend;
+#[cfg(feature = "seccomp-listener")]
+static DEFAULT: libcontainer::seccomp::LibseccompBackend = libcontainer::seccomp::LibseccompBackend;
+
+/// Heimdall's builder for the profiles it reads, the default backend for the
+/// ones it refuses by kind (see the module docs).
+struct HeimdallFirst;
+
+impl SeccompBackend for HeimdallFirst {
+    fn name(&self) -> &'static str {
+        heimdall_youki::NAME
+    }
+
+    fn compile(&self, seccomp: &LinuxSeccomp) -> Result<CompiledSeccomp, SeccompError> {
+        // The trait has no error of a backend's own: the reason travels as
+        // an io::Error in LoadProgram, with the backend's message.
+        let err = |e: String| SeccompError::LoadProgram {
+            source: std::io::Error::other(e),
+        };
+        let json = serde_json::to_string(seccomp).map_err(|e| err(e.to_string()))?;
+        match heimdall_youki::compile_oci_json(&json) {
+            Ok(c) => Ok(CompiledSeccomp::from_program(
+                c.program
+                    .iter()
+                    .map(|i| libcontainer::seccomp::SockFilter {
+                        code: i.code,
+                        jt: i.jt,
+                        jf: i.jf,
+                        k: i.k,
+                    })
+                    .collect(),
+                c.flags,
+                c.wants_listener,
+            )),
+            // not Heimdall's kind of profile: the default backend's program
+            Err(heimdall_youki::BackendError::Profile(_)) => DEFAULT.compile(seccomp),
+            Err(e) => Err(err(e.to_string())),
+        }
+    }
+}
 
 /// Make Heimdall's builder the seccomp backend of the containers this
 /// process creates (once per process; a second call is a no-op).
 pub fn register() -> Result<(), String> {
     use libcontainer::seccomp::{container_backend, set_container_backend};
-    static HEIMDALL: heimdall_youki::HeimdallBackend = heimdall_youki::HeimdallBackend;
+    static HEIMDALL: HeimdallFirst = HeimdallFirst;
     if set_container_backend(&HEIMDALL).is_ok()
         || container_backend().name() == heimdall_youki::NAME
     {

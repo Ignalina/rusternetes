@@ -30,7 +30,8 @@ youki = ["dep:libcontainer", "dep:oci-spec", "dep:nix", "dep:oci-image", "dep:uu
 # which records the container's calls (learning a profile). Links libseccomp; off by default.
 seccomp-listener = ["youki", "libcontainer/libseccomp"]
 # A pod's seccomp profile compiled by Heimdall's classic-BPF builder (vendor/heimdall-youki,
-# youki's SeccompBackend trait) instead of the default backend; pure Rust, no libseccomp.
+# youki's SeccompBackend trait) instead of the default backend; pure Rust, no libseccomp. A profile
+# Heimdall does not read (moby's RuntimeDefault under seccompDefault) is compiled by the default backend.
 # Heimdall is AGPL-3.0-only: a shim built with this feature is AGPL-3.0-only as a whole.
 # Off by default. See src/backend/youki/heimdall.rs.
 heimdall-seccomp = ["youki", "dep:heimdall-youki", "dep:heimdall-seccomp"]
