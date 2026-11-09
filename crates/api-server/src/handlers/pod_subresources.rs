@@ -402,6 +402,16 @@ async fn get_node_container_logs(
     Ok(body)
 }
 
+/// The id of the container `full_name` (`<pod>_<container>`) in a runtime's
+/// container list.
+fn container_named(
+    containers: &[bollard::models::ContainerSummary],
+    full_name: &str,
+) -> Option<String> {
+    let _ = full_name;
+    containers.first().and_then(|c| c.id.clone())
+}
+
 /// Get real logs from the container runtime
 async fn get_container_logs(
     pod: &rusternetes_common::resources::Pod,
@@ -471,9 +481,7 @@ async fn get_container_logs(
             ..Default::default()
         };
         if let Ok(containers) = docker.list_containers(Some(list_opts)).await {
-            containers
-                .first()
-                .and_then(|c| c.id.clone())
+            container_named(&containers, &full_container_name)
                 .unwrap_or(full_container_name.clone())
         } else {
             full_container_name.clone()
@@ -1521,6 +1529,21 @@ mod tests {
     use rusternetes_common::types::{LabelSelector, ObjectMeta, TypeMeta};
     use rusternetes_storage::memory::MemoryStorage;
     use std::collections::HashMap;
+
+    /// The logs of pod `web`'s container `main` come from `web_main` or from
+    /// nothing, never from `func-web_main` (a pod of another namespace whose
+    /// name holds it; Docker's name filter is an unanchored regex).
+    #[test]
+    fn a_containers_log_is_read_from_that_container_only() {
+        let c = |id: &str, name: &str| bollard::models::ContainerSummary {
+            id: Some(id.to_string()),
+            names: Some(vec![format!("/{name}")]),
+            ..Default::default()
+        };
+        let list = vec![c("1", "func-web_main"), c("2", "web_main")];
+        assert_eq!(container_named(&list, "web_main").as_deref(), Some("2"));
+        assert_eq!(container_named(&list[..1], "web_main"), None);
+    }
 
     #[test]
     fn logs_skip_the_local_docker_socket_on_a_youki_node() {

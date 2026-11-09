@@ -1317,6 +1317,18 @@ mod tests {
         assert!(!name_matches("myweb_app", "^/web"));
     }
 
+    /// A plain pattern is where a name starts, never a piece of it: the
+    /// kubelet's `web_` (pod `web`) found `func-web_main` (pod `func-web`,
+    /// another namespace) and gave `web` that container's IP.
+    #[test]
+    fn a_plain_name_filter_never_matches_inside_another_pods_name() {
+        assert!(name_matches("web_main", "web_"));
+        assert!(name_matches("web_pause", "web_pause"));
+        assert!(!name_matches("func-web_main", "web_"));
+        assert!(!name_matches("func-web_pause", "web_pause"));
+        assert!(!name_matches("a-web_main", "web_main"));
+    }
+
     fn meta_named(name: &str) -> Meta {
         Meta {
             id: format!("id-{name}-0123456789abcdef"),

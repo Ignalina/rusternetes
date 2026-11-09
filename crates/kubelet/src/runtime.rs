@@ -1269,7 +1269,7 @@ impl ContainerRuntime {
 
                         // Resolve pod IP from first container for non-CNI mode
                         if !resolved_ip && pod_ip.is_none() {
-                            if let Ok(Some(ip)) = self.get_pod_ip(pod_name).await {
+                            if let Ok(Some(ip)) = self.get_pod_ip(pod).await {
                                 pod_ip = Some(ip);
                                 resolved_ip = true;
                                 self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
@@ -1389,7 +1389,7 @@ impl ContainerRuntime {
 
                     // Resolve pod IP from first container for non-CNI mode
                     if !resolved_ip && pod_ip.is_none() {
-                        if let Ok(Some(ip)) = self.get_pod_ip(pod_name).await {
+                        if let Ok(Some(ip)) = self.get_pod_ip(pod).await {
                             pod_ip = Some(ip);
                             resolved_ip = true;
                             self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
@@ -1415,7 +1415,7 @@ impl ContainerRuntime {
 
             // Resolve pod IP from first container for non-CNI mode
             if !resolved_ip && pod_ip.is_none() {
-                if let Ok(Some(ip)) = self.get_pod_ip(pod_name).await {
+                if let Ok(Some(ip)) = self.get_pod_ip(pod).await {
                     pod_ip = Some(ip.clone());
                     resolved_ip = true;
                     self.create_pod_hosts_file(pod, pod_ip.as_deref())?;
@@ -7869,7 +7869,8 @@ impl ContainerRuntime {
     }
 
     /// Get the pod IP address from the first running container
-    pub async fn get_pod_ip(&self, pod_name: &str) -> Result<Option<String>> {
+    pub async fn get_pod_ip(&self, pod: &Pod) -> Result<Option<String>> {
+        let pod_name = pod.metadata.name.as_str();
         if self.host_network_pods.lock().unwrap().contains(pod_name) {
             return Ok(Some(node_internal_ip()));
         }
@@ -12473,6 +12474,104 @@ mod backend_tests {
         assert!(!gone_vol.exists(), "a deleted pod's volumes are removed");
     }
 
+    fn pod_in(namespace: &str, name: &str) -> rusternetes_common::resources::Pod {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {"name": name, "namespace": namespace, "uid": format!("uid-{namespace}-{name}")},
+            "spec": {"containers": [{"name": "main", "image": "app:1"}]}
+        }))
+        .unwrap()
+    }
+
+    /// Pod `func-web`'s containers (another namespace) and pod `web-2`'s:
+    /// both names hold `web` (`func-web_main` holds `web_`), neither is
+    /// pod `web`'s.
+    fn neighbours(backend: &FakeBackend) {
+        backend.add("func-web_pause", "running", 1);
+        backend.set_ip("func-web_pause", "10.1.0.7");
+        backend.add("func-web_main", "running", 1);
+        backend.set_ip("func-web_main", "10.1.0.7");
+        backend.add("web-2_main", "running", 1);
+        backend.set_ip("web-2_main", "10.1.0.9");
+    }
+
+    /// Pod `web` (namespace a) and pod `func-web` (namespace b) on one node:
+    /// `web`'s IP is its own container's, never `func-web`'s (seen in four
+    /// OVN runs: the CNI attachments know no IP for `web`, and the container
+    /// lookup's `web_pause` / `web_` found `func-web_pause` / `func-web_main`).
+    #[tokio::test]
+    async fn a_pods_ip_is_its_own_never_a_pod_whose_name_holds_its_name() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        neighbours(&backend);
+        backend.add("web_main", "running", 2);
+        backend.set_ip("web_main", "10.1.0.5");
+        let (runtime, _v) = runtime_with(backend.clone()).await;
+
+        assert_eq!(
+            runtime.get_pod_ip(&pod_in("a", "web")).await.unwrap().as_deref(),
+            Some("10.1.0.5")
+        );
+        assert_eq!(
+            runtime.get_pod_ip(&pod_in("b", "func-web")).await.unwrap().as_deref(),
+            Some("10.1.0.7")
+        );
+
+        // `web`'s container is gone: no IP, rather than another pod's.
+        backend.state.lock().unwrap().containers.get_mut("web_main").unwrap().state = "exited";
+        assert_eq!(runtime.get_pod_ip(&pod_in("a", "web")).await.unwrap(), None);
+    }
+
+    /// `is_pod_running("web")` answers for pod `web` alone.
+    #[tokio::test]
+    async fn is_pod_running_counts_only_the_pods_own_containers() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        neighbours(&backend);
+        let (runtime, _v) = runtime_with(backend.clone()).await;
+        assert!(
+            !runtime.is_pod_running("web").await.unwrap(),
+            "only func-web and web-2 run"
+        );
+    }
+
+    /// Stopping pod `web` (its deletion, a deadline, a pod with a grace
+    /// period) stops `web`'s containers and nothing of `func-web` or `web-2`.
+    #[tokio::test]
+    async fn stopping_a_pod_stops_only_its_own_containers() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        neighbours(&backend);
+        backend.add("web_main", "running", 2);
+        let (runtime, _v) = runtime_with(backend.clone()).await;
+
+        runtime.stop_pod_with_grace_period("web", 5).await.unwrap();
+        runtime.stop_pod_for(&pod_in("a", "web"), 5).await.unwrap();
+
+        let calls = backend.calls();
+        assert!(calls.contains(&"stop web_main".to_string()), "{calls:?}");
+        assert!(
+            calls.iter().all(|c| !c.contains("func-web") && !c.contains("web-2")),
+            "another pod was stopped: {calls:?}"
+        );
+    }
+
+    /// Removing pod `web`'s containers (orphan cleanup) removes no other
+    /// pod's.
+    #[tokio::test]
+    async fn removing_a_pod_removes_only_its_own_containers() {
+        let backend = Arc::new(FakeBackend::new("fake"));
+        neighbours(&backend);
+        backend.add("web_main", "exited", 2);
+        let (runtime, _v) = runtime_with(backend.clone()).await;
+
+        runtime.stop_and_remove_pod("web").await.unwrap();
+
+        assert_eq!(
+            backend.names(),
+            vec!["func-web_main", "func-web_pause", "web-2_main"],
+            "{:?}",
+            backend.calls()
+        );
+    }
+
     /// The GC's pod list: a store that did not answer is no list at all (the
     /// GC skips that round), never "no pods" — that made every pod look
     /// deleted and removed every dead container on the node.
@@ -13273,5 +13372,136 @@ exit 0
         std::fs::remove_file(e.state().join("slow-add")).unwrap();
         e.runtime.start_pod(&pod()).await.unwrap();
         assert_eq!(e.log(), vec!["ADD".to_string()], "one ADD, no DEL");
+    }
+
+    /// Pod `web` in namespace `a` or `b`.
+    fn web_in(namespace: &str) -> Pod {
+        serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "web", "namespace": namespace, "uid": format!("uid-{namespace}")},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{"name": "app", "image": "app:1"}]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn set_state(e: &Env, name: &str, state: &'static str) {
+        e.backend
+            .state
+            .lock()
+            .unwrap()
+            .containers
+            .get_mut(name)
+            .unwrap()
+            .state = state;
+    }
+
+    /// Starting pod `web` clears `web`'s old containers, not those of pod
+    /// `web-2` (the clean-up's `^/web` took `web-2_app` for `web`'s and
+    /// removed it, its log with it).
+    #[tokio::test]
+    async fn starting_a_pod_removes_only_its_own_old_containers() {
+        let e = env().await;
+        e.backend.add("web-2_app", "exited", 1);
+        e.backend.add("func-web_app", "exited", 1);
+        e.runtime.start_pod(&pod()).await.unwrap();
+        let names = e.backend.names();
+        assert!(names.contains(&"web-2_app".to_string()), "{names:?}");
+        assert!(names.contains(&"func-web_app".to_string()), "{names:?}");
+    }
+
+    /// Pod `web` in two namespaces: each one's IP is its own or none, never
+    /// the other's. While `a/web` runs, `b/web` is not started into its
+    /// containers or its network (the node keys a pod's containers and its
+    /// sandbox by the pod's name).
+    #[tokio::test]
+    async fn the_same_pod_name_in_two_namespaces_resolves_per_namespace() {
+        let e = env().await;
+        let (a, b) = (web_in("a"), web_in("b"));
+        e.runtime.start_pod(&a).await.unwrap();
+        assert_eq!(
+            e.runtime.get_pod_ip(&a).await.unwrap().as_deref(),
+            Some("10.1.0.2")
+        );
+        assert_eq!(
+            e.runtime.get_pod_ip(&b).await.unwrap(),
+            None,
+            "b/web does not run here; 10.1.0.2 is a/web's"
+        );
+
+        assert!(
+            e.runtime.start_pod(&b).await.is_err(),
+            "b/web must not start on a/web's containers"
+        );
+        assert_eq!(e.log(), vec!["ADD"], "a/web's network untouched");
+        assert!(e.runtime.is_pod_running("web").await.unwrap());
+        assert_eq!(
+            e.runtime.get_pod_ip(&a).await.unwrap().as_deref(),
+            Some("10.1.0.2")
+        );
+
+        // a/web goes; b/web comes up, and a/web has no IP any more.
+        e.runtime.stop_pod_for(&a, 0).await.unwrap();
+        e.runtime.start_pod(&b).await.unwrap();
+        assert!(e.runtime.get_pod_ip(&b).await.unwrap().is_some());
+        assert_eq!(
+            e.runtime.get_pod_ip(&a).await.unwrap(),
+            None,
+            "a/web is gone; the IP is b/web's"
+        );
+    }
+
+    /// A crash-looping pod keeps its sandbox network for its restart. A pod
+    /// of the same name in another namespace must not be started into it:
+    /// it would get that pod's network and IP.
+    #[tokio::test]
+    async fn a_pod_never_joins_the_sandbox_of_a_same_named_pod_in_another_namespace() {
+        let e = env().await;
+        let (a, b) = (web_in("a"), web_in("b"));
+        e.runtime.start_pod(&a).await.unwrap();
+        set_state(&e, "web_app", "exited");
+
+        assert!(e.runtime.start_pod(&b).await.is_err());
+        assert_eq!(e.log(), vec!["ADD"], "no DEL of a/web's network, no ADD");
+        assert_eq!(e.held(), (1, 1));
+        assert_eq!(e.runtime.get_pod_ip(&b).await.unwrap(), None);
+        assert!(
+            e.backend.names().contains(&"web_app".to_string()),
+            "a/web's last container (its log) is kept"
+        );
+
+        // a/web's own restart keeps its sandbox, as before.
+        e.runtime.start_pod(&a).await.unwrap();
+        assert_eq!(e.log(), vec!["ADD"]);
+        assert_eq!(
+            e.runtime.get_pod_ip(&a).await.unwrap().as_deref(),
+            Some("10.1.0.2")
+        );
+    }
+
+    /// Deleting `b/web` (it never ran here) stops nothing of `a/web`: not its
+    /// containers, not its network, not its volumes.
+    #[tokio::test]
+    async fn deleting_a_pod_never_stops_a_same_named_pod_of_another_namespace() {
+        let e = env().await;
+        let (a, b) = (web_in("a"), web_in("b"));
+        e.runtime.start_pod(&a).await.unwrap();
+
+        e.runtime.stop_pod_for(&b, 0).await.unwrap();
+
+        let calls = e.backend.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("stop ")),
+            "a/web was stopped for b/web: {calls:?}"
+        );
+        assert_eq!(e.log(), vec!["ADD"], "a/web's network was torn down");
+        assert!(e.runtime.is_pod_running("web").await.unwrap());
+        assert_eq!(
+            e.runtime.get_pod_ip(&a).await.unwrap().as_deref(),
+            Some("10.1.0.2")
+        );
     }
 }

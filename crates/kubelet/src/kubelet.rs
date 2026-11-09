@@ -2109,7 +2109,7 @@ impl Kubelet {
                             // Get container statuses and pod IP
                             let container_statuses =
                                 self.runtime.get_container_statuses(&fresh_pod).await.ok();
-                            let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                            let pod_ip = self.runtime.get_pod_ip(pod).await.ok().flatten();
                             let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
 
                             // Write Running status using the fresh resourceVersion
@@ -2593,7 +2593,7 @@ impl Kubelet {
                         self.runtime.get_container_statuses(&fresh_pod).await.ok();
 
                     // Get pod IP
-                    let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                    let pod_ip = self.runtime.get_pod_ip(pod).await.ok().flatten();
                     let pod_i_ps = pod_ip.as_ref().map(|ip| vec![PodIP { ip: ip.clone() }]);
 
                     // Update status to Running
@@ -3537,7 +3537,7 @@ impl Kubelet {
                             }
 
                             // Get pod IP (important for pods started by docker-compose)
-                            let pod_ip = self.runtime.get_pod_ip(pod_name).await.ok().flatten();
+                            let pod_ip = self.runtime.get_pod_ip(pod).await.ok().flatten();
 
                             // Re-read pod from storage to get latest resourceVersion
                             // to avoid CAS conflicts when other controllers have

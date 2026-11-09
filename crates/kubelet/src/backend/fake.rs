@@ -17,6 +17,8 @@ pub(crate) struct FakeContainer {
     pub created: i64,
     pub exit_code: Option<i64>,
     pub config: ContainerConfig,
+    /// The address `inspect_container` reports (none: no network settings).
+    pub ip: Option<String>,
 }
 
 #[derive(Default)]
@@ -59,8 +61,15 @@ impl FakeBackend {
                 created,
                 exit_code: (state == "exited").then_some(0),
                 config: ContainerConfig::default(),
+                ip: None,
             },
         );
+    }
+
+    /// The container's address, as `inspect_container` reports it.
+    pub fn set_ip(&self, name: &str, ip: &str) {
+        let mut st = self.state.lock().unwrap();
+        st.containers.get_mut(name).expect("no such container").ip = Some(ip.to_string());
     }
 
     /// Containers of `image` fail to be created until `fail` is false again.
@@ -149,6 +158,7 @@ impl ContainerBackend for FakeBackend {
                 created: chrono::Utc::now().timestamp(),
                 exit_code: None,
                 config,
+                ip: None,
             },
         );
         Ok(id)
@@ -231,7 +241,10 @@ impl ContainerBackend for FakeBackend {
                 exit_code: c.exit_code,
                 ..Default::default()
             }),
-            network_settings: None,
+            network_settings: c.ip.as_ref().map(|ip| NetworkSettings {
+                ip_address: Some(ip.clone()),
+                networks: None,
+            }),
             host_config: Some(InspectHostConfig {
                 network_mode: c
                     .config
@@ -334,5 +347,21 @@ impl ContainerBackend for FakeBackend {
 
     async fn remove_volume(&self, _name: &str) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_matches;
+
+    /// A plain pattern is where a name starts, never a piece of it: pod
+    /// `web`'s `web_` must not find pod `func-web`'s `func-web_main`.
+    #[test]
+    fn a_plain_name_filter_never_matches_inside_another_pods_name() {
+        assert!(name_matches("web_main", "web_"));
+        assert!(name_matches("web_pause", "web_pause"));
+        assert!(!name_matches("func-web_main", "web_"));
+        assert!(!name_matches("func-web_pause", "web_pause"));
+        assert!(!name_matches("a-web_main", "web_main"));
     }
 }
