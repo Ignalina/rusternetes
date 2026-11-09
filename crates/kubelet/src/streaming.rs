@@ -7,8 +7,10 @@
 //! an empty stdin frame.
 
 use crate::backend::{
-    ContainerBackend, CreateExecOptions, LogOutput, LogsOptions, StartExecResults,
+    ContainerBackend, CreateExecOptions, ListContainersOptions, LogOutput, LogsOptions,
+    StartExecResults,
 };
+use crate::pod_identity::{self, Claim};
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, RawQuery};
 use axum::response::{IntoResponse, Response};
@@ -72,15 +74,55 @@ fn failure_frame(message: &str) -> Vec<u8> {
     f
 }
 
+/// Refuses (404) a container `<pod>_<container>` that is a pod's of another
+/// namespace than `namespace`: the node names containers by the pod's name
+/// alone, and their labels name the pod ([`pod_identity`]). Without it, exec
+/// into pod `web` of namespace `b` ran in pod `web` of namespace `a`. A
+/// container without labels (made before them) is told by its name.
+async fn of_namespace(
+    backend: &dyn ContainerBackend,
+    namespace: &str,
+    name: &str,
+) -> Result<(), Response> {
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("name".to_string(), vec![format!("^/{name}")]);
+    let Ok(listed) = backend
+        .list_containers(ListContainersOptions { all: true, filters })
+        .await
+    else {
+        // Unknown: the backend's own call answers (a missing container is its 404).
+        return Ok(());
+    };
+    let other = listed
+        .iter()
+        .filter(|c| pod_identity::summary_name(c) == name)
+        .any(|c| {
+            Claim::from_labels(c.labels.as_ref())
+                .namespace
+                .is_some_and(|n| n != namespace)
+        });
+    if other {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            format!("No such container: {name} in namespace {namespace}"),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
 /// `GET /exec/{namespace}/{pod}/{container}?command=…&stdin=…` (WebSocket).
 pub async fn exec(
     backend: Arc<dyn ContainerBackend>,
-    Path((_namespace, pod, container)): Path<(String, String, String)>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
     RawQuery(raw): RawQuery,
     ws: WebSocketUpgrade,
 ) -> Response {
     let q = StreamQuery::parse(raw.as_deref());
     let name = format!("{}_{}", pod, container);
+    if let Err(refused) = of_namespace(&*backend, &namespace, &name).await {
+        return refused;
+    }
     ws.protocols(PROTOCOLS)
         .on_upgrade(move |socket| run_exec(socket, backend, name, q))
         .into_response()
@@ -206,10 +248,13 @@ pub async fn run_exec(
 /// youki backend gives containers /dev/null).
 pub async fn attach(
     backend: Arc<dyn ContainerBackend>,
-    Path((_namespace, pod, container)): Path<(String, String, String)>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
     ws: WebSocketUpgrade,
 ) -> Response {
     let name = format!("{}_{}", pod, container);
+    if let Err(refused) = of_namespace(&*backend, &namespace, &name).await {
+        return refused;
+    }
     ws.protocols(PROTOCOLS)
         .on_upgrade(move |socket| async move {
             let (mut tx, mut rx) = socket.split();
@@ -258,11 +303,14 @@ pub async fn attach(
 /// until the container stops.
 pub async fn container_logs(
     backend: Arc<dyn ContainerBackend>,
-    Path((_namespace, pod, container)): Path<(String, String, String)>,
+    Path((namespace, pod, container)): Path<(String, String, String)>,
     RawQuery(raw): RawQuery,
 ) -> Response {
     let q = StreamQuery::parse(raw.as_deref());
     let name = format!("{}_{}", pod, container);
+    if let Err(refused) = of_namespace(&*backend, &namespace, &name).await {
+        return refused;
+    }
     let opts = LogsOptions {
         stdout: true,
         stderr: true,
