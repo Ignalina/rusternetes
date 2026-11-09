@@ -74,16 +74,17 @@ fn failure_frame(message: &str) -> Vec<u8> {
     f
 }
 
-/// Refuses (404) a container `<pod>_<container>` that is a pod's of another
-/// namespace than `namespace`: the node names containers by the pod's name
-/// alone, and their labels name the pod ([`pod_identity`]). Without it, exec
-/// into pod `web` of namespace `b` ran in pod `web` of namespace `a`. A
-/// container without labels (made before them) is told by its name.
-async fn of_namespace(
+/// The 404 for a container `<pod>_<container>` that is a pod's of another
+/// namespace than `namespace` (none: the container may be used). The node
+/// names containers by the pod's name alone, and their labels name the pod
+/// ([`pod_identity`]). Without it, exec into pod `web` of namespace `b` ran
+/// in pod `web` of namespace `a`. A container without labels (made before
+/// them) is told by its name.
+async fn refused_for_namespace(
     backend: &dyn ContainerBackend,
     namespace: &str,
     name: &str,
-) -> Result<(), Response> {
+) -> Option<Response> {
     let mut filters = std::collections::HashMap::new();
     filters.insert("name".to_string(), vec![format!("^/{name}")]);
     let Ok(listed) = backend
@@ -91,7 +92,7 @@ async fn of_namespace(
         .await
     else {
         // Unknown: the backend's own call answers (a missing container is its 404).
-        return Ok(());
+        return None;
     };
     let other = listed
         .iter()
@@ -101,14 +102,13 @@ async fn of_namespace(
                 .namespace
                 .is_some_and(|n| n != namespace)
         });
-    if other {
-        return Err((
+    other.then(|| {
+        (
             axum::http::StatusCode::NOT_FOUND,
             format!("No such container: {name} in namespace {namespace}"),
         )
-            .into_response());
-    }
-    Ok(())
+            .into_response()
+    })
 }
 
 /// `GET /exec/{namespace}/{pod}/{container}?command=…&stdin=…` (WebSocket).
@@ -120,7 +120,7 @@ pub async fn exec(
 ) -> Response {
     let q = StreamQuery::parse(raw.as_deref());
     let name = format!("{}_{}", pod, container);
-    if let Err(refused) = of_namespace(&*backend, &namespace, &name).await {
+    if let Some(refused) = refused_for_namespace(&*backend, &namespace, &name).await {
         return refused;
     }
     ws.protocols(PROTOCOLS)
@@ -252,7 +252,7 @@ pub async fn attach(
     ws: WebSocketUpgrade,
 ) -> Response {
     let name = format!("{}_{}", pod, container);
-    if let Err(refused) = of_namespace(&*backend, &namespace, &name).await {
+    if let Some(refused) = refused_for_namespace(&*backend, &namespace, &name).await {
         return refused;
     }
     ws.protocols(PROTOCOLS)
@@ -308,7 +308,7 @@ pub async fn container_logs(
 ) -> Response {
     let q = StreamQuery::parse(raw.as_deref());
     let name = format!("{}_{}", pod, container);
-    if let Err(refused) = of_namespace(&*backend, &namespace, &name).await {
+    if let Some(refused) = refused_for_namespace(&*backend, &namespace, &name).await {
         return refused;
     }
     let opts = LogsOptions {

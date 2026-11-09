@@ -5806,6 +5806,7 @@ impl ContainerRuntime {
 
     /// Check if a pod's containers are running: those named for `pod_name`,
     /// whichever pod they are (see [`Self::is_pod_running_of`]).
+    #[allow(dead_code)]
     pub async fn is_pod_running(&self, pod_name: &str) -> Result<bool> {
         let containers = self.named_containers(pod_name, false).await?;
         Ok(has_app_container(&containers))
