@@ -409,4 +409,86 @@ mod tests {
         let s: serde_json::Value = serde_json::from_slice(&status).unwrap();
         assert_eq!(s["details"]["causes"][0]["message"], "1");
     }
+
+    /// Container `web_app` of pod `web` in namespace `a`: its labels name
+    /// the pod, the name holds no namespace.
+    async fn web_app_of_namespace_a() -> Arc<FakeBackend> {
+        let b = Arc::new(FakeBackend::new("fake"));
+        let labels = std::collections::HashMap::from([
+            (
+                crate::pod_identity::POD_NAMESPACE_LABEL.to_string(),
+                "a".to_string(),
+            ),
+            (
+                crate::pod_identity::POD_NAME_LABEL.to_string(),
+                "web".to_string(),
+            ),
+        ]);
+        b.create_container(
+            "web_app",
+            crate::backend::ContainerConfig {
+                labels: Some(labels),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        b.start_container("web_app").await.unwrap();
+        b
+    }
+
+    /// The status line of a plain GET.
+    async fn get_status(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        out.lines().next().unwrap_or("").to_string()
+    }
+
+    /// `exec` into pod `web` of namespace `b` must not run in pod `web` of
+    /// namespace `a`: the node names both pods' containers `web_<container>`,
+    /// and the namespace in the path was not read.
+    #[tokio::test]
+    async fn exec_and_attach_never_reach_a_same_named_pod_of_another_namespace() {
+        let b = web_app_of_namespace_a().await;
+        let addr = serve(b.clone()).await;
+        for path in ["exec/b/web/app?command=cat", "attach/b/web/app"] {
+            let url = format!("ws://{addr}/{path}");
+            assert!(
+                tokio_tungstenite::connect_async(url).await.is_err(),
+                "{path} reached a/web"
+            );
+        }
+        assert!(
+            !b.calls().iter().any(|c| c.starts_with("exec ")),
+            "{:?}",
+            b.calls()
+        );
+
+        // Its own namespace's exec still runs.
+        let url = format!("ws://{addr}/exec/a/web/app?command=false");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        while let Some(Ok(_)) = ws.next().await {}
+        assert!(b.calls().iter().any(|c| c == "exec web_app false"));
+    }
+
+    /// The logs of pod `web` in namespace `b` are not pod `web`'s of
+    /// namespace `a`.
+    #[tokio::test]
+    async fn logs_never_come_from_a_same_named_pod_of_another_namespace() {
+        let b = web_app_of_namespace_a().await;
+        let addr = serve(b).await;
+        let other = get_status(addr, "/containerLogs/b/web/app").await;
+        assert!(other.contains(" 404 "), "{other}");
+        let followed = get_status(addr, "/containerLogs/b/web/app?follow=true").await;
+        assert!(followed.contains(" 404 "), "{followed}");
+        let own = get_status(addr, "/containerLogs/a/web/app").await;
+        assert!(own.contains(" 200 "), "{own}");
+    }
 }
