@@ -134,6 +134,7 @@ impl ContainerBackend for DockerBackend {
                 host_config: c.host_config.map(|hc| InspectHostConfig {
                     network_mode: hc.network_mode,
                 }),
+                labels: c.labels,
             })
             .collect())
     }
@@ -357,6 +358,7 @@ fn to_bollard_config(c: ContainerConfig) -> bc::Config<String> {
         user: c.user,
         hostname: c.hostname,
         exposed_ports: c.exposed_ports,
+        labels: c.labels,
         host_config: c.host_config.map(|h| bm::HostConfig {
             group_add: h.group_add,
             binds: h.binds,

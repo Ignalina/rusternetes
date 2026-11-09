@@ -1,9 +1,10 @@
 use crate::backend::{
-    ContainerBackend, ContainerConfig, ContainerStateStatus, CreateExecOptions, DockerBackend,
-    HostConfig, ListContainersOptions, LogsOptions, Mount, NetworkSettings, PortBinding,
-    RemoveContainerOptions, StartExecResults, StatsOptions, StopContainerOptions,
+    ContainerBackend, ContainerConfig, ContainerStateStatus, ContainerSummary, CreateExecOptions,
+    DockerBackend, HostConfig, ListContainersOptions, LogsOptions, Mount, NetworkSettings,
+    PortBinding, RemoveContainerOptions, StartExecResults, StatsOptions, StopContainerOptions,
     UpdateContainerOptions,
 };
+use crate::pod_identity::{self, Claim};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures_util::StreamExt;
@@ -608,11 +609,25 @@ impl ContainerRuntime {
         }
 
         if std::path::Path::new(&netns_path).exists() {
-            if cni
+            // Kept only for this pod: the namespace is named for the pod's
+            // name alone, and a pod of that name in another namespace would
+            // join that pod's network and get its IP.
+            let live: Vec<Claim> = cni
                 .get_attachments(pod_name)
                 .iter()
-                .any(|a| a.netns == netns_path)
-            {
+                .filter(|a| a.netns == netns_path)
+                .map(|a| Claim::from_cni_args(a.args.as_deref()))
+                .collect();
+            if let Some(holder) = live.iter().find(|c| c.is_other_namespace(pod)) {
+                anyhow::bail!(
+                    "the sandbox network {} is pod {}'s: pod {}/{} cannot share it",
+                    netns_name,
+                    holder,
+                    pod_identity::namespace(pod),
+                    pod_name
+                );
+            }
+            if live.iter().any(|c| c.is_of(pod)) {
                 info!("Pod {} keeps its sandbox network {}", pod_name, netns_path);
                 return Ok(netns_path);
             }
@@ -866,10 +881,24 @@ impl ContainerRuntime {
         let pod_name = &pod.metadata.name;
         let namespace = pod.metadata.namespace.as_deref().unwrap_or("default");
 
+        // The node keys a pod's containers and its sandbox network by the
+        // pod's name alone: while a pod of the same name in another namespace
+        // has them, this pod waits. Starting it would adopt that pod's
+        // containers (and IP), replace them, or join its network.
+        if let Some(holder) = self.name_held_by_another_namespace(pod).await {
+            anyhow::bail!(
+                "CreateContainerError: pod name {} is in use on this node by pod {} (the node names a pod's containers and its sandbox by the pod's name); {}/{} waits until it is gone",
+                pod_name,
+                holder,
+                namespace,
+                pod_name
+            );
+        }
+
         // Guard: if the pod's containers are already running, skip the start.
         // This prevents duplicate container creation when sync_pod is called
         // multiple times in rapid succession (e.g., watch feedback loops).
-        if self.is_pod_running(pod_name).await.unwrap_or(false) {
+        if self.is_pod_running_of(pod).await.unwrap_or(false) {
             debug!(
                 "Pod {}/{} containers already running, skipping start",
                 namespace, pod_name
@@ -883,13 +912,18 @@ impl ContainerRuntime {
         // K8s does this in SyncPod before creating new containers.
         // Without this, Docker returns 409 Conflict for container name reuse.
         // K8s ref: pkg/kubelet/kuberuntime/kuberuntime_manager.go — SyncPod
+        // Only this pod's name's containers (`^/web` took pod `web-2`'s for
+        // `web`'s), and none a pod of another namespace left (its log).
         if let Ok(containers) = self
             .backend
             .list_containers(ListContainersOptions {
                 all: true,
                 filters: {
                     let mut f = std::collections::HashMap::new();
-                    f.insert("name".to_string(), vec![format!("^/{}", pod_name)]);
+                    f.insert(
+                        "name".to_string(),
+                        vec![pod_identity::name_filter(pod_name)],
+                    );
                     f.insert(
                         "status".to_string(),
                         vec![
@@ -906,6 +940,8 @@ impl ContainerRuntime {
             // Remove old containers in parallel for faster cleanup
             let remove_futures: Vec<_> = containers
                 .iter()
+                .filter(|c| pod_identity::summary_is_named_for(c, pod_name))
+                .filter(|c| !Claim::from_labels(c.labels.as_ref()).is_other_namespace(pod))
                 .filter_map(|c| c.id.as_ref())
                 .map(|id| {
                     debug!("Removing old container {} for pod {}", id, pod_name);
@@ -970,20 +1006,86 @@ impl ContainerRuntime {
 
     /// Whether any container of the pod (init, app, sidecar) is running.
     async fn any_pod_container_running(&self, pod_name: &str) -> bool {
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("^/{}_", pod_name)]);
-        match self
-            .backend
-            .list_containers(ListContainersOptions {
-                all: false,
-                filters,
-            })
-            .await
-        {
+        match self.named_containers(pod_name, false).await {
             Ok(c) => !c.is_empty(),
             // Unknown: keep the network rather than cut a running pod off.
             Err(_) => true,
         }
+    }
+
+    /// The containers named for pod `pod_name` (`<pod>_<container>`), by the
+    /// name's structure: never those of a pod whose name only holds it
+    /// (`func-web_main` holds `web_`). See [`pod_identity`].
+    async fn named_containers(&self, pod_name: &str, all: bool) -> Result<Vec<ContainerSummary>> {
+        let mut filters = HashMap::new();
+        filters.insert(
+            "name".to_string(),
+            vec![pod_identity::name_filter(pod_name)],
+        );
+        let containers = self
+            .backend
+            .list_containers(ListContainersOptions { all, filters })
+            .await?;
+        Ok(containers
+            .into_iter()
+            .filter(|c| pod_identity::summary_is_named_for(c, pod_name))
+            .collect())
+    }
+
+    /// `pod`'s own containers: named for it, and not labelled with another
+    /// pod (of another namespace, or an earlier pod of the name).
+    async fn own_containers(&self, pod: &Pod, all: bool) -> Result<Vec<ContainerSummary>> {
+        Ok(self
+            .named_containers(&pod.metadata.name, all)
+            .await?
+            .into_iter()
+            .filter(|c| Claim::from_labels(c.labels.as_ref()).is_of(pod))
+            .collect())
+    }
+
+    /// The pod of another namespace that holds `pod`'s name on this node: a
+    /// container of the name that runs (or is created) and is labelled with
+    /// that pod, or the name's CNI attachment made for it whose namespace is
+    /// still there. The node keys a pod's containers, sandbox network and
+    /// volumes by the pod's name alone.
+    async fn name_held_by_another_namespace(&self, pod: &Pod) -> Option<Claim> {
+        let pod_name = pod.metadata.name.as_str();
+        if let Ok(containers) = self.named_containers(pod_name, true).await {
+            for c in &containers {
+                let alive = matches!(
+                    c.state.as_deref(),
+                    Some("running" | "created" | "restarting" | "paused")
+                );
+                let claim = Claim::from_labels(c.labels.as_ref());
+                if alive && claim.is_other_namespace(pod) {
+                    return Some(claim);
+                }
+            }
+        }
+        if let Some(cni) = &self.cni {
+            for a in cni.get_attachments(pod_name) {
+                let claim = Claim::from_cni_args(a.args.as_deref());
+                if claim.is_other_namespace(pod) && std::path::Path::new(&a.netns).exists() {
+                    return Some(claim);
+                }
+            }
+        }
+        None
+    }
+
+    /// The IP of `pod`'s own CNI attachment: one whose `CNI_ARGS` name
+    /// another pod (the same name in another namespace) is not this pod's.
+    fn cni_ip_of(&self, pod: &Pod) -> Option<String> {
+        if !self.use_cni {
+            return None;
+        }
+        self.cni
+            .as_ref()?
+            .get_attachments(&pod.metadata.name)
+            .into_iter()
+            .filter(|a| Claim::from_cni_args(a.args.as_deref()).is_of(pod))
+            .find_map(|a| a.result.primary_ip())
+            .map(|ip| ip.to_string())
     }
 
     /// The pod with the projected ServiceAccount volume (`kube-api-access`)
@@ -1092,11 +1194,7 @@ impl ContainerRuntime {
         let mut pod_ip: Option<String> = if host_network {
             Some(node_internal_ip())
         } else if self.use_cni {
-            if let Some(cni) = &self.cni {
-                cni.get_container_ip(pod_name)
-            } else {
-                None
-            }
+            self.cni_ip_of(pod)
         } else {
             // Start a pause container to obtain the pod's Docker-assigned IP before
             // creating any real containers.
@@ -1876,6 +1974,7 @@ impl ContainerRuntime {
                 ),
                 ..Default::default()
             }),
+            labels: Some(pod_identity::labels(pod)),
             ..Default::default()
         };
 
@@ -5052,6 +5151,8 @@ impl ContainerRuntime {
                 // App containers share namespaces via ipc_mode/pid_mode above.
                 ..Default::default()
             }),
+            // The pod's identity: its namespace is not in the container's name.
+            labels: Some(pod_identity::labels(pod)),
             ..Default::default()
         };
 
@@ -5512,10 +5613,7 @@ impl ContainerRuntime {
     pub async fn stop_and_remove_pod(&self, pod_name: &str) -> Result<()> {
         self.clear_probe_states_for_pod(pod_name);
 
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-        let options = ListContainersOptions { all: true, filters };
-        let containers = self.backend.list_containers(options).await?;
+        let containers = self.named_containers(pod_name, true).await?;
 
         for container in containers {
             if let Some(id) = container.id {
@@ -5547,13 +5645,8 @@ impl ContainerRuntime {
             pod_name, grace_period_seconds
         );
 
-        // List all containers with this pod prefix
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-
-        let options = ListContainersOptions { all: true, filters };
-
-        let containers = self.backend.list_containers(options).await?;
+        // The pod's containers, by the name's structure.
+        let containers = self.named_containers(pod_name, true).await?;
 
         // Stop app containers first, then the pause container last.
         // The pause container owns the network namespace — stopping it first
@@ -5568,7 +5661,7 @@ impl ContainerRuntime {
                     .map(|n| n.trim_start_matches('/').to_string())
                     .unwrap_or_default();
 
-                if container_name.ends_with("_pause") {
+                if pod_identity::is_pause(&container_name) {
                     pause_container_id = Some(id.clone());
                     continue;
                 }
@@ -5711,28 +5804,19 @@ impl ContainerRuntime {
         false
     }
 
-    /// Check if a pod's containers are running
+    /// Check if a pod's containers are running: those named for `pod_name`,
+    /// whichever pod they are (see [`Self::is_pod_running_of`]).
     pub async fn is_pod_running(&self, pod_name: &str) -> Result<bool> {
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
+        let containers = self.named_containers(pod_name, false).await?;
+        Ok(has_app_container(&containers))
+    }
 
-        let options = ListContainersOptions {
-            all: false, // Only running containers
-            filters,
-        };
-
-        let containers = self.backend.list_containers(options).await?;
-        // Check that at least one non-pause container is running.
-        // Just the pause container running doesn't count — the app containers may have
-        // failed to start (e.g., CreateContainerConfigError from subpath validation).
-        let pause_suffix = format!("{}_pause", pod_name);
-        let has_app_container = containers.iter().any(|c| {
-            c.names
-                .as_ref()
-                .map(|names| names.iter().any(|n| !n.contains(&pause_suffix)))
-                .unwrap_or(false)
-        });
-        Ok(has_app_container)
+    /// Whether `pod`'s own containers run: named for it and not labelled
+    /// with another pod (the same name in another namespace, or an earlier
+    /// pod of the name).
+    pub async fn is_pod_running_of(&self, pod: &Pod) -> Result<bool> {
+        let containers = self.own_containers(pod, false).await?;
+        Ok(has_app_container(&containers))
     }
 
     /// Check if any app (non-init, non-pause) container has been created for a pod.
@@ -5740,15 +5824,8 @@ impl ContainerRuntime {
     /// If app containers exist, all init containers must have completed successfully.
     async fn has_any_app_container(&self, pod: &Pod) -> bool {
         let pod_name = &pod.metadata.name;
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-
-        let options = ListContainersOptions {
-            all: true, // Include exited/created containers
-            filters,
-        };
-
-        let containers = match self.backend.list_containers(options).await {
+        // Include exited/created containers
+        let containers = match self.own_containers(pod, true).await {
             Ok(c) => c,
             Err(_) => return false,
         };
@@ -7467,7 +7544,12 @@ impl ContainerRuntime {
     /// allows preStop hooks to be executed before container termination.
     pub async fn stop_pod_for(&self, pod: &Pod, grace_period_seconds: i64) -> Result<()> {
         let pod_name = &pod.metadata.name;
-        self.clear_probe_states_for_pod(pod_name);
+        // A pod of the same name in another namespace holds the name here:
+        // its containers, probes, network and volumes are not this pod's.
+        let holder = self.name_held_by_another_namespace(pod).await;
+        if holder.is_none() {
+            self.clear_probe_states_for_pod(pod_name);
+        }
         info!(
             "Stopping pod: {} (grace period: {}s, with lifecycle hooks)",
             pod_name, grace_period_seconds
@@ -7504,13 +7586,13 @@ impl ContainerRuntime {
             );
         }
 
-        // List all containers with this pod prefix
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-
-        let options = ListContainersOptions { all: true, filters };
-
-        let containers = self.backend.list_containers(options).await?;
+        // The pod's containers: named for it, none of another namespace's pod.
+        let containers: Vec<ContainerSummary> = self
+            .named_containers(pod_name, true)
+            .await?
+            .into_iter()
+            .filter(|c| !Claim::from_labels(c.labels.as_ref()).is_other_namespace(pod))
+            .collect();
 
         // First pass: execute preStop hooks on all running containers.
         // We must run ALL preStop hooks before stopping ANY containers, because
@@ -7664,7 +7746,7 @@ impl ContainerRuntime {
                     .first()
                     .map(|n| n.trim_start_matches('/').to_string())
                     .unwrap_or_default();
-                if container_name == pause_suffix || container_name.ends_with("_pause") {
+                if container_name == pause_suffix || pod_identity::is_pause(&container_name) {
                     pause_container_id = Some(id.clone());
                     continue;
                 }
@@ -7688,6 +7770,17 @@ impl ContainerRuntime {
             if let Err(e) = self.backend.stop_container(pause_id, stop_options).await {
                 warn!("Failed to stop pause container {}: {}", pause_id, e);
             }
+        }
+
+        if let Some(holder) = holder {
+            info!(
+                "Pod {}/{}: the network and volumes of the name {} are pod {}'s, left as they are",
+                pod_identity::namespace(pod),
+                pod_name,
+                pod_name,
+                holder
+            );
+            return Ok(());
         }
 
         // Teardown CNI networking if enabled
@@ -7868,78 +7961,59 @@ impl ContainerRuntime {
         Ok(())
     }
 
-    /// Get the pod IP address from the first running container
+    /// The pod's IP: its own, never another pod's. A host-network pod has
+    /// the node's; else the IP of its CNI attachment (one made for it: its
+    /// CNI_ARGS name this pod); else the IP of a running container of its own
+    /// (named for it and labelled with no other pod), the sandbox first.
+    /// The OVN plugin left the attachment lookup empty, and the container
+    /// lookup by `web_pause` / `web_` gave pod `web` the IP of pod
+    /// `func-web` of another namespace.
     pub async fn get_pod_ip(&self, pod: &Pod) -> Result<Option<String>> {
         let pod_name = pod.metadata.name.as_str();
-        if self.host_network_pods.lock().unwrap().contains(pod_name) {
+        if is_host_network(pod) {
             return Ok(Some(node_internal_ip()));
         }
-        // If using CNI, get IP from CNI runtime
-        if self.use_cni {
-            if let Some(cni) = &self.cni {
-                if let Some(ip) = cni.get_container_ip(pod_name) {
-                    debug!("Retrieved pod IP {} from CNI for pod {}", ip, pod_name);
-                    return Ok(Some(ip));
-                }
-            }
+        if let Some(ip) = self.cni_ip_of(pod) {
+            debug!("Retrieved pod IP {} from CNI for pod {}", ip, pod_name);
+            return Ok(Some(ip));
         }
 
-        // Fallback to Docker/Podman network inspection
-        // Look specifically for the pause container which owns the network namespace
-        let pause_name = format!("{}_pause", pod_name);
-        let mut filters = HashMap::new();
-        filters.insert("name".to_string(), vec![pause_name.clone()]);
-
-        let options = ListContainersOptions {
-            all: false, // Only running containers
-            filters,
-        };
-
-        let mut containers = self.backend.list_containers(options).await?;
-
-        // If no pause container, try any container matching the pod name
-        if containers.is_empty() {
-            let mut filters2 = HashMap::new();
-            filters2.insert("name".to_string(), vec![format!("{}_", pod_name)]);
-            let options2 = ListContainersOptions {
-                all: false,
-                filters: filters2,
+        // Docker/Podman network inspection, the pause container (which owns
+        // the network namespace) first.
+        let mut containers = self.own_containers(pod, false).await?;
+        containers.sort_by_key(|c| !pod_identity::is_pause(pod_identity::summary_name(c)));
+        for container in &containers {
+            let Some(id) = &container.id else {
+                continue;
             };
-            containers = self.backend.list_containers(options2).await?;
-        }
-
-        // Get the IP from the pause container (or first matching)
-        if let Some(container) = containers.first() {
-            if let Some(id) = &container.id {
-                let inspect = self.backend.inspect_container(id).await?;
-
-                if let Some(network_settings) = inspect.network_settings {
-                    // First try to get IP from the specific network we're using
-                    if let Some(networks) = network_settings.networks {
-                        if let Some(network_info) = networks.get(&self.network) {
-                            if let Some(ip) = &network_info.ip_address {
-                                if !ip.is_empty() && ip != "0.0.0.0" {
-                                    debug!(
-                                        "Retrieved pod IP {} from network {} for pod {}",
-                                        ip, self.network, pod_name
-                                    );
-                                    return Ok(Some(ip.clone()));
-                                }
-                            }
-                        }
-                    }
-
-                    // Fallback to default network IP
-                    if let Some(ip) = network_settings.ip_address {
-                        if !ip.is_empty() && ip != "0.0.0.0" {
-                            debug!(
-                                "Retrieved pod IP {} from default network for pod {}",
-                                ip, pod_name
-                            );
-                            return Ok(Some(ip));
-                        }
-                    }
-                }
+            let Some(network_settings) = self.backend.inspect_container(id).await?.network_settings
+            else {
+                continue;
+            };
+            // First try to get IP from the specific network we're using
+            if let Some(ip) = network_settings
+                .networks
+                .as_ref()
+                .and_then(|n| n.get(&self.network))
+                .and_then(|n| n.ip_address.clone())
+                .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
+            {
+                debug!(
+                    "Retrieved pod IP {} from network {} for pod {}",
+                    ip, self.network, pod_name
+                );
+                return Ok(Some(ip));
+            }
+            // Fallback to default network IP
+            if let Some(ip) = network_settings
+                .ip_address
+                .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
+            {
+                debug!(
+                    "Retrieved pod IP {} from default network for pod {}",
+                    ip, pod_name
+                );
+                return Ok(Some(ip));
             }
         }
 
@@ -8494,14 +8568,14 @@ impl ContainerRuntime {
             .filter(|c| {
                 if let Some(names) = &c.names {
                     for name in names {
-                        let clean = name.trim_start_matches('/');
-                        if clean.ends_with("_pause") {
+                        if pod_identity::is_pause(name) {
                             return false;
                         }
-                        for pod_name in pod_names {
-                            if clean.starts_with(pod_name) {
-                                return true;
-                            }
+                        if pod_names
+                            .iter()
+                            .any(|p| pod_identity::is_named_for(name, p))
+                        {
+                            return true;
                         }
                     }
                 }
@@ -8654,6 +8728,17 @@ fn pod_group_add(pod: &Pod) -> Option<Vec<String>> {
 /// `spec.hostNetwork: true`.
 fn is_host_network(pod: &Pod) -> bool {
     pod.spec.as_ref().and_then(|s| s.host_network) == Some(true)
+}
+
+/// Whether a container other than the sandbox (pause) is among `containers`:
+/// the pause container alone does not make a pod running (its app
+/// containers may have failed to start, e.g. CreateContainerConfigError).
+fn has_app_container(containers: &[ContainerSummary]) -> bool {
+    containers.iter().any(|c| {
+        c.names
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|n| !pod_identity::is_pause(n)))
+    })
 }
 
 /// An app container's PID namespace: the node's for `spec.hostPID` (it
@@ -12508,16 +12593,31 @@ mod backend_tests {
         let (runtime, _v) = runtime_with(backend.clone()).await;
 
         assert_eq!(
-            runtime.get_pod_ip(&pod_in("a", "web")).await.unwrap().as_deref(),
+            runtime
+                .get_pod_ip(&pod_in("a", "web"))
+                .await
+                .unwrap()
+                .as_deref(),
             Some("10.1.0.5")
         );
         assert_eq!(
-            runtime.get_pod_ip(&pod_in("b", "func-web")).await.unwrap().as_deref(),
+            runtime
+                .get_pod_ip(&pod_in("b", "func-web"))
+                .await
+                .unwrap()
+                .as_deref(),
             Some("10.1.0.7")
         );
 
         // `web`'s container is gone: no IP, rather than another pod's.
-        backend.state.lock().unwrap().containers.get_mut("web_main").unwrap().state = "exited";
+        backend
+            .state
+            .lock()
+            .unwrap()
+            .containers
+            .get_mut("web_main")
+            .unwrap()
+            .state = "exited";
         assert_eq!(runtime.get_pod_ip(&pod_in("a", "web")).await.unwrap(), None);
     }
 
@@ -12548,7 +12648,9 @@ mod backend_tests {
         let calls = backend.calls();
         assert!(calls.contains(&"stop web_main".to_string()), "{calls:?}");
         assert!(
-            calls.iter().all(|c| !c.contains("func-web") && !c.contains("web-2")),
+            calls
+                .iter()
+                .all(|c| !c.contains("func-web") && !c.contains("web-2")),
             "another pod was stopped: {calls:?}"
         );
     }

@@ -90,6 +90,9 @@ struct Meta {
     network_mode: Option<String>,
     config: StoredProcess,
     cgroups_path: String,
+    /// The labels it was created with (none in a meta written before them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    labels: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -315,13 +318,14 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
-/// Docker-style name filter: `^/prefix` or a plain substring of `/name`.
+/// Docker-style name filter on the `/`-prefixed name: `^/prefix`, or a plain
+/// pattern, which is where the name starts too. Docker reads a plain pattern
+/// as an unanchored regular expression; every pattern the kubelet passes
+/// means the start of a name (`<pod>_`, `<pod>_<container>`), and a match
+/// inside a name took pod `func-web`'s `func-web_main` for pod `web`'s.
 fn name_matches(name: &str, pattern: &str) -> bool {
-    let full = format!("/{}", name);
-    match pattern.strip_prefix('^') {
-        Some(prefix) => full.starts_with(prefix),
-        None => full.contains(pattern),
-    }
+    let prefix = pattern.strip_prefix('^').unwrap_or(pattern);
+    name.starts_with(prefix.strip_prefix('/').unwrap_or(prefix))
 }
 
 /// Resolve `"uid"`, `"uid:gid"` or user/group names against the rootfs.
@@ -607,6 +611,7 @@ impl Inner {
                     working_dir: Some(cwd),
                 },
                 cgroups_path,
+                labels: config.labels.clone(),
             };
             image::write_json(&dir.join("meta.json"), &meta)?;
             self.index_put(meta.clone());
@@ -1040,6 +1045,7 @@ impl ContainerBackend for YoukiBackend {
                         host_config: Some(InspectHostConfig {
                             network_mode: m.network_mode.clone(),
                         }),
+                        labels: m.labels.clone(),
                     })
                 })
                 .collect())
@@ -1340,6 +1346,7 @@ mod tests {
             network_mode: None,
             config: StoredProcess::default(),
             cgroups_path: format!("/rusternetes/{name}"),
+            labels: None,
         }
     }
 
@@ -1445,6 +1452,7 @@ mod tests {
                     network_mode: None,
                     config: StoredProcess::default(),
                     cgroups_path: format!("/rusternetes/{name}"),
+                    labels: None,
                 });
             }
             assert_eq!(std::env::current_dir().unwrap(), cwd);

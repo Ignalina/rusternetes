@@ -111,14 +111,11 @@ impl FakeBackend {
     }
 }
 
-/// Docker's `name` filter is a regex on the `/`-prefixed name; tests only
-/// use a leading `^` anchor or plain substrings.
+/// The `name` filter as the youki backend reads it: `^/prefix`, or a plain
+/// pattern, which is where the name starts too (never a piece inside it).
 fn name_matches(name: &str, pattern: &str) -> bool {
-    let full = format!("/{}", name);
-    match pattern.strip_prefix('^') {
-        Some(prefix) => full.starts_with(prefix),
-        None => full.contains(pattern),
-    }
+    let prefix = pattern.strip_prefix('^').unwrap_or(pattern);
+    name.starts_with(prefix.strip_prefix('/').unwrap_or(prefix))
 }
 
 #[async_trait]
@@ -216,6 +213,7 @@ impl ContainerBackend for FakeBackend {
                         .as_ref()
                         .and_then(|h| h.network_mode.clone()),
                 }),
+                labels: c.config.labels.clone(),
             })
             .collect())
     }

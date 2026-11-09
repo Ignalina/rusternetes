@@ -157,6 +157,9 @@ pub struct ContainerConfig {
     /// `"<port>/<proto>"` keys.
     pub exposed_ports: Option<HashMap<String, HashMap<(), ()>>>,
     pub host_config: Option<HostConfig>,
+    /// Labels; the kubelet puts its pod's identity here
+    /// ([`crate::pod_identity::labels`]).
+    pub labels: Option<HashMap<String, String>>,
 }
 
 /// Lifecycle state of a container as the backend reports it.
@@ -242,6 +245,8 @@ pub struct ContainerSummary {
     /// `"created"`, `"running"`, `"exited"`, ...
     pub state: Option<String>,
     pub host_config: Option<InspectHostConfig>,
+    /// The labels the container was created with.
+    pub labels: Option<HashMap<String, String>>,
 }
 
 /// Result of [`ContainerBackend::inspect_image`](super::ContainerBackend::inspect_image).

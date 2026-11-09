@@ -7,6 +7,7 @@ pub mod csi;
 pub mod eviction;
 pub mod kubelet;
 pub mod netns;
+pub mod pod_identity;
 pub mod readiness_timing;
 pub mod runtime;
 pub mod seccomp;

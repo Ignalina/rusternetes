@@ -403,13 +403,21 @@ async fn get_node_container_logs(
 }
 
 /// The id of the container `full_name` (`<pod>_<container>`) in a runtime's
-/// container list.
+/// container list: that name exactly. Docker's name filter is an unanchored
+/// regular expression, so the list for `web_main` holds `func-web_main` too
+/// (a pod of another namespace), and its first entry was read as the log.
 fn container_named(
     containers: &[bollard::models::ContainerSummary],
     full_name: &str,
 ) -> Option<String> {
-    let _ = full_name;
-    containers.first().and_then(|c| c.id.clone())
+    containers
+        .iter()
+        .find(|c| {
+            c.names
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|n| n.trim_start_matches('/') == full_name))
+        })
+        .and_then(|c| c.id.clone())
 }
 
 /// Get real logs from the container runtime

@@ -10,6 +10,8 @@ mod eviction;
 mod kubelet;
 #[allow(dead_code)]
 mod netns;
+#[allow(dead_code)]
+mod pod_identity;
 mod readiness_timing;
 mod runtime;
 #[allow(dead_code)]
