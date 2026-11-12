@@ -1,10 +1,13 @@
-//! Image references and pulls on the `oci-image` crate.
+//! Image references and pulls on the `oci-image-store` crate.
 //!
-//! Layers are pulled anonymously over the kubelet's existing reqwest client
-//! into a content-addressed store (every blob checked against its sha256
-//! digest) and unpacked once each, in one pass, into `layers/<diff_id>/` in
-//! overlayfs format. A container's rootfs is an overlay of its image's layer
-//! directories; an updated image fetches and unpacks only its new layers.
+//! A pull is oci-image-store's, behind its `Registry` trait (oci-client over
+//! HTTPS in the kubelet, a fake in tests): every manifest and blob is checked
+//! against its digest and size before it is kept, straight into the layer
+//! store, where each layer is audited and unpacked once, into
+//! `layers/<diff_id>/` in overlayfs format, its diff_id checked. A
+//! container's rootfs is an overlay of its image's layer directories; an
+//! updated image fetches and unpacks only its new layers, and an unpacked
+//! layer whose blob was pruned is not fetched again.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,8 +15,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-pub use oci_image::ImageRef;
-use oci_image::{LayerStore, Layout, OverlayXattr, UnpackOptions};
+pub use oci_image_store::ImageRef;
+use oci_image_store::{
+    load_image, unpack_layers, Image, LayerStore, Platform, PullOptions, Registry, UnpackOptions,
+};
 
 use crate::backend::ImageConfig;
 
@@ -102,30 +107,39 @@ impl ImageStore {
         read_json(&path).with_context(|| format!("No such image: {}", image))
     }
 
-    /// Pull `image`, calling `progress` with status lines.
-    pub async fn pull(
+    /// Pull `image` from `registry` into the layer store, unpack its layers
+    /// there once each and drop the unpacked layers' blobs, calling
+    /// `progress` with status lines.
+    pub async fn pull<R: Registry>(
         &self,
-        client: &reqwest::Client,
+        registry: &R,
         image: &str,
         progress: &mut (dyn FnMut(String) + Send),
     ) -> Result<StoredImage> {
+        let r = ImageRef::parse(image)?;
         let layers = self.layer_store()?;
-        let pulled = oci_image::pull::pull(client, image, &layers, progress).await?;
-        let r = pulled.reference.clone();
-        let id = pulled.id.to_string();
-        let dir = self.image_dir(&id);
-
-        let (image_id, image_layers) = (pulled.id.clone(), pulled.layers.clone());
-        tokio::task::spawn_blocking(move || {
-            let opts = UnpackOptions {
-                layout: Layout::Overlay(OverlayXattr::Trusted),
-                ..UnpackOptions::default()
-            };
-            layers.add_image(&image_id, &image_layers, &opts)?;
+        progress(format!("Pulling {}", r.canonical()));
+        let scratch = self.root.join("tmp");
+        fs::create_dir_all(&scratch)?;
+        let opts = PullOptions {
+            scratch,
+            ..PullOptions::default()
+        };
+        let pulled = oci_image_store::pull(registry, &r, &layers, &opts).await?;
+        let top = pulled.desc.digest.clone();
+        let img = tokio::task::spawn_blocking(move || -> Result<Image> {
+            let img = load_image(&layers, &top, &Platform::host())?;
+            // Overlay form (the store's default for per-layer directories);
+            // device nodes are skipped, the runtime makes /dev.
+            unpack_layers(&layers, &img, &layers, &UnpackOptions::default())?;
             // The unpacked layers are what containers use; drop their blobs.
-            layers.prune_unpacked_blobs()
+            layers.prune_unpacked_blobs()?;
+            Ok(img)
         })
         .await??;
+        let id = img.id().to_string();
+        let dir = self.image_dir(&id);
+        let config = serde_json::to_value(&img.config)?;
         if !dir.join("image.json").exists() {
             let tmp = self
                 .root
@@ -136,7 +150,7 @@ impl ImageStore {
             let stored = StoredImage {
                 id: id.clone(),
                 reference: r.canonical(),
-                config: stored_config(&pulled.config),
+                config: stored_config(&config),
             };
             write_json(&tmp.join("image.json"), &stored)?;
             fs::create_dir_all(dir.parent().unwrap())?;
@@ -282,12 +296,16 @@ mod tests {
             "rootfs": {"type": "layers", "diff_ids": [l.diff_id.to_string()]},
         }))
         .unwrap();
-        let (m, _) =
-            write_image(&src, &cfg, &[l.desc.clone()], &Default::default()).unwrap();
+        let (m, _) = write_image(&src, &cfg, &[l.desc.clone()], &Default::default()).unwrap();
         let reg = oci_image_store::FakeRegistry::new();
-        push(&reg, &src, &m, &ImageRef::parse("reg.test/team/app:1").unwrap())
-            .await
-            .unwrap();
+        push(
+            &reg,
+            &src,
+            &m,
+            &ImageRef::parse("reg.test/team/app:1").unwrap(),
+        )
+        .await
+        .unwrap();
         (reg, l.desc.digest)
     }
 
@@ -335,10 +353,7 @@ mod tests {
         assert!(layers.iter().any(|l| l.join("bin/sh").exists()));
         assert_eq!(store.get("busybox:1.36").unwrap().id, img.id);
         // A second pull finds every blob and the rootfs already there.
-        let again = store
-            .pull(&reg, "busybox:1.36", &mut |_| {})
-            .await
-            .unwrap();
+        let again = store.pull(&reg, "busybox:1.36", &mut |_| {}).await.unwrap();
         assert_eq!(again.id, img.id);
     }
 }

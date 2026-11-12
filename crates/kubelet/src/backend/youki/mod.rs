@@ -104,7 +104,7 @@ struct StoredProcess {
 struct Inner {
     cfg: YoukiConfig,
     images: ImageStore,
-    http: reqwest::Client,
+    registry: oci_image_store::OciClientRegistry,
     /// Every container's [`Meta`] by name: read from disk once (here), kept
     /// current by create, start and remove. Lists and lookups never scan
     /// the containers directory again.
@@ -142,9 +142,10 @@ impl Inner {
         Ok(Inner {
             images: ImageStore::new(cfg.root.clone()),
             cfg,
-            http: reqwest::Client::builder()
-                .user_agent("rusternetes-kubelet")
-                .build()?,
+            registry: oci_image_store::OciClientRegistry::new(
+                oci_image_store::Auth::Anonymous,
+                Vec::new(),
+            ),
             index: std::sync::RwLock::new(index),
             pulls: Arc::new(InFlight::default()),
         })
@@ -524,8 +525,8 @@ impl Inner {
         fs::create_dir_all(&dir)?;
         let result = (|| -> Result<Meta> {
             let rootfs = dir.join("rootfs");
-            let overlay = oci_image::Overlay {
-                lower: oci_image::Overlay::stack(&self.images.layers(&image_id)?),
+            let overlay = oci_image_store::Overlay {
+                lower: oci_image_store::Overlay::stack(&self.images.layers(&image_id)?),
                 upper: dir.join("upper"),
                 work: dir.join("work"),
                 merged: rootfs.clone(),
@@ -897,7 +898,7 @@ impl ContainerBackend for YoukiBackend {
                     let _ticket = ticket;
                     let r = task_inner
                         .images
-                        .pull(&task_inner.http, &task_image, &mut progress)
+                        .pull(&task_inner.registry, &task_image, &mut progress)
                         .await;
                     let _ = done_tx.send(r.err().map(|e| format!("{:#}", e)));
                 });
