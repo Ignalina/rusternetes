@@ -262,16 +262,73 @@ mod tests {
         );
     }
 
+    /// An image `app:1` with one layer (`a` = `1`) in a fake registry; its layer blob digest.
+    async fn registry_with_an_image() -> (oci_image_store::FakeRegistry, oci_image_store::Digest) {
+        use oci_image_store::{add_layer, push, write_image, LayerCompression, MemLayout};
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_size(1);
+        h.set_mode(0o644);
+        b.append_data(&mut h, "a", &b"1"[..]).unwrap();
+        let tar = b.into_inner().unwrap();
+        let src = MemLayout::new();
+        let scratch = tempfile::tempdir().unwrap();
+        let l = add_layer(&src, &mut &tar[..], LayerCompression::Gzip, scratch.path()).unwrap();
+        let cfg = serde_json::from_value(serde_json::json!({
+            "architecture": oci_image_store::Platform::host().architecture,
+            "os": "linux",
+            "config": {"Env": ["PATH=/bin"], "Cmd": ["/bin/sh"], "WorkingDir": "/w"},
+            "rootfs": {"type": "layers", "diff_ids": [l.diff_id.to_string()]},
+        }))
+        .unwrap();
+        let (m, _) =
+            write_image(&src, &cfg, &[l.desc.clone()], &Default::default()).unwrap();
+        let reg = oci_image_store::FakeRegistry::new();
+        push(&reg, &src, &m, &ImageRef::parse("reg.test/team/app:1").unwrap())
+            .await
+            .unwrap();
+        (reg, l.desc.digest)
+    }
+
+    /// The pull is oci-image-store's, behind its `Registry` trait: the layers land in the
+    /// kubelet's layer store and unpack there once, the blobs are pruned, and a second pull
+    /// fetches no layer again (the registry serves garbage for it by then).
+    #[tokio::test]
+    async fn a_pull_unpacks_each_layer_once_and_a_second_pull_fetches_none() {
+        let (reg, layer) = registry_with_an_image().await;
+        let root = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(root.path().to_path_buf());
+        let mut lines = Vec::new();
+        let img = store
+            .pull(&reg, "reg.test/team/app:1", &mut |l| lines.push(l))
+            .await
+            .unwrap();
+        assert_eq!(img.config.cmd, Some(vec!["/bin/sh".to_string()]));
+        assert_eq!(img.config.working_dir.as_deref(), Some("/w"));
+        let layers = store.layers(&img.id).unwrap();
+        assert_eq!(std::fs::read(layers[0].join("a")).unwrap(), b"1");
+        assert_eq!(store.get("reg.test/team/app:1").unwrap().id, img.id);
+        assert!(lines.iter().any(|l| l.starts_with("Pulled ")), "{lines:?}");
+
+        reg.lie(&layer, b"not the layer".to_vec());
+        let again = store
+            .pull(&reg, "reg.test/team/app:1", &mut |_| {})
+            .await
+            .unwrap();
+        assert_eq!(again.id, img.id);
+    }
+
     /// Network: `cargo test --features youki -- --ignored pulls_busybox`.
     #[tokio::test]
     #[ignore]
     async fn pulls_busybox_from_docker_hub() {
         let root = tempfile::tempdir().unwrap();
         let store = ImageStore::new(root.path().to_path_buf());
-        let client = reqwest::Client::new();
+        let reg = oci_image_store::OciClientRegistry::new(oci_image_store::Auth::Anonymous, vec![]);
         let mut lines = Vec::new();
         let img = store
-            .pull(&client, "busybox:1.36", &mut |l| lines.push(l))
+            .pull(&reg, "busybox:1.36", &mut |l| lines.push(l))
             .await
             .unwrap();
         let layers = store.layers(&img.id).unwrap();
@@ -279,7 +336,7 @@ mod tests {
         assert_eq!(store.get("busybox:1.36").unwrap().id, img.id);
         // A second pull finds every blob and the rootfs already there.
         let again = store
-            .pull(&client, "busybox:1.36", &mut |_| {})
+            .pull(&reg, "busybox:1.36", &mut |_| {})
             .await
             .unwrap();
         assert_eq!(again.id, img.id);
