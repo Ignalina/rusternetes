@@ -69,7 +69,7 @@ oci-spec = { version = "0.10", default-features = false, features = ["runtime"],
 nix = { version = "0.29", features = ["mount", "sched", "signal", "process", "net", "fs"], optional = true }
 sha2 = "0.10"
 # The image store: references, digests, one-pass layer unpack (crates.io).
-oci-image-store = { version = "0.2.0", features = ["registry"], optional = true }
+oci-image-store = { version = "0.1.0", features = ["registry"], optional = true }
 uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
